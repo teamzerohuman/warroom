@@ -2,6 +2,13 @@
 import { Command } from 'commander';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import {
+  linkSdkToDemo,
+  runDevStatus,
+  type DevActionResult,
+  type DevStatus,
+  unlinkSdkFromDemo,
+} from './commands/dev-link.js';
 import { runDoctor } from './commands/doctor.js';
 import { runMapsStudy } from './commands/maps-study.js';
 
@@ -13,6 +20,56 @@ function printJson(output: Output, value: unknown) {
 
 function printNotImplemented(output: Output, command: string, issue: string) {
   output(`${command} is not implemented in phase 1. Track it in ${issue}.`);
+}
+
+function formatRepoLine(label: string, repo: DevStatus['sdk']) {
+  const checkout = repo.checkedOut ? 'present' : 'missing';
+  const source = repo.source === 'sibling' ? ', sibling fallback' : repo.source === 'manifest' ? ', manifest path' : '';
+  const dirty = repo.clean === false ? ', dirty' : repo.clean === true ? ', clean' : '';
+  return `${label}: ${checkout}${source}${dirty} -> ${repo.resolvedPath}`;
+}
+
+function printDevStatus(output: Output, result: DevStatus) {
+  output(formatRepoLine('SDK checkout', result.sdk));
+  output(formatRepoLine('Demo checkout', result.demo));
+  output(`Demo dependencies: ${result.demo.nodeModules ? 'installed' : 'missing node_modules'}`);
+  for (const tool of result.tools) {
+    output(`${tool.name}: ${tool.available ? 'ok' : 'missing'}${tool.detail ? ` (${tool.detail})` : ''}`);
+  }
+
+  const linkState = result.linked
+    ? 'linked'
+    : result.partiallyLinked
+      ? 'partially linked'
+      : result.legacyDirectLinked
+        ? 'legacy direct links'
+        : 'unlinked';
+  output(`SDK-to-demo dev link: ${linkState}`);
+  for (const packageLink of result.packages) {
+    const build = packageLink.buildOutputExists ? 'built' : 'missing dist';
+    if (packageLink.linked) {
+      output(`ok ${packageLink.name} -> ${packageLink.targetPath} (${build})`);
+    } else if (packageLink.legacyDirectLinked) {
+      output(`legacy-direct ${packageLink.name} -> ${packageLink.sdkPackagePath} (${build})`);
+    } else if (packageLink.exists) {
+      output(`published ${packageLink.name} (${packageLink.isSymlink ? packageLink.actualTarget : 'not a symlink'}, ${build})`);
+    } else {
+      output(`missing ${packageLink.name} (${build})`);
+    }
+  }
+
+  output('');
+  output('Recommended linked workflow:');
+  output(`SDK watch: ${result.recommended.sdkWatch}`);
+  output(`Demo dev: ${result.recommended.demoDev}`);
+  output(`Demo build: ${result.recommended.demoBuild}`);
+  output(`Demo typecheck: ${result.recommended.demoTypecheck}`);
+  output(`Demo Playwright core: ${result.recommended.demoPlaywrightCore}`);
+}
+
+function printDevAction(output: Output, action: DevActionResult) {
+  for (const message of action.messages) output(message);
+  printDevStatus(output, action.status);
 }
 
 export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
@@ -97,32 +154,45 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
   const dev = program.command('dev').description('Local development orchestration commands.');
   dev
     .command('status')
-    .description('Show phase-1 local dev-link readiness.')
+    .description('Show SDK-to-demo local dev-link state and prerequisites.')
     .option('--json', 'Print machine-readable output.')
     .action((opts: { json?: boolean }) => {
-      const repos = runMapsStudy(workspaceRoot);
-      const sdk = repos.find((repo) => repo.id === 'sdk');
-      const demo = repos.find((repo) => repo.id === 'demo');
-      const result = {
-        sdkCheckedOut: sdk?.checkedOut ?? false,
-        demoCheckedOut: demo?.checkedOut ?? false,
-        demoRepoStatus: demo?.status ?? 'unknown',
-        devLinkImplemented: false,
-        implementationIssue: 'TeamFloPay/infra#10',
-      };
-
+      const result = runDevStatus(workspaceRoot);
       if (opts.json) {
         printJson(output, result);
         return;
       }
 
-      output(`SDK checkout: ${result.sdkCheckedOut ? 'present' : 'missing'}`);
-      output(`Demo checkout: ${result.demoCheckedOut ? 'present' : result.demoRepoStatus}`);
-      output(`SDK-to-demo dev link: not implemented yet (${result.implementationIssue})`);
+      printDevStatus(output, result);
     });
 
-  dev.command('link').description('Stub for SDK-to-demo local linking.').action(() => printNotImplemented(output, 'warroom dev link', 'TeamFloPay/infra#10'));
-  dev.command('unlink').description('Stub for restoring standalone demo dependency behavior.').action(() => printNotImplemented(output, 'warroom dev unlink', 'TeamFloPay/infra#10'));
+  dev
+    .command('link')
+    .description('Link local SDK packages into the standalone demo checkout.')
+    .option('--skip-build', 'Do not build SDK packages before linking.')
+    .option('--json', 'Print machine-readable output.')
+    .action((opts: { skipBuild?: boolean; json?: boolean }) => {
+      const result = linkSdkToDemo(workspaceRoot, { skipBuild: opts.skipBuild });
+      if (opts.json) {
+        printJson(output, result);
+        return;
+      }
+      printDevAction(output, result);
+    });
+
+  dev
+    .command('unlink')
+    .description('Remove local SDK package links and restore demo published-package install.')
+    .option('--skip-install', 'Do not run pnpm install after removing local links.')
+    .option('--json', 'Print machine-readable output.')
+    .action((opts: { skipInstall?: boolean; json?: boolean }) => {
+      const result = unlinkSdkFromDemo(workspaceRoot, { skipInstall: opts.skipInstall });
+      if (opts.json) {
+        printJson(output, result);
+        return;
+      }
+      printDevAction(output, result);
+    });
 
   return program;
 }

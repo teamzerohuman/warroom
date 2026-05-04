@@ -48,9 +48,10 @@ The phase-1 CLI is intentionally small:
 npm run warroom -- --help
 npm run warroom -- maps study
 npm run warroom -- doctor
+npm run warroom -- dev status
 ```
 
-Future implementation issues will fill in bootstrap, sync, issue, PR, commit, abort, and dev-link behavior.
+Future implementation issues will fill in bootstrap, sync, issue, PR, commit, and abort behavior. SDK-to-demo local linking is available through `warroom dev link`, `warroom dev status`, and `warroom dev unlink`.
 
 ## Child Repo Map
 

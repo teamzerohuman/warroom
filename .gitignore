@@ -14,6 +14,8 @@ coverage/
 # Local command artifacts.
 .warroom/runs/*
 !.warroom/runs/.gitkeep
+.warroom/dev/*
+!.warroom/dev/.gitkeep
 
 # Child repositories are cloned locally and committed in their own repos.
 maps/repos/*
