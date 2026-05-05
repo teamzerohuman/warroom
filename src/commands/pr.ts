@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
 import { setCampaignStatus, type CampaignStatusSetResult } from '../lib/campaign.js';
-import { getAdapterCommand } from '../lib/env.js';
+import { getAdapterInvocation, runAdapter } from '../lib/env.js';
 import { getRepoHealth, loadRepoManifest, runGit } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
 import { parseIssueRef } from './issues.js';
@@ -20,6 +20,8 @@ export type PrOptions = {
   cleanupLocal?: boolean;
   confirmCleanup?: boolean;
   checkInMinutes?: number;
+  issueTitle?: string;
+  issueUrl?: string;
 };
 
 export type MergeReadiness = {
@@ -73,12 +75,31 @@ export type PrPlanResult = {
     checks?: number;
     checkInMinutes?: number;
   };
+  adapterCwd?: string | null;
+  launchError?: string | null;
 };
 
 function ghJson<T>(args: string[], fallback: T): T {
   const result = spawnSync('gh', args, { encoding: 'utf8' });
   if (result.status !== 0 || !result.stdout.trim()) return fallback;
   return JSON.parse(result.stdout) as T;
+}
+
+function repoEntryForGitHub(workspaceRoot: string, githubRepo: string) {
+  const manifest = loadRepoManifest(workspaceRoot);
+  return manifest.repos.find((entry) => entry.github === githubRepo) ?? null;
+}
+
+function repoWorkspaceForGitHub(workspaceRoot: string, githubRepo: string) {
+  const repo = repoEntryForGitHub(workspaceRoot, githubRepo);
+  if (!repo) return workspaceRoot;
+
+  const health = getRepoHealth(workspaceRoot, repo);
+  return health.checkedOut ? health.resolvedPath : workspaceRoot;
+}
+
+function repoIdForGitHub(workspaceRoot: string, githubRepo: string) {
+  return repoEntryForGitHub(workspaceRoot, githubRepo)?.id ?? null;
 }
 
 function parsePrRef(value: string) {
@@ -91,6 +112,20 @@ function truncateText(value: string | undefined, limit = 6000) {
   if (!value) return '(not available)';
   if (value.length <= limit) return value;
   return `${value.slice(0, limit)}\n\n[Truncated by War Room to keep the handoff scoped. Re-run with direct GitHub inspection if more context is needed.]`;
+}
+
+function slugBranchPart(value: string | undefined, fallback: string) {
+  const slug = (value ?? '')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 48)
+    .replace(/-+$/g, '');
+  return slug || fallback;
+}
+
+function featureBranchForIssue(ref: { repo: string; number: number }, title: string | undefined) {
+  return `warroom/${ref.number}-${slugBranchPart(title, ref.repo.split('/').pop() ?? 'issue')}`;
 }
 
 function summarizeList<T>(values: T[] | undefined, map: (value: T) => string, limit = 12) {
@@ -302,28 +337,47 @@ function planLocalCleanup(
 export function runPrEngage(workspaceRoot: string, options: PrOptions): PrPlanResult {
   if (!options.issue) throw new Error('warroom pr engage requires --issue owner/repo#number.');
   const ref = parseIssueRef(options.issue);
-  const issue = ghJson<{ title?: string; body?: string; url?: string }>(
-    ['issue', 'view', String(ref.number), '--repo', ref.repo, '--json', 'title,body,url'],
+  const issue = ghJson<{
+    title?: string;
+    body?: string;
+    url?: string;
+    comments?: Array<{ author?: { login?: string }; body?: string; createdAt?: string }>;
+  }>(
+    ['issue', 'view', String(ref.number), '--repo', ref.repo, '--json', 'title,body,url,comments'],
     {}
   );
+  const title = issue.title ?? options.issueTitle ?? 'unknown';
+  const featureBranch = featureBranchForIssue(ref, title);
+  const issueComments = summarizeList(issue.comments, (comment) => {
+    const author = comment.author?.login ?? 'unknown';
+    return `- ${author} at ${comment.createdAt ?? 'unknown'}: ${truncateText(comment.body, 1000)}`;
+  });
   const prompt = [
-    `War Room PR engage preflight for ${options.issue}`,
+    `War Room implementation handoff for ${options.issue}`,
     '',
-    `Title: ${issue.title ?? 'unknown'}`,
-    `URL: ${issue.url ?? `https://github.com/${ref.repo}/issues/${ref.number}`}`,
-    `Target branch: ${options.base ?? 'main'} (use stage only as the second target option after validation)`,
+    `Title: ${title}`,
+    `URL: ${issue.url ?? options.issueUrl ?? `https://github.com/${ref.repo}/issues/${ref.number}`}`,
+    `Base branch: ${options.base ?? 'main'} (use stage only as the second target option after validation)`,
+    `Feature branch: ${featureBranch}`,
     '',
     buildSpecialistContext(workspaceRoot, ref.repo),
     '',
-    'Required preflight:',
-    '- Confirm owner repo and branch strategy.',
-    '- Identify intended files or areas.',
-    '- List validation commands before code changes.',
-    '- Keep product edits in the owning child repo.',
-    '- Do not open a PR until validation and commit creation are complete.',
+    'Mission:',
+    '- Implement the issue now. Do not stop after writing a plan, preflight, analysis note, or handoff markdown.',
+    `- Start from ${options.base ?? 'main'} and create or switch to feature branch ${featureBranch}.`,
+    '- Read and follow the repository AGENTS.md plus referenced development/testing instructions before editing.',
+    '- Use the existing issue body and GitHub discussion as the accepted triage context.',
+    '- Make the required code, test, and product documentation changes in this owning child repo.',
+    '- Do not create standalone preflight, plan, or analysis markdown files unless the issue specifically asks for product documentation.',
+    '- Run the most relevant validation commands for the changed surface; if the repo defines a full go/check command, run it before finishing when feasible.',
+    '- Commit the implementation on the feature branch after validation passes. If validation cannot pass, leave the code changes in place and explain the blocker.',
+    '- Do not merge. Do not open a PR unless the repository workflow explicitly requires it after a completed, validated commit.',
     '',
     'Issue body:',
     truncateText(issue.body),
+    '',
+    'GitHub discussion and triage comments:',
+    issueComments,
   ].join('\n');
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'pr-engage', {
@@ -331,13 +385,27 @@ export function runPrEngage(workspaceRoot: string, options: PrOptions): PrPlanRe
         'input.json': JSON.stringify(options, null, 2),
       })
     : null;
-  const adapterCommand = getAdapterCommand(workspaceRoot);
+  const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
+  const adapterRepoId = repoIdForGitHub(workspaceRoot, ref.repo);
+  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd, { repoId: adapterRepoId }).display;
   const campaignStatus = setCampaignStatus(options.issue, 'battlefield-active', { confirm: options.confirmStatus });
 
-  const contextSummary = { promptCharacters: prompt.length };
-  if (options.dryRun !== false) return { prompt, artifact, launched: false, adapterCommand, action: 'engage', campaignStatus, contextSummary };
-  const launched = spawnSync(adapterCommand, [], { input: prompt, stdio: ['pipe', 'inherit', 'inherit'] }).status === 0;
-  return { prompt, artifact, launched, adapterCommand, action: 'engage', campaignStatus, contextSummary };
+  const contextSummary = { promptCharacters: prompt.length, comments: issue.comments?.length ?? 0 };
+  if (options.dryRun !== false) {
+    return { prompt, artifact, launched: false, adapterCommand, action: 'engage', campaignStatus, contextSummary, adapterCwd };
+  }
+  const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd, repoId: adapterRepoId });
+  return {
+    prompt,
+    artifact,
+    launched: launch.launched,
+    adapterCommand: launch.invocation.display,
+    action: 'engage',
+    campaignStatus,
+    contextSummary,
+    adapterCwd,
+    launchError: launch.error,
+  };
 }
 
 export function runPrReview(workspaceRoot: string, options: PrOptions): PrPlanResult {
@@ -423,7 +491,9 @@ export function runPrReview(workspaceRoot: string, options: PrOptions): PrPlanRe
         'input.json': JSON.stringify(options, null, 2),
       })
     : null;
-  const adapterCommand = getAdapterCommand(workspaceRoot);
+  const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
+  const adapterRepoId = repoIdForGitHub(workspaceRoot, ref.repo);
+  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd, { repoId: adapterRepoId }).display;
   const campaignStatus = options.issue
     ? setCampaignStatus(options.issue, 'skirmish', { confirm: options.confirmStatus })
     : null;
@@ -436,9 +506,21 @@ export function runPrReview(workspaceRoot: string, options: PrOptions): PrPlanRe
     checkInMinutes,
   };
 
-  if (options.dryRun !== false) return { prompt, artifact, launched: false, adapterCommand, action: 'review', campaignStatus, contextSummary };
-  const launched = spawnSync(adapterCommand, [], { input: prompt, stdio: ['pipe', 'inherit', 'inherit'] }).status === 0;
-  return { prompt, artifact, launched, adapterCommand, action: 'review', campaignStatus, contextSummary };
+  if (options.dryRun !== false) {
+    return { prompt, artifact, launched: false, adapterCommand, action: 'review', campaignStatus, contextSummary, adapterCwd };
+  }
+  const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd, repoId: adapterRepoId });
+  return {
+    prompt,
+    artifact,
+    launched: launch.launched,
+    adapterCommand: launch.invocation.display,
+    action: 'review',
+    campaignStatus,
+    contextSummary,
+    adapterCwd,
+    launchError: launch.error,
+  };
 }
 
 export function runPrMerge(workspaceRoot: string, options: PrOptions): PrPlanResult {

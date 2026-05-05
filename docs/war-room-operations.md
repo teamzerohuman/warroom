@@ -15,11 +15,9 @@ War Room coordinates the campaign; child repositories own the code.
 npm run warroom -- doctor
 npm run warroom -- sync --report
 npm run warroom -- issue next
-npm run warroom -- pr engage --issue TeamFloPay/infra#4
 ```
 
-Use `--launch` only when ready to hand the scoped prompt to the configured LLM adapter.
-Use `--confirm-status` only when ready to mutate the Campaign Map state for the selected issue.
+`issue next` prompts for a ready issue in an interactive terminal, moves the selected issue to `battlefield-active`, and launches the implementation handoff for that selection. Use `--dry-run` to preview without launching or moving Campaign Map status.
 Use `warroom commit create --repo <id> --validate "<command>" --write-artifact` before a final commit when the repo needs a deterministic change summary, validation record, and local audit bundle.
 Use `warroom maps assign --repo <id>` with framework/domain/resource flags for reviewed specialist-context edits; pass `--write` only after checking the dry-run messages.
 
@@ -31,7 +29,7 @@ Use `warroom campaign status-check` to validate board status options, `warroom c
 
 Workflow commands also understand the Campaign Map:
 
-- `warroom issue next` reads `ready-to-engage` project items first.
+- `warroom issue next` reads `ready-to-engage` project items first, then can select one for implementation and move it to `battlefield-active`.
 - `warroom issue triage` reads `needs-triage` project items first.
 - `warroom issue triage --mark-ready --confirm-status` moves work to `ready-to-engage`.
 - `warroom pr engage --confirm-status` moves work to `battlefield-active`.

@@ -5,11 +5,13 @@ import { getEnvStatus } from '../lib/env.js';
 import { loadResourcesManifest, validateResourceReferences } from '../lib/resources.js';
 import { checkGithubAuth, checkTool } from '../lib/tools.js';
 import { checkCampaignLabels, checkCampaignStatusOptions } from '../lib/campaign.js';
+import { runAlliesStatus } from './allies.js';
 
 const requiredFiles = [
   'AGENTS.md',
   'README.md',
-  '.env.example',
+  '.env.local.example',
+  'allies.yaml',
   'repos.yaml',
   'resources.yaml',
   'maps/campaign-atlas.md',
@@ -36,10 +38,12 @@ export function runDoctor(workspaceRoot: string) {
   ];
   const campaignLabels = checkCampaignLabels(manifest);
   const campaignStatuses = checkCampaignStatusOptions();
+  const allies = runAlliesStatus(workspaceRoot);
 
   const structuralOk =
     files.every((file) => file.exists) &&
     manifest.repos.length > 0 &&
+    allies.ok &&
     resourceReferences.ok &&
     env.adapterSupported;
 
@@ -55,6 +59,7 @@ export function runDoctor(workspaceRoot: string) {
     },
     campaignLabels,
     campaignStatuses,
+    allies,
     repos,
     repoCount: manifest.repos.length,
     activeRepoCount: manifest.repos.filter((repo) => repo.status === 'active').length,

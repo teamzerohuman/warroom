@@ -1,8 +1,8 @@
 import { spawnSync } from 'node:child_process';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
 import { listCampaignIssuesByStatus, setCampaignStatus, type CampaignStatusSetResult } from '../lib/campaign.js';
-import { getAdapterCommand } from '../lib/env.js';
-import { loadRepoManifest } from '../lib/repos.js';
+import { getAdapterInvocation, runAdapter } from '../lib/env.js';
+import { getRepoHealth, loadRepoManifest } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
 
 export type IssueRef = {
@@ -39,6 +39,7 @@ export type IssueHandoffResult = {
     checks?: number;
     checkInMinutes?: number;
   };
+  launchError?: string | null;
 };
 
 export type IssueTriageOptions = {
@@ -115,13 +116,30 @@ function buildTriagePrompt(workspaceRoot: string, ref: IssueRef) {
     buildSpecialistContext(workspaceRoot, ref.repo),
     '',
     'Goal:',
-    '- Clarify the problem, acceptance criteria, owner repo, risk, dependencies, and validation commands.',
+    '- Clarify the problem (@grill-me), acceptance criteria, owner repo, risk, dependencies, and validation commands.',
     '- Produce a compact implementation-ready battle plan.',
     '- Keep context scoped; ask for more information if needed.',
     '',
     'Issue body:',
     truncateText(issue.body),
   ].join('\n');
+}
+
+function repoEntryForGitHub(workspaceRoot: string, githubRepo: string) {
+  const manifest = loadRepoManifest(workspaceRoot);
+  return manifest.repos.find((entry) => entry.github === githubRepo) ?? null;
+}
+
+function repoWorkspaceForGitHub(workspaceRoot: string, githubRepo: string) {
+  const repo = repoEntryForGitHub(workspaceRoot, githubRepo);
+  if (!repo) return workspaceRoot;
+
+  const health = getRepoHealth(workspaceRoot, repo);
+  return health.checkedOut ? health.resolvedPath : workspaceRoot;
+}
+
+function repoIdForGitHub(workspaceRoot: string, githubRepo: string) {
+  return repoEntryForGitHub(workspaceRoot, githubRepo)?.id ?? null;
 }
 
 export function runIssueNext(workspaceRoot: string, label = 'ready-to-engage') {
@@ -158,7 +176,9 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
         'input.json': JSON.stringify({ issue: options.issue, label }, null, 2),
       })
     : null;
-  const adapterCommand = getAdapterCommand(workspaceRoot);
+  const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
+  const adapterRepoId = repoIdForGitHub(workspaceRoot, ref.repo);
+  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd, { repoId: adapterRepoId }).display;
   const campaignStatus = options.markReady
     ? setCampaignStatus(options.issue, 'ready-to-engage', { confirm: options.confirmStatus })
     : null;
@@ -168,6 +188,6 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
     return { prompt, artifact, launched: false, adapterCommand, campaignStatus, contextSummary };
   }
 
-  const launched = spawnSync(adapterCommand, [], { input: prompt, stdio: ['pipe', 'inherit', 'inherit'] }).status === 0;
-  return { prompt, artifact, launched, adapterCommand, campaignStatus, contextSummary };
+  const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd, repoId: adapterRepoId });
+  return { prompt, artifact, launched: launch.launched, adapterCommand: launch.invocation.display, campaignStatus, contextSummary, launchError: launch.error };
 }

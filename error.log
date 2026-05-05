@@ -1,0 +1,21 @@
+[2026-05-05T16:38:29.896690+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-05T16:38:29.898801+00:00] auth: mode=ChatGPT account_id=bd6c2c07-8e61-44ba-88ea-113e03ecb7b4
+[2026-05-05T16:38:29.898888+00:00] auth: set ChatGPT-Account-Id header: bd6c2c07-8e61-44ba-88ea-113e03ecb7b4
+[2026-05-05T16:38:29.927425+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-05T16:38:29.929374+00:00] auth: mode=ChatGPT account_id=bd6c2c07-8e61-44ba-88ea-113e03ecb7b4
+[2026-05-05T16:38:29.929478+00:00] auth: set ChatGPT-Account-Id header: bd6c2c07-8e61-44ba-88ea-113e03ecb7b4
+[2026-05-05T16:38:30.467315+00:00] http.list_tasks: env=<all> limit=20 cursor_in=<none> cursor_out=<none> items=0
+[2026-05-05T16:53:41.632325+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-05T16:53:41.635910+00:00] auth: mode=ChatGPT account_id=bd6c2c07-8e61-44ba-88ea-113e03ecb7b4
+[2026-05-05T16:53:41.636016+00:00] auth: set ChatGPT-Account-Id header: bd6c2c07-8e61-44ba-88ea-113e03ecb7b4
+[2026-05-05T16:53:42.059413+00:00] http.list_tasks: env=<all> limit=20 cursor_in=<none> cursor_out=<none> items=0
+[2026-05-05T16:54:32.108952+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-05T16:54:32.111587+00:00] auth: mode=ChatGPT account_id=bd6c2c07-8e61-44ba-88ea-113e03ecb7b4
+[2026-05-05T16:54:32.111710+00:00] auth: set ChatGPT-Account-Id header: bd6c2c07-8e61-44ba-88ea-113e03ecb7b4
+[2026-05-05T16:59:20.107356+00:00] startup: base_url=https://chatgpt.com/backend-api path_style=wham
+[2026-05-05T16:59:20.110050+00:00] auth: mode=ChatGPT account_id=bd6c2c07-8e61-44ba-88ea-113e03ecb7b4
+[2026-05-05T16:59:20.110158+00:00] auth: set ChatGPT-Account-Id header: bd6c2c07-8e61-44ba-88ea-113e03ecb7b4
+[2026-05-05T16:59:20.117017+00:00] env: parsed SSH GitHub origin => TeamFloPay/warroom
+[2026-05-05T16:59:21.946997+00:00] env: status=200 OK content-type=application/json
+[2026-05-05T16:59:22.295737+00:00] env: status=200 OK content-type=application/json
+[2026-05-05T16:59:22.670904+00:00] http.list_tasks: env=69fa219208d08191a4691cb1ce1add7b limit=1 cursor_in=<none> cursor_out=<none> items=0

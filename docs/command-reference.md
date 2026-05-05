@@ -13,12 +13,14 @@ warroom sync --report
 warroom campaign status-check
 warroom campaign labels
 warroom campaign status --issue TeamFloPay/infra#4 --status battlefield-active
+warroom allies status
 warroom maps study
 warroom maps assign --check
 warroom maps assign --repo sdk --add-framework TypeScript --add-resource github-cli
 warroom issue triage
 warroom issue triage --issue TeamFloPay/infra#4 --dry-run --mark-ready --write-artifact
 warroom issue next
+warroom issue next --dry-run
 warroom issue create
 warroom issue fortify
 warroom pr engage --issue TeamFloPay/infra#4 --base main
@@ -44,15 +46,16 @@ warroom pr review --help
 - `sync --report` does not fetch or pull. Without `--report`, sync skips dirty repos and only fast-forwards clean checkouts.
 - `campaign labels --apply` creates missing repo labels only when `--confirm` is also present.
 - `campaign status` previews issue status movement unless `--confirm` is present. Moving to `blockaded` requires `--reason`.
-- Issue and PR handoff commands print scoped prompts by default. Add `--dry-run` for explicit preview mode or `--launch` to start the configured LLM adapter.
-- Workflow status movement is guarded separately with `--confirm-status`.
+- Issue and PR handoff commands print scoped prompts by default, except interactive `issue next`, which launches the selected issue by default. `pr engage` and selected `issue next` launches are implementation handoffs, not preflight-only planning. Add `--dry-run` for preview mode.
+- Workflow status movement is guarded separately with `--confirm-status`, except interactive `issue next`, which moves the selected issue to `battlefield-active` by default. Add `--no-status` to skip that movement.
 - `pr merge` only merges when `--confirm` is present. Victory summary comments require `--post-summary --confirm-summary`; local checkout cleanup requires `--cleanup-local --confirm-cleanup`.
 - `commit create` only commits when `--confirm` is present. `--all` is also explicit, and validation commands must pass before a confirmed commit proceeds.
+- `allies status` is read-only. It validates shared ally docs and env templates, and reports local-only env/checkouts without cloning, syncing, or reading secret values.
 - `abort` preserves work by default. `--stash` requires `--confirm`; the destructive last-resort reset path requires `--danger-reset --confirm-danger "discard local work"`.
 
 ## Command Notes
 
-`warroom doctor` validates files, `repos.yaml`, `resources.yaml`, resource references, LLM adapter shape, local repo health, local tool availability including `gh`, and Campaign Map label presence. Label fixes are printed as a reviewed create plan; doctor does not mutate labels.
+`warroom doctor` validates files, `repos.yaml`, `allies.yaml`, `resources.yaml`, ally shared docs, resource references, LLM adapter shape, local repo health, local tool availability including `gh`, and Campaign Map label presence. Label fixes are printed as a reviewed create plan; doctor does not mutate labels.
 
 `warroom campaign status-check` validates the Campaign Map Status field options: `needs-triage`, `ready-to-engage`, `battlefield-active`, `skirmish`, `blockaded`, and `victory`.
 
@@ -60,15 +63,19 @@ warroom pr review --help
 
 `warroom campaign status` previews or applies issue movement on the Campaign Map. Use `--confirm` to mutate the board.
 
+`warroom allies status` reports enterprise ally workspace health. It checks committed safe metadata and docs, verifies expected Campaign Map/client labels on ally issue repos, reports whether local ally `.env.local` files exist, and reports whether client issue repos are checked out under ignored `allies/<ally>/repos/*`. It does not clone repos, sync Unito data, mutate labels, or print secret values.
+
 `warroom maps assign` validates or updates Sergeant/resource assignments. Use `--repo`, `--sergeant`, `--add-framework`, `--remove-framework`, `--add-domain`, `--remove-domain`, `--add-resource`, and `--remove-resource` for targeted specialist-context edits. Use `--resource-id` with `--resource-type`, `--resource-name`, `--resource-description`, and `--resource-docs-url` to add or update safe logical resource definitions. Pass `--write` to update `repos.yaml`, `resources.yaml`, and regenerate `maps/campaign-atlas.md`; protected notes blocks are preserved.
 
 `warroom issue triage` lists Campaign Map items in `needs-triage`. If the project query returns no items, it falls back to open issues with the `needs-triage` label. With `--issue owner/repo#number`, it builds a scoped handoff prompt with the assigned Sergeant, repo specialist context, and allowed resources, and can write `.warroom/runs/*` artifacts. Add `--mark-ready --confirm-status` after a successful triage to move the issue to `ready-to-engage`.
 
-`warroom issue next` lists Campaign Map items in `ready-to-engage`. If the project query returns no items, it falls back to open issues with the `ready-to-engage` label.
+`warroom issue next` lists Campaign Map items in `ready-to-engage`. If the project query returns no items, it falls back to open issues with the `ready-to-engage` label. In an interactive terminal it prompts for a numbered issue and then starts the same scoped implementation handoff as `warroom pr engage --issue ... --launch --confirm-status`. Add `--dry-run` to preview the handoff without launching or moving status, `--no-status` to launch without Campaign Map movement, or `--no-select` to keep list-only output.
 
 `warroom issue create` and `warroom issue fortify` are explicit post-MVP placeholders tracked by TeamFloPay/infra#7.
 
-`warroom pr engage`, `warroom pr review`, and `warroom pr merge` provide preflight plans and scoped handoffs with the assigned Sergeant, repo specialist context, and allowed resources. `pr engage --base main` defaults to `main`; `stage` remains the secondary target option after validation. `pr review --dry-run` includes PR files, comments, latest reviews, check state, context size, and a 60-minute default check-in instruction for future feedback loops. `pr merge` includes merge state, review decision, draft state, status checks, readiness blockers, and a generated victory summary. Add `--summary <text>` to customize the summary, `--write-artifact` to store `prompt.md`, `pr.json`, `readiness.json`, `summary.md`, `summary-posts.json`, and `local-cleanup.json`, and `--post-summary --confirm-summary` to post comments to the PR plus linked issue. Add `--cleanup-local --confirm-cleanup` to switch the mapped clean local checkout back to the PR base branch when it is currently on the PR branch. `pr engage --confirm-status` moves the issue to `battlefield-active`; `pr review --issue ... --confirm-status` moves it to `skirmish`; `pr merge --issue ... --confirm-status` moves it to `victory` only when no merge-readiness blockers are detected. Full code-writing automation remains human-directed through the launched adapter.
+`warroom pr engage` launches development from an issue. It includes the issue body, GitHub discussion/triage comments, assigned Sergeant, repo specialist context, allowed resources, base branch, and a generated feature branch name, then instructs the adapter to implement, validate, and commit rather than write a preflight markdown plan. `pr engage --base main` defaults to `main`; `stage` remains the secondary target option after validation. `warroom pr review` and `warroom pr merge` provide scoped handoffs for later review and merge stages. `pr review --dry-run` includes PR files, comments, latest reviews, check state, context size, and a 60-minute default check-in instruction for future feedback loops. `pr merge` includes merge state, review decision, draft state, status checks, readiness blockers, and a generated victory summary. Add `--summary <text>` to customize the summary, `--write-artifact` to store `prompt.md`, `pr.json`, `readiness.json`, `summary.md`, `summary-posts.json`, and `local-cleanup.json`, and `--post-summary --confirm-summary` to post comments to the PR plus linked issue. Add `--cleanup-local --confirm-cleanup` to switch the mapped clean local checkout back to the PR base branch when it is currently on the PR branch. `pr engage --confirm-status` moves the issue to `battlefield-active`; `pr review --issue ... --confirm-status` moves it to `skirmish`; `pr merge --issue ... --confirm-status` moves it to `victory` only when no merge-readiness blockers are detected.
+
+Set `LLM_ADAPTER=codex-cloud` and repo-specific environment ids such as `CODEX_CLOUD_ENV_BACKEND=<environment-id>` or `CODEX_CLOUD_ENV_SDK=<environment-id>` in `.env.local` when launches should create durable Codex Cloud tasks instead of foreground terminal sessions. War Room selects the environment from the owning repo id in `repos.yaml`. If `codex cloud` opens Codex Desktop without showing an environment id, Codex Cloud still needs an environment configured for the target repo before War Room can submit tasks.
 
 `warroom commit create` inspects a mapped child repo, summarizes changed files, proposes a conventional commit message, optionally runs repeatable `--validate <command>` checks from the target repo, and refuses to proceed when other child repos are dirty. Add `--write-artifact` to write `input.json`, `result.json`, `summary.md`, `status.txt`, and `validation.json` under ignored `.warroom/runs/*`. A confirmed commit without `--all` requires the target repo to have only staged changes.
 

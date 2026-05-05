@@ -2,7 +2,9 @@
 import { Command } from 'commander';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { createInterface } from 'node:readline';
 import { runAbort, type AbortResult } from './commands/abort.js';
+import { runAlliesStatus, type AlliesStatus } from './commands/allies.js';
 import { runBootstrap, type BootstrapResult } from './commands/bootstrap.js';
 import { runCampaignLabels, runCampaignStatus, runCampaignStatusCheck } from './commands/campaign.js';
 import { runCommitCreate, type CommitCreateResult } from './commands/commit-create.js';
@@ -14,7 +16,13 @@ import {
   unlinkSdkFromDemo,
 } from './commands/dev-link.js';
 import { runDoctor } from './commands/doctor.js';
-import { runIssueNext, runIssueTriage, type IssueHandoffResult, type IssueListResult } from './commands/issues.js';
+import {
+  runIssueNext,
+  runIssueTriage,
+  type IssueHandoffResult,
+  type IssueListResult,
+  type IssueSummary,
+} from './commands/issues.js';
 import { runMapsAssign, type MapsAssignResult } from './commands/maps-assign.js';
 import { runMapsStudy } from './commands/maps-study.js';
 import { runPrEngage, runPrMerge, runPrReview, type PrPlanResult } from './commands/pr.js';
@@ -22,6 +30,13 @@ import { runSync, type SyncResult } from './commands/sync.js';
 import { CAMPAIGN_STATUSES, type CampaignStatusName } from './lib/campaign.js';
 
 type Output = (text: string) => void;
+type Input = NodeJS.ReadableStream & { isTTY?: boolean };
+type BuildProgramOptions = {
+  cwd?: string;
+  output?: Output;
+  input?: Input;
+  interactive?: boolean;
+};
 
 function printJson(output: Output, value: unknown) {
   output(JSON.stringify(value, null, 2));
@@ -58,6 +73,22 @@ function printSync(output: Output, result: SyncResult) {
   }
 }
 
+function printAlliesStatus(output: Output, result: AlliesStatus) {
+  output(`Allies: ${result.ok ? 'ok' : 'needs attention'} (${result.activeAllyCount} active, ${result.plannedAllyCount} planned)`);
+  for (const ally of result.allies) {
+    const issueRepo = ally.issueRepoCheckedOut
+      ? `issue repo present${ally.issueRepoClean === false ? ', dirty' : ally.issueRepoClean === true ? ', clean' : ''}`
+      : 'issue repo missing';
+    output(
+      `${ally.id}: ${ally.status}, docs ${ally.sharedDocsOk ? 'ok' : 'missing'}, labels ${ally.labels.missing.length === 0 && ally.labels.checked ? 'ok' : 'missing'}, env ${ally.envLocalExists ? 'present' : 'missing'}, ${issueRepo} -> ${ally.localPath}`
+    );
+    if (!ally.envExampleExists) output(`missing env example: ${ally.envExamplePath}`);
+    for (const doc of ally.docsStatus.filter((entry) => !entry.exists)) output(`missing doc: ${doc.path}`);
+    if (ally.labels.error) output(`label check failed: ${ally.labels.error}`);
+    for (const label of ally.labels.missing) output(`missing label: ${ally.issue_repo.github}:${label}`);
+  }
+}
+
 function printMapsAssign(output: Output, result: MapsAssignResult) {
   output(`Campaign atlas: ${result.atlasMatches ? 'up to date' : 'needs regeneration'}`);
   output(`Resource references: ${result.resourceReferencesOk ? 'ok' : 'missing references'}`);
@@ -65,14 +96,45 @@ function printMapsAssign(output: Output, result: MapsAssignResult) {
   for (const message of result.messages) output(message);
 }
 
-function printIssueList(output: Output, result: IssueListResult) {
+function printIssueList(output: Output, result: IssueListResult, options: { numbered?: boolean } = {}) {
   const selector = result.source === 'campaign' ? `Campaign status ${result.status}` : `label ${result.label}`;
   output(`Issues with ${selector}: ${result.issues.length}`);
-  for (const issue of result.issues) output(`${issue.repo}#${issue.number} ${issue.title} ${issue.url}`);
+  result.issues.forEach((issue, index) => {
+    const prefix = options.numbered ? `${index + 1}. ` : '';
+    output(`${prefix}${issue.repo}#${issue.number} ${issue.title} ${issue.url}`);
+  });
+}
+
+async function promptIssueSelection(output: Output, input: Input, issues: IssueSummary[]) {
+  if (issues.length === 0) return null;
+
+  output('Select an issue number to engage, or enter 0 to cancel.');
+  output('Selection:');
+
+  const readline = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of readline) {
+      const answer = line.trim().toLowerCase();
+      if (answer === '0' || answer === 'q' || answer === 'quit' || answer === 'cancel') return null;
+
+      const selected = Number(answer);
+      if (Number.isInteger(selected) && selected >= 1 && selected <= issues.length) {
+        return issues[selected - 1] ?? null;
+      }
+
+      output(`Enter a number from 1 to ${issues.length}, or 0 to cancel.`);
+      output('Selection:');
+    }
+  } finally {
+    readline.close();
+  }
+
+  return null;
 }
 
 function printIssueHandoff(output: Output, result: IssueHandoffResult) {
   output(`Adapter: ${result.adapterCommand}${result.launched ? ' (launched)' : ' (not launched)'}`);
+  if (result.launchError) output(`Adapter error: ${result.launchError}`);
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
   if (result.contextSummary) {
     output(`Context size: ${result.contextSummary.promptCharacters} chars`);
@@ -89,8 +151,11 @@ function printIssueHandoff(output: Output, result: IssueHandoffResult) {
 }
 
 function printPrPlan(output: Output, result: PrPlanResult) {
-  output(`PR ${result.action}: ${result.launched ? 'launched' : 'preflight only'}`);
+  const state = result.launched ? 'launched' : result.action === 'engage' ? 'dry run' : 'preflight only';
+  output(`PR ${result.action}: ${state}`);
   if (result.adapterCommand) output(`Adapter: ${result.adapterCommand}`);
+  if (result.adapterCwd) output(`Adapter cwd: ${result.adapterCwd}`);
+  if (result.launchError) output(`Adapter error: ${result.launchError}`);
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
   if (result.contextSummary) {
     output(`Context size: ${result.contextSummary.promptCharacters} chars`);
@@ -225,9 +290,11 @@ function printDevAction(output: Output, action: DevActionResult) {
   printDevStatus(output, action.status);
 }
 
-export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
+export function buildProgram(options: BuildProgramOptions = {}) {
   const workspaceRoot = options.cwd ?? process.cwd();
   const output = options.output ?? console.log;
+  const input = options.input ?? process.stdin;
+  const interactive = options.interactive ?? Boolean(input.isTTY);
   const program = new Command();
 
   program
@@ -257,6 +324,8 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
         output(`${tool.ok ? 'ok' : 'missing'} ${tool.name}${tool.detail ? ` (${tool.detail})` : ''}`);
       }
       output(`LLM adapter: ${result.env.adapter ?? 'unset'}${result.env.adapterSupported ? '' : ' (unsupported)'}`);
+      for (const note of result.env.notes) output(`LLM note: ${note}`);
+      output(`Allies: ${result.allies.ok ? 'ok' : 'needs attention'} (${result.allies.activeAllyCount} active, ${result.allies.plannedAllyCount} planned)`);
       output(`Resource references: ${result.resources.referencesOk ? 'ok' : 'missing references'}`);
       output(
         `Campaign statuses: ${result.campaignStatuses.errors.length > 0 ? 'check failed' : result.campaignStatuses.missing.length === 0 && result.campaignStatuses.unexpected.length === 0 ? 'ok' : 'needs attention'}`
@@ -271,6 +340,21 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
         const dirty = repo.clean === false ? ', dirty' : repo.clean === true ? ', clean' : '';
         output(`${repo.github}: ${checkout}${dirty} -> ${repo.resolvedPath}`);
       }
+    });
+
+  const allies = program.command('allies').description('Inspect enterprise ally workspaces.');
+
+  allies
+    .command('status')
+    .description('Show ally workspace health, shared docs, local env, and issue repo checkout state.')
+    .option('--json', 'Print machine-readable output.')
+    .action((opts: { json?: boolean }) => {
+      const result = runAlliesStatus(workspaceRoot);
+      if (opts.json) {
+        printJson(output, result);
+        return;
+      }
+      printAlliesStatus(output, result);
     });
 
   const maps = program.command('maps').description('Inspect and maintain the repo map.');
@@ -459,22 +543,71 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
     });
   issue
     .command('next')
-    .description('List issues ready for implementation using a matching label.')
+    .description('List issues ready for implementation and select one to start development.')
     .option('--label <label>', 'Ready label to query.', 'ready-to-engage')
+    .option('--base <branch>', 'Target branch for the eventual PR.', 'main')
+    .option('--dry-run', 'Print the selected issue handoff without launching the adapter or moving Campaign Map status.')
+    .option('--launch', 'Launch the configured LLM adapter for the selected issue. This is the default after selection.')
+    .option('--confirm-status', 'Move the selected issue to battlefield-active on the Campaign Map. This is the default after selection.')
+    .option('--no-status', 'Do not move the selected issue to battlefield-active.')
+    .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
+    .option('--no-select', 'List issues without prompting for a selection.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: { label?: string; json?: boolean }) => {
-      const result = runIssueNext(workspaceRoot, opts.label);
-      if (opts.json) {
-        printJson(output, result);
-        return;
+    .action(
+      async (opts: {
+        label?: string;
+        base?: string;
+        dryRun?: boolean;
+        launch?: boolean;
+        confirmStatus?: boolean;
+        status?: boolean;
+        writeArtifact?: boolean;
+        select?: boolean;
+        json?: boolean;
+      }) => {
+        const result = runIssueNext(workspaceRoot, opts.label);
+        if (opts.json) {
+          printJson(output, result);
+          return;
+        }
+        const canSelect = opts.select !== false && interactive && result.issues.length > 0;
+        printIssueList(output, result, { numbered: canSelect });
+
+        if (!canSelect) {
+          if (opts.select !== false && result.issues.length > 0 && !interactive) {
+            output(
+              'Selection is available in an interactive terminal. Run warroom pr engage --issue <owner/repo#number> to engage one directly.'
+            );
+          }
+          return;
+        }
+
+        const selected = await promptIssueSelection(output, input, result.issues);
+        if (!selected) {
+          output('No issue selected.');
+          return;
+        }
+
+        const issueRef = `${selected.repo}#${selected.number}`;
+        output(`Engaging ${issueRef}`);
+        const dryRun = opts.dryRun === true;
+        const plan = runPrEngage(workspaceRoot, {
+          issue: issueRef,
+          base: opts.base,
+          dryRun,
+          confirmStatus: dryRun ? false : opts.status !== false || opts.confirmStatus === true,
+          writeArtifact: opts.writeArtifact,
+          issueTitle: selected.title,
+          issueUrl: selected.url,
+        });
+        printPrPlan(output, plan);
       }
-      printIssueList(output, result);
-    });
+    );
 
   const pr = program.command('pr').description('Pull request workflow commands.');
   pr
     .command('engage')
-    .description('Create a scoped PR engagement preflight handoff from an issue.')
+    .description('Create a scoped implementation handoff from an issue.')
     .requiredOption('--issue <owner/repo#number>', 'Issue to implement.')
     .option('--base <branch>', 'Target branch for the eventual PR.', 'main')
     .option('--dry-run', 'Print the structured handoff without launching the configured LLM adapter.')
@@ -483,6 +616,9 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
     .action((opts: { issue: string; base?: string; dryRun?: boolean; launch?: boolean; confirmStatus?: boolean; writeArtifact?: boolean; json?: boolean }) => {
+      if (opts.launch && opts.dryRun !== true && !opts.json) {
+        output(`Preparing implementation for ${opts.issue}...`);
+      }
       const result = runPrEngage(workspaceRoot, {
         issue: opts.issue,
         base: opts.base,
@@ -660,5 +796,10 @@ if (path.resolve(currentFile) === invokedFile) {
     if (error.code === 'EPIPE') process.exit(0);
     throw error;
   });
-  buildProgram().parse(process.argv.map((arg) => (arg === '-help' ? '--help' : arg)));
+  buildProgram()
+    .parseAsync(process.argv.map((arg) => (arg === '-help' ? '--help' : arg)))
+    .catch((error: unknown) => {
+      console.error(error instanceof Error ? error.message : String(error));
+      process.exit(1);
+    });
 }

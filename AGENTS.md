@@ -14,7 +14,7 @@ If instructions conflict:
 
 ## Ownership
 
-- War Room owns repo maps, local command orchestration, company-level agent guidance, local run artifacts, and future issue/PR workflow helpers.
+- War Room owns repo maps, ally maps, local command orchestration, company-level agent guidance, local run artifacts, and future issue/PR workflow helpers.
 - Child repositories own product source code, product CI, deployable infrastructure, package publishing, and repo-specific docs.
 - Do not copy SDK, backend, app, or infra product source into War Room.
 - Keep child repo checkouts under ignored `maps/repos/*`; commit product changes in the owning child repository.
@@ -30,6 +30,8 @@ If instructions conflict:
 
 - Do not commit real secrets, tokens, private endpoints, local env values, certificates, or provider credentials.
 - `.env.local` is local-only and ignored.
+- `allies/*/.env.local`, `allies/*/repos/*`, and `allies/*/workspace/*` are local-only and ignored.
+- Ally docs may contain safe internal operating context, but must not contain raw client exports, production data, contracts, private endpoints, real credentials, or client PII.
 - `repos.yaml`, `resources.yaml`, and map docs may contain logical resource IDs, public docs URLs, and safe internal documentation paths only.
 
 ## Cross-Repo Workflow

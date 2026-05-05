@@ -17,6 +17,11 @@ coverage/
 .warroom/dev/*
 !.warroom/dev/.gitkeep
 
+# Ally secrets, local client repo checkouts, and machine-specific workspace state.
+allies/*/.env.local
+allies/*/repos/*
+allies/*/workspace/*
+
 # Child repositories are cloned locally and committed in their own repos.
 maps/repos/*
 !maps/repos/.gitkeep

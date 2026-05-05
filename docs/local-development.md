@@ -37,6 +37,37 @@ Report child repo sync state without pulling:
 npm run warroom -- sync --report
 ```
 
+## Enterprise Allies
+
+Enterprise client workspaces live under `allies/*` and are tracked by `allies.yaml`.
+
+Committed ally files hold safe shared operating context:
+
+```text
+allies/clicktech/
+  README.md
+  .env.local.example
+  docs/
+```
+
+Ignored ally paths hold local or sensitive state:
+
+```text
+allies/clicktech/.env.local
+allies/clicktech/repos/*
+allies/clicktech/workspace/*
+```
+
+Use `docs/*` for shared client documentation that is safe for the private War Room repo. Use `workspace/*` for local scratch, raw exports, experiments, or notes that should not be committed. Real API keys, client data, private endpoints, contracts, and PII must stay out of git.
+
+Check ally health:
+
+```sh
+npm run warroom -- allies status
+```
+
+For ClickTech, Stripe keys belong in `allies/clicktech/.env.local`. Existing consumers may still use `STRIPE_USD`, `STRIPE_GBP`, and `STRIPE_EUR`; add account-specific variable names only when the consuming workflow is clear.
+
 ## SDK-To-Demo Linking
 
 Use local linking when you need to change SDK packages and verify those changes in the standalone demo before publishing `@flopay/*`.

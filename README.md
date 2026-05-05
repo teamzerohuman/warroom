@@ -42,9 +42,12 @@ Run the normal operating checks:
 ```sh
 npm run warroom -- campaign status-check
 npm run warroom -- campaign labels
+npm run warroom -- allies status
 npm run warroom -- maps study
 npm run warroom -- issue next
 ```
+
+In an interactive terminal, `issue next` prints numbered ready issues and lets you choose one to start the PR engagement handoff. The selected issue is moved to `battlefield-active` and handed to the configured LLM adapter; add `--dry-run` to preview without launching or moving status.
 
 If you already keep sibling checkouts next to War Room, such as `../sdk` or `../demo`, the CLI can detect those when the mapped `maps/repos/*` checkout is missing. `repos.yaml` remains the ownership map either way.
 
@@ -94,6 +97,7 @@ Use `npm run warroom -- dev unlink` to restore published-package behavior.
 - Child repos live locally under ignored `maps/repos/*`.
 - No Git submodules by default.
 - Secrets are never committed.
+- Enterprise ally secrets live in ignored `allies/<ally>/.env.local` files.
 - War Room uses npm for its TypeScript CLI package.
 - Child repos can use their own package managers and workflows.
 
@@ -110,6 +114,24 @@ Current mapped repos:
 - `docs`
 - `dashboard`
 - `landing`
+
+## Enterprise Allies
+
+Enterprise client support lives under `allies/*`. The shared manifest is `allies.yaml`; it tracks safe metadata such as ally id, shared docs, local env path, and client issue repo sync boundary.
+
+ClickTech is the first ally workspace:
+
+- Safe shared docs: `allies/clicktech/docs/*`
+- Local secrets: `allies/clicktech/.env.local`
+- Local scratch: `allies/clicktech/workspace/*`
+- Client issue repo checkout: `allies/clicktech/repos/ally-clicktech`
+- Planned issue sync: ClickTech Jira <> Unito <> `TeamFloPay/ally-clicktech`
+
+Check ally readiness:
+
+```sh
+npm run warroom -- allies status
+```
 
 ## Documentation
 

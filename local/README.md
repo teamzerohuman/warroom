@@ -11,3 +11,5 @@ npm run warroom -- dev status
 npm run warroom -- dev link
 npm run warroom -- dev unlink
 ```
+
+Enterprise ally local state belongs under `../allies/<ally>/workspace/*` and `../allies/<ally>/repos/*`. Those paths are ignored because they may contain client-specific scratch work or client issue repo checkouts.
