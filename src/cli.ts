@@ -90,6 +90,11 @@ function printPrPlan(output: Output, result: PrPlanResult) {
     output(`Summary ${post.target}: ${state} ${post.ref}${post.url ? ` ${post.url}` : ''}${post.reason ? ` (${post.reason})` : ''}`);
     if (post.error) output(`summary error: ${post.error}`);
   }
+  if (result.localCleanup) {
+    output(`Local cleanup: ${result.localCleanup.applied ? 'applied' : result.localCleanup.blocked.length ? 'blocked' : 'planned'} ${result.localCleanup.repo}`);
+    for (const blocker of result.localCleanup.blocked) output(`cleanup blocked: ${blocker}`);
+    for (const message of result.localCleanup.messages) output(`cleanup: ${message}`);
+  }
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
   }
@@ -469,6 +474,8 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
     .option('--summary <text>', 'Victory summary to include in local artifacts and optional comments.')
     .option('--post-summary', 'Plan or post victory summary comments to the PR and linked issue.')
     .option('--confirm-summary', 'Actually post victory summary comments. Requires --post-summary.')
+    .option('--cleanup-local', 'Plan or return the mapped local checkout to the PR base branch.')
+    .option('--confirm-cleanup', 'Actually switch the mapped local checkout when cleanup is safe. Requires --cleanup-local.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
     .action((opts: {
@@ -479,6 +486,8 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
       summary?: string;
       postSummary?: boolean;
       confirmSummary?: boolean;
+      cleanupLocal?: boolean;
+      confirmCleanup?: boolean;
       writeArtifact?: boolean;
       json?: boolean;
     }) => {
@@ -490,6 +499,8 @@ export function buildProgram(options: { cwd?: string; output?: Output } = {}) {
         summary: opts.summary,
         postSummary: opts.postSummary,
         confirmSummary: opts.confirmSummary,
+        cleanupLocal: opts.cleanupLocal,
+        confirmCleanup: opts.confirmCleanup,
         writeArtifact: opts.writeArtifact,
       });
       if (opts.json) {

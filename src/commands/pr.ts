@@ -2,6 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
 import { setCampaignStatus, type CampaignStatusSetResult } from '../lib/campaign.js';
 import { getAdapterCommand } from '../lib/env.js';
+import { getRepoHealth, loadRepoManifest, runGit } from '../lib/repos.js';
 import { parseIssueRef } from './issues.js';
 
 export type PrOptions = {
@@ -15,6 +16,8 @@ export type PrOptions = {
   summary?: string;
   postSummary?: boolean;
   confirmSummary?: boolean;
+  cleanupLocal?: boolean;
+  confirmCleanup?: boolean;
 };
 
 export type MergeReadiness = {
@@ -37,6 +40,17 @@ export type SummaryPostResult = {
   error: string | null;
 };
 
+export type LocalCleanupResult = {
+  repo: string;
+  path: string | null;
+  currentBranch: string | null;
+  targetBranch: string | null;
+  clean: boolean | null;
+  applied: boolean;
+  blocked: string[];
+  messages: string[];
+};
+
 export type PrPlanResult = {
   prompt: string;
   artifact: RunArtifact | null;
@@ -48,6 +62,7 @@ export type PrPlanResult = {
   summary?: string;
   summaryPosts?: SummaryPostResult[];
   merged?: boolean;
+  localCleanup?: LocalCleanupResult | null;
 };
 
 function ghJson<T>(args: string[], fallback: T): T {
@@ -209,6 +224,69 @@ function buildSummaryPostPlan(options: PrOptions, summary: string, readiness: Me
       error: result.error,
     };
   });
+}
+
+function planLocalCleanup(
+  workspaceRoot: string,
+  prRepo: string,
+  headRefName: string | undefined,
+  baseRefName: string | undefined,
+  options: PrOptions
+): LocalCleanupResult | null {
+  if (!options.cleanupLocal) return null;
+
+  const manifest = loadRepoManifest(workspaceRoot);
+  const repoEntry = manifest.repos.find((entry) => entry.github === prRepo);
+  const targetBranch = baseRefName ?? manifest.defaults.default_branch;
+
+  if (!repoEntry) {
+    return {
+      repo: prRepo,
+      path: null,
+      currentBranch: null,
+      targetBranch,
+      clean: null,
+      applied: false,
+      blocked: [`No mapped child repo found for ${prRepo}.`],
+      messages: [],
+    };
+  }
+
+  const repo = getRepoHealth(workspaceRoot, repoEntry);
+  const blocked: string[] = [];
+  const messages: string[] = [];
+
+  if (!repo.checkedOut) blocked.push(`Repo checkout is missing: ${repo.resolvedPath}`);
+  if (repo.clean === false) blocked.push(`Repo checkout is dirty: ${repo.resolvedPath}`);
+  if (!repo.branch) blocked.push('Repo current branch is unknown.');
+  if (repo.branch && headRefName && repo.branch !== headRefName && repo.branch !== targetBranch) {
+    blocked.push(`Repo is on ${repo.branch}, not PR branch ${headRefName} or target branch ${targetBranch}.`);
+  }
+  if (repo.branch === targetBranch) messages.push(`Already on ${targetBranch}.`);
+
+  let applied = false;
+  if (options.confirmCleanup && blocked.length === 0 && repo.branch !== targetBranch) {
+    const switched = runGit(repo.resolvedPath, ['switch', targetBranch]);
+    if (switched.status !== 0) {
+      blocked.push(switched.stderr || `git switch ${targetBranch} failed with exit ${switched.status ?? 'unknown'}.`);
+    } else {
+      applied = true;
+      messages.push(`Switched local checkout to ${targetBranch}.`);
+    }
+  } else if (!options.confirmCleanup && repo.branch !== targetBranch) {
+    messages.push('Pass --confirm-cleanup to switch the local checkout when the preflight is clear.');
+  }
+
+  return {
+    repo: repo.github,
+    path: repo.resolvedPath,
+    currentBranch: repo.branch,
+    targetBranch,
+    clean: repo.clean,
+    applied,
+    blocked,
+    messages,
+  };
 }
 
 export function runPrEngage(workspaceRoot: string, options: PrOptions): PrPlanResult {
@@ -400,6 +478,7 @@ export function runPrMerge(workspaceRoot: string, options: PrOptions): PrPlanRes
   }
 
   const summaryPosts = buildSummaryPostPlan(options, summary, readiness);
+  const localCleanup = planLocalCleanup(workspaceRoot, ref.repo, pr.headRefName, pr.baseRefName, options);
   const campaignStatus = options.issue
     ? setCampaignStatus(options.issue, 'victory', { confirm: options.confirmStatus && readiness.blocked.length === 0 })
     : null;
@@ -411,6 +490,7 @@ export function runPrMerge(workspaceRoot: string, options: PrOptions): PrPlanRes
         'readiness.json': JSON.stringify(readiness, null, 2),
         'summary.md': summary,
         'summary-posts.json': JSON.stringify(summaryPosts, null, 2),
+        'local-cleanup.json': JSON.stringify(localCleanup, null, 2),
       })
     : null;
 
@@ -425,5 +505,6 @@ export function runPrMerge(workspaceRoot: string, options: PrOptions): PrPlanRes
     summary,
     summaryPosts,
     merged,
+    localCleanup,
   };
 }
