@@ -19,6 +19,19 @@ import { runMapsStudy } from '../src/commands/maps-study.js';
 import { runSync } from '../src/commands/sync.js';
 
 const workspaceRoot = new URL('..', import.meta.url).pathname;
+const FAST_PR_REVIEW_ENV = ['WARROOM_PR_REVIEW_POLL_MS', 'WARROOM_PR_REVIEW_CODERABBIT_SETTLE_MS'] as const;
+
+function setFastPrReviewPolling() {
+  const original = Object.fromEntries(FAST_PR_REVIEW_ENV.map((key) => [key, process.env[key]]));
+  process.env.WARROOM_PR_REVIEW_POLL_MS = '0';
+  process.env.WARROOM_PR_REVIEW_CODERABBIT_SETTLE_MS = '0';
+  return () => {
+    for (const [key, value] of Object.entries(original)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  };
+}
 
 describe('phase-1 CLI', () => {
   it('loads the repo map', () => {
@@ -426,6 +439,7 @@ describe('phase-1 CLI', () => {
 
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    const restorePrReviewEnv = setFastPrReviewPolling();
 
     try {
       const lines: string[] = [];
@@ -447,6 +461,35 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('PR review loop iterations: 2');
       expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
     } finally {
+      restorePrReviewEnv();
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('waits for delayed CodeRabbit feedback before closing the review loop', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    const stateFile = path.join(root, 'review-state.txt');
+    mkdirSync(bin, { recursive: true });
+    writePrReviewLoopGhFixture(bin, stateFile, { queue: 'multi', outstandingFirst: true, delayedCodeRabbit: true });
+    writePrReviewLoopCodexFixture(bin, stateFile);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    const restorePrReviewEnv = setFastPrReviewPolling();
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'review', '--pr', 'TeamFloPay/sdk#12', '--launch']);
+
+      expect(lines).toContain('PR review loop 1: 1 outstanding CodeRabbit comment remains; starting another adapter loop.');
+      expect(lines).toContain('PR review loop 2: no outstanding CodeRabbit feedback remains.');
+      expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expect(Number(readFileSync(`${stateFile}.polls`, 'utf8'))).toBeGreaterThanOrEqual(4);
+    } finally {
+      restorePrReviewEnv();
       process.env.PATH = originalPath;
     }
   });
@@ -461,6 +504,7 @@ describe('phase-1 CLI', () => {
 
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    const restorePrReviewEnv = setFastPrReviewPolling();
 
     try {
       const lines: string[] = [];
@@ -480,6 +524,7 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('PR https://github.com/TeamFloPay/backend/pull/657'))).toBe(true);
       expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
     } finally {
+      restorePrReviewEnv();
       process.env.PATH = originalPath;
     }
   });
@@ -495,6 +540,7 @@ describe('phase-1 CLI', () => {
 
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    const restorePrReviewEnv = setFastPrReviewPolling();
 
     try {
       const lines: string[] = [];
@@ -507,6 +553,7 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('codex cloud exec'))).toBe(false);
       expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
     } finally {
+      restorePrReviewEnv();
       process.env.PATH = originalPath;
     }
   });
@@ -1882,14 +1929,14 @@ process.exit(1);
 function writePrReviewLoopGhFixture(
   bin: string,
   stateFile: string,
-  options: { queue: 'single' | 'multi'; outstandingFirst: boolean }
+  options: { queue: 'single' | 'multi'; outstandingFirst: boolean; delayedCodeRabbit?: boolean }
 ) {
   const ghPath = path.join(bin, 'gh');
   writeFileSync(
     ghPath,
     `#!/usr/bin/env node
 const args = process.argv.slice(2);
-const { readFileSync } = require('node:fs');
+const { readFileSync, writeFileSync } = require('node:fs');
 const stateFile = ${JSON.stringify(stateFile)};
 const options = ${JSON.stringify(options)};
 
@@ -1917,6 +1964,25 @@ function loopCount() {
   } catch {
     return 0;
   }
+}
+
+function pollStateFile() {
+  return stateFile + '.polls';
+}
+
+function pollCount() {
+  try {
+    const value = Number(readFileSync(pollStateFile(), 'utf8').trim());
+    return Number.isFinite(value) ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function incrementPollCount() {
+  const next = pollCount() + 1;
+  writeFileSync(pollStateFile(), String(next));
+  return next;
 }
 
 function headSha() {
@@ -1993,7 +2059,8 @@ if (args[0] === 'api' && args[1] === 'graphql') {
   const query = valueFor('query') || '';
 
   if (query.includes('pullRequest')) {
-    const hasOutstanding = options.outstandingFirst && loopCount() === 1;
+    const delayedFeedbackPending = options.delayedCodeRabbit && loopCount() === 1 && pollCount() < 4;
+    const hasOutstanding = options.outstandingFirst && loopCount() === 1 && !delayedFeedbackPending;
     json({
       data: {
         repository: {
@@ -2083,16 +2150,31 @@ if (args[0] === 'pr' && args[1] === 'view') {
   const number = Number(args[2]);
   const isSdk = repo === 'TeamFloPay/sdk';
   const isDemo = repo === 'TeamFloPay/demo';
+  const currentHead = headSha();
+  const poll = incrementPollCount();
+  const delayedCheckPending = options.delayedCodeRabbit && loopCount() === 1 && poll < 4;
   json({
     title: isSdk ? 'Review active SDK work' : isDemo ? 'Review demo follow-up' : 'Remove Recurly & Chargebee Support',
     body: 'Review CodeRabbit feedback.',
     url: 'https://github.com/' + repo + '/pull/' + number,
     headRefName: isSdk ? 'warroom/8-active-sdk-work' : isDemo ? 'warroom/9-demo-follow-up' : 'warroom/632-remove-recurly-chargebee',
     baseRefName: 'main',
-    headRefOid: headSha(),
-    statusCheckRollup: [
-      { name: 'CodeRabbit', status: 'COMPLETED', conclusion: 'SUCCESS' }
-    ]
+    headRefOid: currentHead,
+    reviews: delayedCheckPending
+      ? []
+      : [
+          {
+            author: { login: 'coderabbitai' },
+            state: 'COMMENTED',
+            submittedAt: '2026-05-06T12:00:00Z',
+            commit: { oid: currentHead }
+          }
+        ],
+    statusCheckRollup: delayedCheckPending
+      ? []
+      : [
+          { name: 'CodeRabbit', status: 'COMPLETED', conclusion: 'SUCCESS' }
+        ]
   });
   process.exit(0);
 }

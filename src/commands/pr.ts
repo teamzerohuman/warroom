@@ -151,6 +151,8 @@ export type PrReviewLoopResult = {
     adapterLaunched: boolean;
     adapterError: string | null;
     outstandingCodeRabbitComments: number | null;
+    codeRabbitObserved: boolean | null;
+    codeRabbitSettled: boolean | null;
   }>;
   blocked: string[];
   error: string | null;
@@ -260,6 +262,7 @@ const DEFAULT_CHANGELOG_ACTIONS_SETTLE_MS = 5_000;
 const DEFAULT_PR_REVIEW_MAX_LOOPS = 5;
 const DEFAULT_PR_REVIEW_COMMIT_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_PR_REVIEW_CODERABBIT_TIMEOUT_MS = 15 * 60_000;
+const DEFAULT_PR_REVIEW_CODERABBIT_SETTLE_MS = 60_000;
 const DEFAULT_PR_REVIEW_POLL_MS = 15_000;
 
 function ghJson<T>(args: string[], fallback: T): T {
@@ -569,6 +572,16 @@ type PrReviewSnapshot = {
   headRefName?: string;
   baseRefName?: string;
   headRefOid?: string;
+  reviews?: Array<{
+    author?: {
+      login?: string;
+    };
+    commit?: {
+      oid?: string;
+    };
+    submittedAt?: string;
+    state?: string;
+  }>;
   statusCheckRollup?: Array<{
     name?: string;
     context?: string;
@@ -576,6 +589,8 @@ type PrReviewSnapshot = {
     conclusion?: string;
     state?: string;
     workflowName?: string;
+    startedAt?: string;
+    completedAt?: string;
   }>;
 };
 
@@ -770,7 +785,7 @@ function prReviewSnapshot(ref: { repo: string; number: number }): PrReviewSnapsh
       '--repo',
       ref.repo,
       '--json',
-      'title,body,url,headRefName,baseRefName,headRefOid,statusCheckRollup',
+      'title,body,url,headRefName,baseRefName,headRefOid,reviews,statusCheckRollup',
     ],
     {}
   );
@@ -782,6 +797,9 @@ function prReviewLoopConfig() {
   const codeRabbitTimeout = Number(
     envValue('WARROOM_PR_REVIEW_CODERABBIT_TIMEOUT_MS', String(DEFAULT_PR_REVIEW_CODERABBIT_TIMEOUT_MS))
   );
+  const codeRabbitSettle = Number(
+    envValue('WARROOM_PR_REVIEW_CODERABBIT_SETTLE_MS', String(DEFAULT_PR_REVIEW_CODERABBIT_SETTLE_MS))
+  );
   const poll = Number(envValue('WARROOM_PR_REVIEW_POLL_MS', String(DEFAULT_PR_REVIEW_POLL_MS)));
 
   return {
@@ -792,6 +810,10 @@ function prReviewLoopConfig() {
       Number.isFinite(codeRabbitTimeout) && codeRabbitTimeout >= 0
         ? codeRabbitTimeout
         : DEFAULT_PR_REVIEW_CODERABBIT_TIMEOUT_MS,
+    codeRabbitSettleMs:
+      Number.isFinite(codeRabbitSettle) && codeRabbitSettle >= 0
+        ? codeRabbitSettle
+        : DEFAULT_PR_REVIEW_CODERABBIT_SETTLE_MS,
     pollMs: Number.isFinite(poll) && poll >= 0 ? poll : DEFAULT_PR_REVIEW_POLL_MS,
   };
 }
@@ -811,7 +833,6 @@ function isTerminalCheckState(value: string | null | undefined) {
     'CANCELLED',
     'COMPLETED',
     'ERROR',
-    'EXPECTED',
     'FAILURE',
     'NEUTRAL',
     'SKIPPED',
@@ -822,10 +843,52 @@ function isTerminalCheckState(value: string | null | undefined) {
   ].includes(value.toUpperCase());
 }
 
+function codeRabbitChecks(snapshot: PrReviewSnapshot) {
+  return (snapshot.statusCheckRollup ?? []).filter(isCodeRabbitCheck);
+}
+
 function codeRabbitChecksRunning(snapshot: PrReviewSnapshot) {
-  return (snapshot.statusCheckRollup ?? [])
-    .filter(isCodeRabbitCheck)
-    .some((check) => !isTerminalCheckState(check.conclusion ?? check.state ?? check.status));
+  return codeRabbitChecks(snapshot).some((check) => !isTerminalCheckState(check.conclusion ?? check.state ?? check.status));
+}
+
+function codeRabbitReviews(snapshot: PrReviewSnapshot) {
+  return (snapshot.reviews ?? []).filter((review) => review.author?.login?.toLowerCase().includes('coderabbit'));
+}
+
+function codeRabbitReviewedHead(snapshot: PrReviewSnapshot, headSha: string) {
+  return codeRabbitReviews(snapshot).some((review) => review.commit?.oid === headSha);
+}
+
+function codeRabbitFeedbackFingerprint(
+  snapshot: PrReviewSnapshot,
+  threads: ReturnType<typeof listOutstandingCodeRabbitThreads>,
+  headSha: string
+) {
+  return JSON.stringify({
+    headSha: snapshot.headRefOid ?? headSha,
+    checks: codeRabbitChecks(snapshot).map((check) => ({
+      name: check.name ?? null,
+      context: check.context ?? null,
+      workflowName: check.workflowName ?? null,
+      status: check.status ?? null,
+      conclusion: check.conclusion ?? null,
+      state: check.state ?? null,
+      startedAt: check.startedAt ?? null,
+      completedAt: check.completedAt ?? null,
+    })),
+    reviews: codeRabbitReviews(snapshot).map((review) => ({
+      commit: review.commit?.oid ?? null,
+      state: review.state ?? null,
+      submittedAt: review.submittedAt ?? null,
+    })),
+    threads: threads.map((thread) => ({
+      path: thread.path,
+      line: thread.line,
+      author: thread.author,
+      url: thread.url,
+      excerpt: thread.excerpt,
+    })),
+  });
 }
 
 async function waitForPrHeadChange(
@@ -849,15 +912,66 @@ async function waitForCodeRabbitFeedback(
   ref: { repo: string; number: number },
   headSha: string,
   timeoutMs: number,
+  settleMs: number,
   pollMs: number
 ) {
   const startedAt = Date.now();
+  let stableSince: number | null = null;
+  let stableFingerprint: string | null = null;
+  let lastReason = 'CodeRabbit has not been observed on the latest commit yet.';
+
   while (true) {
     const snapshot = prReviewSnapshot(ref);
     const threads = listOutstandingCodeRabbitThreads(ref);
     const sameHead = !snapshot.headRefOid || snapshot.headRefOid === headSha;
-    if (sameHead && !codeRabbitChecksRunning(snapshot)) return { snapshot, threads };
-    if (Date.now() - startedAt >= timeoutMs) return { snapshot, threads };
+    const checks = codeRabbitChecks(snapshot);
+    const observed = threads.length > 0 || checks.length > 0 || codeRabbitReviewedHead(snapshot, headSha);
+    const running = codeRabbitChecksRunning(snapshot);
+
+    if (!sameHead) {
+      lastReason = `PR head changed while waiting for CodeRabbit feedback (${shortSha(snapshot.headRefOid)} != ${shortSha(headSha)}).`;
+      stableSince = null;
+      stableFingerprint = null;
+    } else if (!observed) {
+      lastReason = 'CodeRabbit has not been observed on the latest commit yet.';
+      stableSince = null;
+      stableFingerprint = null;
+    } else if (running) {
+      lastReason = 'CodeRabbit is still reviewing the latest commit.';
+      stableSince = null;
+      stableFingerprint = null;
+    } else {
+      const fingerprint = codeRabbitFeedbackFingerprint(snapshot, threads, headSha);
+      if (stableFingerprint !== fingerprint) {
+        stableFingerprint = fingerprint;
+        stableSince = Date.now();
+      }
+      const settledMs = stableSince === null ? 0 : Date.now() - stableSince;
+      if (settledMs >= settleMs) {
+        return {
+          snapshot,
+          threads,
+          ready: true,
+          codeRabbitObserved: observed,
+          codeRabbitSettled: true,
+          timedOut: false,
+          reason: null,
+        };
+      }
+      lastReason = `CodeRabbit feedback is waiting for a ${settleMs}ms quiet window (${settledMs}ms elapsed).`;
+    }
+
+    if (Date.now() - startedAt >= timeoutMs) {
+      return {
+        snapshot,
+        threads,
+        ready: false,
+        codeRabbitObserved: observed,
+        codeRabbitSettled: false,
+        timedOut: true,
+        reason: lastReason,
+      };
+    }
     await delay(pollMs);
   }
 }
@@ -2449,6 +2563,8 @@ async function runCodeRabbitPrReviewLoop(
       adapterLaunched: launch.launched,
       adapterError: launch.error,
       outstandingCodeRabbitComments: null,
+      codeRabbitObserved: null,
+      codeRabbitSettled: null,
     };
 
     if (!launch.launched) {
@@ -2483,10 +2599,30 @@ async function runCodeRabbitPrReviewLoop(
     iteration.endHeadSha = currentHeadSha;
     options.reviewStatus?.(`PR review loop ${index}: detected PR commit ${shortSha(currentHeadSha)}.`);
     options.reviewStatus?.(`PR review loop ${index}: waiting for CodeRabbit feedback on the latest commit.`);
-    const feedback = await waitForCodeRabbitFeedback(ref, currentHeadSha, config.codeRabbitTimeoutMs, config.pollMs);
+    const feedback = await waitForCodeRabbitFeedback(
+      ref,
+      currentHeadSha,
+      config.codeRabbitTimeoutMs,
+      config.codeRabbitSettleMs,
+      config.pollMs
+    );
     const outstanding = feedback.threads.length;
     iteration.outstandingCodeRabbitComments = outstanding;
+    iteration.codeRabbitObserved = feedback.codeRabbitObserved;
+    iteration.codeRabbitSettled = feedback.codeRabbitSettled;
     iterations.push(iteration);
+
+    if (!feedback.ready) {
+      const error = `CodeRabbit feedback did not settle within ${config.codeRabbitTimeoutMs}ms after commit ${shortSha(
+        currentHeadSha
+      )}: ${feedback.reason ?? 'unknown wait state'}`;
+      return {
+        loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
+        launched: true,
+        adapterCommand,
+        launchError: error,
+      };
+    }
 
     if (outstanding === 0) {
       options.reviewStatus?.(`PR review loop ${index}: no outstanding CodeRabbit feedback remains.`);

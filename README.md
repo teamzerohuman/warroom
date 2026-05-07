@@ -136,7 +136,7 @@ warroom pr review
 warroom pr review --pr TeamFloPay/backend#655 --issue "$ISSUE" --launch --confirm-status --write-artifact
 ```
 
-Without `--pr`, `pr review` lists open PRs linked from issues in `battlefield-active` or `skirmish`, ordered by latest update. In an interactive terminal it asks whether to launch the detected PR review handoff, using the selected PR as if `--pr <owner/repo#number> --launch` was passed. Non-interactive runs only list the queue and print an explicit `Outcome:` line. With `--pr --launch`, it sends the fixed GitHub/CodeRabbit feedback handoff to the adapter, waits for a new PR commit, checks outstanding current CodeRabbit comments, and repeats the adapter loop until no CodeRabbit feedback remains or the loop blocks. It moves the issue to `skirmish` when confirmed.
+Without `--pr`, `pr review` lists open PRs linked from issues in `battlefield-active` or `skirmish`, ordered by latest update. In an interactive terminal it asks whether to launch the detected PR review handoff, using the selected PR as if `--pr <owner/repo#number> --launch` was passed. Non-interactive runs only list the queue and print an explicit `Outcome:` line. With `--pr --launch`, it sends the fixed GitHub/CodeRabbit feedback handoff to the adapter, waits for a new PR commit, waits for CodeRabbit to appear and settle on that commit, checks outstanding current CodeRabbit comments, and repeats the adapter loop until no CodeRabbit feedback remains or the loop blocks. It moves the issue to `skirmish` when confirmed.
 
 8. Finish through the merge gate when review is clear.
 

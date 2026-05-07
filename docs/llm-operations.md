@@ -6,7 +6,7 @@ Interactive `issue next` and direct `issue next --issue owner/repo#number` are i
 
 `pr create` is the publication step after implementation work is committed. It runs from the mapped child repo, uses the current or supplied branch, infers the linked issue from `warroom/<issue-number>-...` when possible, generates a PR title/body from issue and commit context unless supplied explicitly, and creates the GitHub PR only with `--confirm`.
 
-`pr review` uses a fixed GitHub/CodeRabbit handoff. Launched runs wait for a new PR commit after each adapter pass, check current unresolved CodeRabbit comments, and relaunch the adapter while CodeRabbit feedback remains. This command always uses the foreground adapter, even when `LLM_ADAPTER=codex-cloud`, because Codex Cloud environments do not inherit local GitHub/CodeRabbit app access, `gh` auth, or local PR remotes.
+`pr review` uses a fixed GitHub/CodeRabbit handoff. Launched runs wait for a new PR commit after each adapter pass, wait for CodeRabbit to appear and settle on that commit, check current unresolved CodeRabbit comments, and relaunch the adapter while CodeRabbit feedback remains. This command always uses the foreground adapter, even when `LLM_ADAPTER=codex-cloud`, because Codex Cloud environments do not inherit local GitHub/CodeRabbit app access, `gh` auth, or local PR remotes.
 
 ## Configuration
 
