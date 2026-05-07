@@ -13,7 +13,12 @@ const SpecialistSchema = z.object({
   }),
 });
 
-const RepoSchema = z.object({
+const MergeSchema = z.object({
+  playwright: z.boolean().default(false),
+  changelog: z.boolean().default(false),
+});
+
+const RawRepoSchema = z.object({
   id: z.string(),
   name: z.string(),
   github: z.string(),
@@ -21,11 +26,20 @@ const RepoSchema = z.object({
   local_path: z.string(),
   status: z.enum(['active', 'planned']),
   planned_by: z.string().optional(),
-  merge_playwright: z.boolean().default(false),
+  merge: MergeSchema.default({}),
+  merge_playwright: z.boolean().optional(),
   owner: z.string(),
   description: z.string(),
   specialist: SpecialistSchema,
 });
+
+const RepoSchema = RawRepoSchema.transform(({ merge, merge_playwright, ...repo }) => ({
+  ...repo,
+  merge: {
+    playwright: merge.playwright ?? merge_playwright ?? false,
+    changelog: merge.changelog ?? false,
+  },
+}));
 
 const RepoManifestSchema = z.object({
   version: z.number(),

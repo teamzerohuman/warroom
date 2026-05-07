@@ -1,4 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
+import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import * as http from 'node:http';
 import * as https from 'node:https';
 import { isIP } from 'node:net';
@@ -14,11 +15,16 @@ import {
 import { getAdapterInvocation, runAdapter } from '../lib/env.js';
 import { getRepoHealth, loadRepoManifest, runGit } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
-import { parseIssueRef } from './issues.js';
+import { parseIssueRef, type IssueRef } from './issues.js';
 
 export type PrOptions = {
   issue?: string;
   pr?: string;
+  branch?: string;
+  title?: string;
+  body?: string;
+  draft?: boolean;
+  push?: boolean;
   dryRun?: boolean;
   writeArtifact?: boolean;
   confirm?: boolean;
@@ -35,6 +41,8 @@ export type PrOptions = {
   currentPath?: string;
   e2eStatus?: (message: string) => void;
   e2eOutput?: (chunk: string, stream: 'stdout' | 'stderr') => void;
+  mergeStatus?: (message: string) => void;
+  reviewStatus?: (message: string) => void;
 };
 
 export type MergeE2EResult = {
@@ -54,6 +62,33 @@ export type MergeE2EResult = {
   testExitStatus: number | null;
   usedExistingBackend: boolean;
   startedBackend: boolean;
+  blocked: string[];
+  error: string | null;
+};
+
+export type MergeChangelogResult = {
+  status: 'planned' | 'passed' | 'failed' | 'skipped';
+  required: boolean;
+  skipReason: string | null;
+  repo: string;
+  path: string | null;
+  base: string;
+  currentBranch: string | null;
+  changelogPath: string | null;
+  version: string | null;
+  actionsHeadSha: string | null;
+  actionsRuns: Array<{
+    databaseId: number | null;
+    name: string;
+    status: string;
+    conclusion: string | null;
+    headSha: string | null;
+    url: string | null;
+  }>;
+  durationMs: number | null;
+  committed: boolean;
+  pushed: boolean;
+  commitSha: string | null;
   blocked: string[];
   error: string | null;
 };
@@ -106,19 +141,37 @@ export type LocalCleanupResult = {
   messages: string[];
 };
 
+export type PrReviewLoopResult = {
+  status: 'planned' | 'passed' | 'failed';
+  completed: boolean;
+  iterations: Array<{
+    iteration: number;
+    startHeadSha: string | null;
+    endHeadSha: string | null;
+    adapterLaunched: boolean;
+    adapterError: string | null;
+    outstandingCodeRabbitComments: number | null;
+  }>;
+  blocked: string[];
+  error: string | null;
+};
+
 export type PrPlanResult = {
   prompt: string;
   artifact: RunArtifact | null;
   launched: boolean;
   adapterCommand: string | null;
-  action: 'engage' | 'review' | 'merge';
+  action: 'issue-start' | 'review' | 'merge';
   campaignStatus: CampaignStatusSetResult | null;
+  developmentBranch?: DevelopmentBranchResult;
   mergeReadiness?: MergeReadiness;
   summary?: string;
   summaryPosts?: SummaryPostResult[];
   merged?: boolean;
   localCleanup?: LocalCleanupResult | null;
   mergeE2E?: MergeE2EResult;
+  mergeChangelog?: MergeChangelogResult;
+  prReviewLoop?: PrReviewLoopResult;
   contextSummary?: {
     promptCharacters: number;
     changedFiles?: number;
@@ -129,6 +182,41 @@ export type PrPlanResult = {
   };
   adapterCwd?: string | null;
   launchError?: string | null;
+};
+
+export type PrCreateResult = {
+  action: 'create';
+  repo: string;
+  path: string;
+  branch: string;
+  base: string;
+  issue: string | null;
+  title: string;
+  body: string;
+  draft: boolean;
+  pushed: boolean;
+  pushCommand: string | null;
+  createCommand: string;
+  created: boolean;
+  url: string | null;
+  blocked: string[];
+  campaignStatus: CampaignStatusSetResult | null;
+  artifact?: RunArtifact;
+};
+
+export type DevelopmentBranchResult = {
+  repo: string;
+  path: string | null;
+  branch: string;
+  base: string;
+  command: string;
+  checkoutRequired: boolean;
+  applied: boolean;
+  linked: boolean;
+  checkedOut: boolean;
+  blocked: string[];
+  output: string | null;
+  error: string | null;
 };
 
 export type PrReviewQueueIssue = {
@@ -166,11 +254,35 @@ const DEFAULT_BACKEND_READY_PATH = '/v1/health';
 const DEFAULT_BACKEND_READY_PROBE_TIMEOUT_MS = 3_000;
 const DEFAULT_BACKEND_READY_TIMEOUT_MS = 120_000;
 const NODE_USE_SYSTEM_CA_FLAG = '--use-system-ca';
+const DEFAULT_CHANGELOG_ACTIONS_TIMEOUT_MS = 20 * 60_000;
+const DEFAULT_CHANGELOG_ACTIONS_POLL_MS = 15_000;
+const DEFAULT_CHANGELOG_ACTIONS_SETTLE_MS = 5_000;
+const DEFAULT_PR_REVIEW_MAX_LOOPS = 5;
+const DEFAULT_PR_REVIEW_COMMIT_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_PR_REVIEW_CODERABBIT_TIMEOUT_MS = 15 * 60_000;
+const DEFAULT_PR_REVIEW_POLL_MS = 15_000;
 
 function ghJson<T>(args: string[], fallback: T): T {
   const result = spawnSync('gh', args, { encoding: 'utf8' });
   if (result.status !== 0 || !result.stdout.trim()) return fallback;
   return JSON.parse(result.stdout) as T;
+}
+
+function ghJsonStrict<T>(args: string[]): T {
+  const result = spawnSync('gh', args, { encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `gh ${args.join(' ')} failed with exit ${result.status ?? 'unknown'}.`);
+  }
+  if (!result.stdout.trim()) throw new Error(`gh ${args.join(' ')} returned empty output.`);
+  return JSON.parse(result.stdout) as T;
+}
+
+function ghTextStrict(args: string[]) {
+  const result = spawnSync('gh', args, { encoding: 'utf8' });
+  if (result.status !== 0) {
+    throw new Error(result.stderr.trim() || `gh ${args.join(' ')} failed with exit ${result.status ?? 'unknown'}.`);
+  }
+  return result.stdout.trim();
 }
 
 function repoEntryForGitHub(workspaceRoot: string, githubRepo: string) {
@@ -195,13 +307,27 @@ function mergePlaywrightRequirement(workspaceRoot: string, githubRepo: string) {
   if (!repo) {
     return {
       required: false,
-      skipReason: `No mapped repo entry with merge_playwright: true for ${githubRepo}.`,
+      skipReason: `No mapped repo entry with merge.playwright: true for ${githubRepo}.`,
     };
   }
 
-  return repo.merge_playwright
+  return repo.merge.playwright
     ? { required: true, skipReason: null }
-    : { required: false, skipReason: `repos.yaml has merge_playwright: false for ${githubRepo}.` };
+    : { required: false, skipReason: `repos.yaml has merge.playwright: false for ${githubRepo}.` };
+}
+
+function mergeChangelogRequirement(workspaceRoot: string, githubRepo: string) {
+  const repo = repoEntryForGitHub(workspaceRoot, githubRepo);
+  if (!repo) {
+    return {
+      required: false,
+      skipReason: `No mapped repo entry with merge.changelog: true for ${githubRepo}.`,
+    };
+  }
+
+  return repo.merge.changelog
+    ? { required: true, skipReason: null }
+    : { required: false, skipReason: `repos.yaml has merge.changelog: false for ${githubRepo}.` };
 }
 
 function parsePrRef(value: string) {
@@ -216,6 +342,10 @@ function truncateText(value: string | undefined, limit = 6000) {
   return `${value.slice(0, limit)}\n\n[Truncated by War Room to keep the handoff scoped. Re-run with direct GitHub inspection if more context is needed.]`;
 }
 
+function fullText(value: string | undefined) {
+  return value && value.trim() ? value : '(not available)';
+}
+
 function slugBranchPart(value: string | undefined, fallback: string) {
   const slug = (value ?? '')
     .toLowerCase()
@@ -228,6 +358,99 @@ function slugBranchPart(value: string | undefined, fallback: string) {
 
 function featureBranchForIssue(ref: { repo: string; number: number }, title: string | undefined) {
   return `warroom/${ref.number}-${slugBranchPart(title, ref.repo.split('/').pop() ?? 'issue')}`;
+}
+
+function shellQuote(value: string) {
+  return /^[A-Za-z0-9_./:@+-]+$/.test(value) ? value : JSON.stringify(value);
+}
+
+function createDevelopmentBranchResult(
+  workspaceRoot: string,
+  ref: IssueRef,
+  title: string | undefined,
+  base: string,
+  apply: boolean,
+  checkoutRequired: boolean
+): DevelopmentBranchResult {
+  const branch = featureBranchForIssue(ref, title);
+  const repoEntry = repoEntryForGitHub(workspaceRoot, ref.repo);
+  const commandArgs = [
+    'issue',
+    'develop',
+    String(ref.number),
+    '--repo',
+    ref.repo,
+    '--base',
+    base,
+    '--name',
+    branch,
+  ];
+  if (checkoutRequired) commandArgs.push('--checkout');
+  const command = ['gh', ...commandArgs].join(' ');
+  const blocked: string[] = [];
+
+  if (!repoEntry) {
+    blocked.push(`repos.yaml does not define a mapped checkout for ${ref.repo}.`);
+  }
+
+  const repo = repoEntry ? getRepoHealth(workspaceRoot, repoEntry) : null;
+  if (repo && !repo.checkedOut) blocked.push(`Mapped checkout is missing: ${repo.resolvedPath}`);
+  if (checkoutRequired && repo?.clean === false) {
+    blocked.push(`Mapped checkout has local changes. Commit, stash, or move them before creating ${branch}.`);
+  }
+
+  if (!apply || blocked.length > 0 || !repo?.checkedOut) {
+    return {
+      repo: ref.repo,
+      path: repo?.resolvedPath ?? null,
+      branch,
+      base,
+      command,
+      checkoutRequired,
+      applied: false,
+      linked: false,
+      checkedOut: false,
+      blocked,
+      output: null,
+      error: blocked.length > 0 ? blocked.join(' ') : null,
+    };
+  }
+
+  const result = spawnSync('gh', commandArgs, { cwd: repo.resolvedPath, encoding: 'utf8' });
+  const output = `${result.stdout ?? ''}${result.stderr ?? ''}`.trim();
+  if (result.status !== 0) {
+    return {
+      repo: ref.repo,
+      path: repo.resolvedPath,
+      branch,
+      base,
+      command,
+      checkoutRequired,
+      applied: false,
+      linked: false,
+      checkedOut: false,
+      blocked: [`Development branch setup failed with exit ${result.status ?? 'unknown'}.`],
+      output: output || null,
+      error: output || `Development branch setup failed with exit ${result.status ?? 'unknown'}.`,
+    };
+  }
+
+  const currentBranch = checkoutRequired ? runGit(repo.resolvedPath, ['branch', '--show-current']) : null;
+  const checkedOut = currentBranch ? currentBranch.status === 0 && currentBranch.stdout === branch : false;
+  return {
+    repo: ref.repo,
+    path: repo.resolvedPath,
+    branch,
+    base,
+    command,
+    checkoutRequired,
+    applied: true,
+    linked: true,
+    checkedOut,
+    blocked: !checkoutRequired || checkedOut ? [] : [`Created linked development branch, but local checkout is on ${currentBranch?.stdout || 'unknown'}.`],
+    output: output || null,
+    error: !checkoutRequired || checkedOut ? null : `Expected local checkout on ${branch}, got ${currentBranch?.stdout || 'unknown'}.`,
+  };
 }
 
 function summarizeList<T>(values: T[] | undefined, map: (value: T) => string, limit = 12) {
@@ -337,6 +560,23 @@ type PullRequestReviewThreadsResponse = {
       };
     };
   };
+};
+
+type PrReviewSnapshot = {
+  title?: string;
+  body?: string;
+  url?: string;
+  headRefName?: string;
+  baseRefName?: string;
+  headRefOid?: string;
+  statusCheckRollup?: Array<{
+    name?: string;
+    context?: string;
+    status?: string;
+    conclusion?: string;
+    state?: string;
+    workflowName?: string;
+  }>;
 };
 
 const PULL_REQUEST_REVIEW_THREADS_QUERY = `
@@ -513,6 +753,113 @@ function listPullRequestReviewThreads(ref: { repo: string; number: number }): Me
         excerpt: truncateText(comment?.body?.replace(/\s+/g, ' ').trim(), 180),
       };
     });
+}
+
+function listOutstandingCodeRabbitThreads(ref: { repo: string; number: number }) {
+  return listPullRequestReviewThreads(ref).filter(
+    (thread) => !thread.isOutdated && thread.author.toLowerCase().includes('coderabbit')
+  );
+}
+
+function prReviewSnapshot(ref: { repo: string; number: number }): PrReviewSnapshot {
+  return ghJson<PrReviewSnapshot>(
+    [
+      'pr',
+      'view',
+      String(ref.number),
+      '--repo',
+      ref.repo,
+      '--json',
+      'title,body,url,headRefName,baseRefName,headRefOid,statusCheckRollup',
+    ],
+    {}
+  );
+}
+
+function prReviewLoopConfig() {
+  const maxLoops = Number(envValue('WARROOM_PR_REVIEW_MAX_LOOPS', String(DEFAULT_PR_REVIEW_MAX_LOOPS)));
+  const commitTimeout = Number(envValue('WARROOM_PR_REVIEW_COMMIT_TIMEOUT_MS', String(DEFAULT_PR_REVIEW_COMMIT_TIMEOUT_MS)));
+  const codeRabbitTimeout = Number(
+    envValue('WARROOM_PR_REVIEW_CODERABBIT_TIMEOUT_MS', String(DEFAULT_PR_REVIEW_CODERABBIT_TIMEOUT_MS))
+  );
+  const poll = Number(envValue('WARROOM_PR_REVIEW_POLL_MS', String(DEFAULT_PR_REVIEW_POLL_MS)));
+
+  return {
+    maxLoops: Number.isFinite(maxLoops) && maxLoops > 0 ? Math.floor(maxLoops) : DEFAULT_PR_REVIEW_MAX_LOOPS,
+    commitTimeoutMs:
+      Number.isFinite(commitTimeout) && commitTimeout >= 0 ? commitTimeout : DEFAULT_PR_REVIEW_COMMIT_TIMEOUT_MS,
+    codeRabbitTimeoutMs:
+      Number.isFinite(codeRabbitTimeout) && codeRabbitTimeout >= 0
+        ? codeRabbitTimeout
+        : DEFAULT_PR_REVIEW_CODERABBIT_TIMEOUT_MS,
+    pollMs: Number.isFinite(poll) && poll >= 0 ? poll : DEFAULT_PR_REVIEW_POLL_MS,
+  };
+}
+
+function shortSha(value: string | null | undefined) {
+  return value ? value.slice(0, 12) : 'unknown';
+}
+
+function isCodeRabbitCheck(check: { name?: string; context?: string; workflowName?: string }) {
+  return [check.name, check.context, check.workflowName].some((value) => value?.toLowerCase().includes('coderabbit'));
+}
+
+function isTerminalCheckState(value: string | null | undefined) {
+  if (!value) return false;
+  return [
+    'ACTION_REQUIRED',
+    'CANCELLED',
+    'COMPLETED',
+    'ERROR',
+    'EXPECTED',
+    'FAILURE',
+    'NEUTRAL',
+    'SKIPPED',
+    'STALE',
+    'STARTUP_FAILURE',
+    'SUCCESS',
+    'TIMED_OUT',
+  ].includes(value.toUpperCase());
+}
+
+function codeRabbitChecksRunning(snapshot: PrReviewSnapshot) {
+  return (snapshot.statusCheckRollup ?? [])
+    .filter(isCodeRabbitCheck)
+    .some((check) => !isTerminalCheckState(check.conclusion ?? check.state ?? check.status));
+}
+
+async function waitForPrHeadChange(
+  ref: { repo: string; number: number },
+  previousHeadSha: string | null,
+  timeoutMs: number,
+  pollMs: number
+) {
+  const startedAt = Date.now();
+  while (true) {
+    const snapshot = prReviewSnapshot(ref);
+    if (snapshot.headRefOid && snapshot.headRefOid !== previousHeadSha) {
+      return { changed: true, snapshot };
+    }
+    if (Date.now() - startedAt >= timeoutMs) return { changed: false, snapshot };
+    await delay(pollMs);
+  }
+}
+
+async function waitForCodeRabbitFeedback(
+  ref: { repo: string; number: number },
+  headSha: string,
+  timeoutMs: number,
+  pollMs: number
+) {
+  const startedAt = Date.now();
+  while (true) {
+    const snapshot = prReviewSnapshot(ref);
+    const threads = listOutstandingCodeRabbitThreads(ref);
+    const sameHead = !snapshot.headRefOid || snapshot.headRefOid === headSha;
+    if (sameHead && !codeRabbitChecksRunning(snapshot)) return { snapshot, threads };
+    if (Date.now() - startedAt >= timeoutMs) return { snapshot, threads };
+    await delay(pollMs);
+  }
 }
 
 function reviewerName(request: { login?: string; name?: string; slug?: string; __typename?: string }) {
@@ -724,6 +1071,82 @@ function repoHealthForCurrentPath(workspaceRoot: string, currentPath: string) {
     .sort((left, right) => right.resolvedPath.length - left.resolvedPath.length)[0] ?? null;
 }
 
+function currentBranchIssueRef(repo: string, branch: string) {
+  const match = branch.match(/^warroom\/(\d+)-/);
+  return match ? `${repo}#${match[1]}` : null;
+}
+
+function gitOutput(repoPath: string, args: string[]) {
+  const result = runGit(repoPath, args);
+  return result.status === 0 && result.stdout ? result.stdout : null;
+}
+
+function branchExists(repoPath: string, branch: string) {
+  const result = runGit(repoPath, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`]);
+  return result.status === 0;
+}
+
+function hasOriginRemote(repoPath: string) {
+  const result = runGit(repoPath, ['remote', 'get-url', 'origin']);
+  return result.status === 0 && result.stdout.trim().length > 0;
+}
+
+function defaultPrBase(workspaceRoot: string, repoPath: string, branch: string, optionBase: string | undefined) {
+  if (optionBase) return optionBase;
+  const configured = gitOutput(repoPath, ['config', `branch.${branch}.gh-merge-base`]);
+  return configured ?? loadRepoManifest(workspaceRoot).defaults.default_branch;
+}
+
+function commitSummary(repoPath: string, base: string, branch: string) {
+  const range = `${base}..${branch}`;
+  const result = runGit(repoPath, ['log', '--oneline', '--no-decorate', range]);
+  return result.status === 0 ? result.stdout.split(/\r?\n/).filter(Boolean).slice(0, 20) : [];
+}
+
+function changedFiles(repoPath: string, base: string, branch: string) {
+  const result = runGit(repoPath, ['diff', '--name-only', `${base}...${branch}`]);
+  return result.status === 0 ? result.stdout.split(/\r?\n/).filter(Boolean).slice(0, 40) : [];
+}
+
+function formatPrBody(issueRef: string | null, issueBody: string | undefined, commits: string[], files: string[]) {
+  const lines = [
+    issueRef ? `Closes ${issueRef}` : null,
+    '',
+    '## Summary',
+    issueBody ? `- Implements the scoped work from ${issueRef}.` : '- Describe the completed branch changes before merging.',
+    ...commits.slice(0, 5).map((commit) => `- ${commit.replace(/^[a-f0-9]+\s+/, '')}`),
+    '',
+    '## Changed files',
+    files.length ? files.map((file) => `- \`${file}\``).join('\n') : '- No changed files were detected against the selected base.',
+    '',
+    '## Validation',
+    '- Not run by `warroom pr create`; add the validation commands used for this branch.',
+  ];
+
+  return lines.filter((line): line is string => line !== null).join('\n');
+}
+
+function prCreateMarkdown(result: Omit<PrCreateResult, 'artifact'>) {
+  return [
+    `# PR Create: ${result.repo}`,
+    '',
+    `- Branch: ${result.branch}`,
+    `- Base: ${result.base}`,
+    `- Issue: ${result.issue ?? 'none inferred'}`,
+    `- Title: ${result.title}`,
+    `- Draft: ${result.draft ? 'yes' : 'no'}`,
+    `- Created: ${result.created ? 'yes' : 'no'}`,
+    result.url ? `- URL: ${result.url}` : null,
+    result.pushCommand ? `- Push: ${result.pushed ? 'pushed' : 'planned'} ${result.pushCommand}` : '- Push: skipped',
+    '',
+    '## Blockers',
+    result.blocked.length ? result.blocked.map((blocker) => `- ${blocker}`).join('\n') : 'No blockers.',
+    '',
+    '## Body',
+    result.body,
+  ].filter((line): line is string => line !== null).join('\n');
+}
+
 export function inferPrRefForCurrentBranch(workspaceRoot: string, currentPath: string) {
   const repo = repoHealthForCurrentPath(workspaceRoot, currentPath);
   if (!repo) throw new Error('warroom pr merge requires --pr unless run inside a mapped child repo checkout.');
@@ -757,6 +1180,132 @@ export function inferPrRefForCurrentBranch(workspaceRoot: string, currentPath: s
   const number = prs[0]?.number;
   if (!number) throw new Error(`Could not read PR number for ${repo.github} branch ${repo.branch}. Pass --pr owner/repo#number.`);
   return `${repo.github}#${number}`;
+}
+
+export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreateResult {
+  const repo = repoHealthForCurrentPath(workspaceRoot, options.currentPath ?? process.cwd());
+  if (!repo) throw new Error('warroom pr create must be run inside a mapped child repo checkout.');
+  if (!repo.checkedOut) throw new Error(`Mapped checkout is missing: ${repo.resolvedPath}`);
+
+  const branch = options.branch ?? repo.branch;
+  if (!branch) throw new Error(`Could not infer current branch for ${repo.github}. Pass --branch <name>.`);
+
+  const base = defaultPrBase(workspaceRoot, repo.resolvedPath, branch, options.base);
+  const issueRef = options.issue ?? currentBranchIssueRef(repo.github, branch);
+  const parsedIssue = issueRef ? parseIssueRef(issueRef) : null;
+  const issue = issueRef
+    ? ghJson<{ title?: string; body?: string; url?: string }>(
+        ['issue', 'view', String(parsedIssue!.number), '--repo', parsedIssue!.repo, '--json', 'title,body,url'],
+        {}
+      )
+    : {};
+  const commits = commitSummary(repo.resolvedPath, base, branch);
+  const files = changedFiles(repo.resolvedPath, base, branch);
+  const title =
+    options.title ??
+    issue.title ??
+    commits[0]?.replace(/^[a-f0-9]+\s+/, '') ??
+    `Publish ${branch}`;
+  const body = options.body ?? formatPrBody(issueRef, issue.body, commits, files);
+  const draft = options.draft ?? false;
+  const blocked: string[] = [];
+
+  if (branch === base) blocked.push(`Refusing to create a PR from base branch ${base}.`);
+  if (!branchExists(repo.resolvedPath, branch)) blocked.push(`Local branch does not exist: ${branch}.`);
+
+  const existingPrs = ghJson<Array<{ number?: number; url?: string }>>(
+    ['pr', 'list', '--repo', repo.github, '--state', 'open', '--head', branch, '--json', 'number,url', '--limit', '10'],
+    []
+  );
+  if (existingPrs.length > 0) {
+    blocked.push(`Open PR already exists for ${branch}: ${existingPrs[0]?.url ?? `${repo.github}#${existingPrs[0]?.number}`}.`);
+  }
+
+  const shouldPush = options.push !== false;
+  const pushArgs = shouldPush
+    ? repo.upstream && repo.branch === branch
+      ? ['push']
+      : ['push', '-u', 'origin', branch]
+    : null;
+  const pushCommand = pushArgs ? `git ${pushArgs.map(shellQuote).join(' ')}` : null;
+  if (shouldPush && !hasOriginRemote(repo.resolvedPath)) {
+    blocked.push('Repo has no origin remote for pushing the PR branch.');
+  }
+
+  const createArgs = [
+    'pr',
+    'create',
+    '--repo',
+    repo.github,
+    '--base',
+    base,
+    '--head',
+    branch,
+    '--title',
+    title,
+    '--body',
+    body,
+    ...(draft ? ['--draft'] : []),
+  ];
+  const createCommand = ['gh', ...createArgs.map(shellQuote)].join(' ');
+  let pushed = false;
+  let created = false;
+  let url: string | null = null;
+
+  if (options.confirm) {
+    if (blocked.length > 0) throw new Error(blocked.join(' '));
+    if (pushArgs) {
+      const push = spawnSync('git', pushArgs, { cwd: repo.resolvedPath, stdio: 'inherit' });
+      if (push.status !== 0) throw new Error(`${pushCommand} failed with exit ${push.status ?? 'unknown'}.`);
+      pushed = true;
+    }
+
+    const createdPr = spawnSync('gh', createArgs, { cwd: repo.resolvedPath, encoding: 'utf8' });
+    if (createdPr.status !== 0) {
+      throw new Error(createdPr.stderr.trim() || `gh pr create failed with exit ${createdPr.status ?? 'unknown'}.`);
+    }
+    const createdOutput = createdPr.stdout.trim();
+    const createdUrl = createdOutput.match(/https:\/\/github\.com\/\S+/)?.[0] ?? null;
+    if (!createdUrl) {
+      throw new Error(`gh pr create completed but did not return a PR URL. Output: ${createdOutput || '(empty)'}`);
+    }
+    created = true;
+    url = createdUrl;
+  }
+
+  const campaignStatus = issueRef
+    ? setCampaignStatus(issueRef, 'skirmish', { confirm: Boolean(options.confirm && options.confirmStatus && created) })
+    : null;
+  const result: Omit<PrCreateResult, 'artifact'> = {
+    action: 'create',
+    repo: repo.github,
+    path: repo.resolvedPath,
+    branch,
+    base,
+    issue: issueRef,
+    title,
+    body,
+    draft,
+    pushed,
+    pushCommand,
+    createCommand,
+    created,
+    url,
+    blocked,
+    campaignStatus,
+  };
+
+  if (!options.writeArtifact) return result;
+
+  return {
+    ...result,
+    artifact: createRunArtifact(workspaceRoot, 'pr-create', {
+      'input.json': JSON.stringify(options, null, 2),
+      'result.json': JSON.stringify(result, null, 2),
+      'summary.md': prCreateMarkdown(result),
+      'body.md': body,
+    }),
+  };
 }
 
 function envValue(name: string, fallback: string) {
@@ -1203,6 +1752,373 @@ async function runMergeE2E(
   }
 }
 
+function changelogActionsConfig() {
+  const timeout = Number(envValue('WARROOM_MERGE_CHANGELOG_ACTIONS_TIMEOUT_MS', String(DEFAULT_CHANGELOG_ACTIONS_TIMEOUT_MS)));
+  const poll = Number(envValue('WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS', String(DEFAULT_CHANGELOG_ACTIONS_POLL_MS)));
+  const settle = Number(envValue('WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS', String(DEFAULT_CHANGELOG_ACTIONS_SETTLE_MS)));
+
+  return {
+    timeoutMs: Number.isFinite(timeout) && timeout > 0 ? timeout : DEFAULT_CHANGELOG_ACTIONS_TIMEOUT_MS,
+    pollMs: Number.isFinite(poll) && poll >= 0 ? poll : DEFAULT_CHANGELOG_ACTIONS_POLL_MS,
+    settleMs: Number.isFinite(settle) && settle >= 0 ? settle : DEFAULT_CHANGELOG_ACTIONS_SETTLE_MS,
+  };
+}
+
+function createMergeChangelogPlan(
+  workspaceRoot: string,
+  githubRepo: string,
+  base: string,
+  requirement: { required: boolean; skipReason: string | null }
+): MergeChangelogResult {
+  const repoEntry = repoEntryForGitHub(workspaceRoot, githubRepo);
+  const repo = repoEntry ? getRepoHealth(workspaceRoot, repoEntry) : null;
+  const changelogPath = repo?.checkedOut ? path.join(repo.resolvedPath, 'CHANGELOG.md') : null;
+  const blocked: string[] = [];
+
+  if (!requirement.required) {
+    return {
+      status: 'skipped',
+      required: false,
+      skipReason: requirement.skipReason,
+      repo: githubRepo,
+      path: repo?.resolvedPath ?? null,
+      base,
+      currentBranch: repo?.branch ?? null,
+      changelogPath: null,
+      version: null,
+      actionsHeadSha: null,
+      actionsRuns: [],
+      durationMs: null,
+      committed: false,
+      pushed: false,
+      commitSha: null,
+      blocked,
+      error: null,
+    };
+  }
+
+  if (!repoEntry) blocked.push(`repos.yaml does not define a mapped checkout for ${githubRepo}.`);
+  if (repo && !repo.checkedOut) blocked.push(`Mapped checkout is missing: ${repo.resolvedPath}`);
+  if (repo?.clean === false) blocked.push(`Mapped checkout has local changes: ${repo.resolvedPath}`);
+  if (changelogPath && !existsSync(changelogPath)) blocked.push(`CHANGELOG.md is missing: ${changelogPath}`);
+
+  return {
+    status: 'planned',
+    required: true,
+    skipReason: null,
+    repo: githubRepo,
+    path: repo?.resolvedPath ?? null,
+    base,
+    currentBranch: repo?.branch ?? null,
+    changelogPath,
+    version: null,
+    actionsHeadSha: null,
+    actionsRuns: [],
+    durationMs: null,
+    committed: false,
+    pushed: false,
+    commitSha: null,
+    blocked,
+    error: null,
+  };
+}
+
+type WorkflowRun = {
+  databaseId?: number;
+  name?: string;
+  displayTitle?: string;
+  status?: string;
+  conclusion?: string | null;
+  headSha?: string;
+  url?: string;
+};
+
+function normalizeWorkflowRun(run: WorkflowRun): MergeChangelogResult['actionsRuns'][number] {
+  return {
+    databaseId: typeof run.databaseId === 'number' ? run.databaseId : null,
+    name: run.name ?? run.displayTitle ?? 'unknown workflow',
+    status: run.status ?? 'unknown',
+    conclusion: run.conclusion ?? null,
+    headSha: run.headSha ?? null,
+    url: run.url ?? null,
+  };
+}
+
+function successfulRunConclusion(run: WorkflowRun) {
+  const conclusion = (run.conclusion ?? '').toUpperCase();
+  return ['SUCCESS', 'SKIPPED', 'NEUTRAL'].includes(conclusion);
+}
+
+function completedRun(run: WorkflowRun) {
+  return (run.status ?? '').toUpperCase() === 'COMPLETED';
+}
+
+function branchHeadSha(repo: string, branch: string) {
+  return ghTextStrict(['api', `repos/${repo}/commits/${encodeURIComponent(branch)}`, '--jq', '.sha']);
+}
+
+function listWorkflowRuns(repo: string, branch: string, headSha: string) {
+  const runs = ghJsonStrict<WorkflowRun[]>([
+    'run',
+    'list',
+    '--repo',
+    repo,
+    '--branch',
+    branch,
+    '--limit',
+    '20',
+    '--json',
+    'databaseId,name,displayTitle,status,conclusion,headSha,url',
+  ]);
+  return runs.filter((run) => run.headSha === headSha);
+}
+
+async function waitForActionsForCurrentHead(
+  repo: string,
+  branch: string,
+  config: ReturnType<typeof changelogActionsConfig>,
+  startedAt: number,
+  output?: (message: string) => void
+) {
+  let lastHeadSha: string | null = null;
+  while (Date.now() - startedAt < config.timeoutMs) {
+    const headSha = branchHeadSha(repo, branch);
+    if (headSha !== lastHeadSha) {
+      output?.(`Changelog: waiting for GitHub Actions on ${repo}@${branch} (${headSha.slice(0, 12)})`);
+      lastHeadSha = headSha;
+    }
+
+    const runs = listWorkflowRuns(repo, branch, headSha);
+    if (runs.length > 0) {
+      const failed = runs.filter((run) => completedRun(run) && !successfulRunConclusion(run));
+      if (failed.length > 0) {
+        throw new Error(`GitHub Actions failed for ${repo}@${branch}: ${failed.map((run) => `${run.name ?? run.displayTitle ?? 'workflow'} (${run.conclusion ?? 'unknown'})`).join(', ')}.`);
+      }
+
+      if (runs.every(completedRun)) {
+        output?.(`Changelog: GitHub Actions passed for ${repo}@${branch} (${headSha.slice(0, 12)})`);
+        return { headSha, runs: runs.map(normalizeWorkflowRun) };
+      }
+    }
+
+    await delay(config.pollMs);
+  }
+
+  throw new Error(`Timed out waiting for GitHub Actions to complete successfully on ${repo}@${branch}.`);
+}
+
+async function waitForSettledBranchActions(
+  repo: string,
+  branch: string,
+  output?: (message: string) => void
+) {
+  const config = changelogActionsConfig();
+  const startedAt = Date.now();
+  let latest = await waitForActionsForCurrentHead(repo, branch, config, startedAt, output);
+
+  while (Date.now() - startedAt < config.timeoutMs) {
+    if (config.settleMs > 0) await delay(config.settleMs);
+    const nextHeadSha = branchHeadSha(repo, branch);
+    if (nextHeadSha === latest.headSha) return { ...latest, durationMs: Date.now() - startedAt };
+    output?.(`Changelog: ${repo}@${branch} advanced to ${nextHeadSha.slice(0, 12)}; waiting for the new actions run`);
+    latest = await waitForActionsForCurrentHead(repo, branch, config, startedAt, output);
+  }
+
+  throw new Error(`Timed out waiting for ${repo}@${branch} actions to settle after branch updates.`);
+}
+
+function prepareChangelogCheckout(repoPath: string, base: string) {
+  const fetch = runGit(repoPath, ['fetch', 'origin', base]);
+  if (fetch.status !== 0) throw new Error(fetch.stderr || `git fetch origin ${base} failed with exit ${fetch.status ?? 'unknown'}.`);
+
+  const switched = runGit(repoPath, ['switch', base]);
+  if (switched.status !== 0) {
+    const tracked = runGit(repoPath, ['switch', '-c', base, '--track', `origin/${base}`]);
+    if (tracked.status !== 0) throw new Error(tracked.stderr || switched.stderr || `git switch ${base} failed.`);
+  }
+
+  const pull = runGit(repoPath, ['pull', '--ff-only', 'origin', base]);
+  if (pull.status !== 0) throw new Error(pull.stderr || `git pull --ff-only origin ${base} failed with exit ${pull.status ?? 'unknown'}.`);
+}
+
+function readJsonFile<T>(filePath: string): T | null {
+  try {
+    return JSON.parse(readFileSync(filePath, 'utf8')) as T;
+  } catch {
+    return null;
+  }
+}
+
+function readPackageVersions(repoPath: string) {
+  const versions: Array<{ file: string; name: string; version: string }> = [];
+  const addPackage = (filePath: string) => {
+    const packageJson = readJsonFile<{ name?: unknown; version?: unknown }>(filePath);
+    if (typeof packageJson?.version !== 'string') return;
+    versions.push({
+      file: path.relative(repoPath, filePath),
+      name: typeof packageJson.name === 'string' ? packageJson.name : path.basename(path.dirname(filePath)),
+      version: packageJson.version,
+    });
+  };
+
+  addPackage(path.join(repoPath, 'package.json'));
+  const packagesPath = path.join(repoPath, 'packages');
+  if (existsSync(packagesPath)) {
+    for (const entry of readdirSync(packagesPath, { withFileTypes: true })) {
+      if (entry.isDirectory()) addPackage(path.join(packagesPath, entry.name, 'package.json'));
+    }
+  }
+
+  return versions;
+}
+
+function buildChangelogPrompt(options: {
+  prRef: string;
+  issueRef: string | undefined;
+  pr: {
+    title?: string;
+    url?: string;
+    body?: string;
+    files?: Array<{ path?: string; additions?: number; deletions?: number }>;
+  };
+  versions: Array<{ file: string; name: string; version: string }>;
+  changelog: string;
+}) {
+  const versions = options.versions.length
+    ? options.versions.map((version) => `- ${version.name}@${version.version} (${version.file})`).join('\n')
+    : '- No package versions were detected.';
+  const files = options.pr.files?.length
+    ? options.pr.files.map((file) => `- ${file.path ?? 'unknown'} (+${file.additions ?? 0}/-${file.deletions ?? 0})`).join('\n')
+    : '- No PR files were returned by GitHub.';
+
+  return [
+    `Update CHANGELOG.md for ${options.prRef}.`,
+    '',
+    'Rules:',
+    '- Edit CHANGELOG.md only.',
+    '- Add one new top entry for the latest released version detected below.',
+    '- Match the existing changelog style and keep the entry concise.',
+    '- Mention the PR and linked issue when useful, but do not include operational War Room details.',
+    '- Do not commit or push; War Room will do that after verifying the file change.',
+    '',
+    `PR title: ${options.pr.title ?? 'unknown'}`,
+    `PR URL: ${options.pr.url ?? 'unknown'}`,
+    options.issueRef ? `Linked issue: ${options.issueRef}` : 'Linked issue: none supplied',
+    '',
+    'Detected package versions after release actions:',
+    versions,
+    '',
+    'Changed files:',
+    files,
+    '',
+    'PR body:',
+    truncateText(options.pr.body, 4000),
+    '',
+    'Current CHANGELOG.md:',
+    truncateText(options.changelog, 8000),
+  ].join('\n');
+}
+
+function gitStatusPaths(repoPath: string) {
+  const status = spawnSync('git', ['status', '--short', '--untracked-files=all'], { cwd: repoPath, encoding: 'utf8' });
+  if (status.status !== 0) {
+    throw new Error(status.stderr.trim() || `git status failed with exit ${status.status ?? 'unknown'}.`);
+  }
+  return status.stdout
+    .split(/\r?\n/)
+    .filter(Boolean)
+    .map((line) => line.slice(3).trim().replace(/^"|"$/g, ''));
+}
+
+async function runMergeChangelog(
+  workspaceRoot: string,
+  plan: MergeChangelogResult,
+  options: PrOptions,
+  pr: {
+    title?: string;
+    url?: string;
+    body?: string;
+    files?: Array<{ path?: string; additions?: number; deletions?: number }>;
+  }
+): Promise<MergeChangelogResult> {
+  if (!plan.required) return plan;
+  if (plan.blocked.length > 0) return { ...plan, status: 'failed', error: plan.blocked.join(' ') };
+  if (!plan.path || !plan.changelogPath) return { ...plan, status: 'failed', error: 'Changelog checkout plan is incomplete.' };
+
+  const startedAt = Date.now();
+  let actionsHeadSha: string | null = null;
+  let actionsRuns: MergeChangelogResult['actionsRuns'] = [];
+  try {
+    const actions = await waitForSettledBranchActions(plan.repo, plan.base, options.mergeStatus);
+    actionsHeadSha = actions.headSha;
+    actionsRuns = actions.runs;
+    options.mergeStatus?.(`Changelog: pulling latest ${plan.base} in ${plan.path}`);
+    prepareChangelogCheckout(plan.path, plan.base);
+
+    const versions = readPackageVersions(plan.path);
+    const version = versions[0]?.version ?? null;
+    const prompt = buildChangelogPrompt({
+      prRef: options.pr ?? plan.repo,
+      issueRef: options.issue,
+      pr,
+      versions,
+      changelog: readFileSync(plan.changelogPath, 'utf8'),
+    });
+    const repoId = repoIdForGitHub(workspaceRoot, plan.repo);
+    options.mergeStatus?.('Changelog: asking the LLM to update CHANGELOG.md');
+    const adapter = runAdapter(workspaceRoot, prompt, { cwd: plan.path, repoId, forceForeground: true });
+    if (!adapter.launched) throw new Error(adapter.error ?? 'LLM adapter failed to update CHANGELOG.md.');
+
+    const changed = gitStatusPaths(plan.path);
+    if (!changed.includes('CHANGELOG.md')) {
+      throw new Error('LLM adapter completed but did not modify CHANGELOG.md.');
+    }
+    const unexpected = changed.filter((file) => file !== 'CHANGELOG.md');
+    if (unexpected.length > 0) {
+      throw new Error(`LLM adapter modified files outside CHANGELOG.md: ${unexpected.join(', ')}.`);
+    }
+
+    const add = runGit(plan.path, ['add', 'CHANGELOG.md']);
+    if (add.status !== 0) throw new Error(add.stderr || `git add CHANGELOG.md failed with exit ${add.status ?? 'unknown'}.`);
+
+    const message = version
+      ? `docs(changelog): update for ${version} [skip-ci]`
+      : 'docs(changelog): update changelog [skip-ci]';
+    const commit = runGit(plan.path, ['commit', '-m', message]);
+    if (commit.status !== 0) throw new Error(commit.stderr || `git commit failed with exit ${commit.status ?? 'unknown'}.`);
+
+    const commitSha = runGit(plan.path, ['rev-parse', '--short', 'HEAD']);
+    if (commitSha.status !== 0) throw new Error(commitSha.stderr || 'Could not read changelog commit sha.');
+
+    const push = runGit(plan.path, ['push', 'origin', plan.base]);
+    if (push.status !== 0) throw new Error(push.stderr || `git push origin ${plan.base} failed with exit ${push.status ?? 'unknown'}.`);
+
+    options.mergeStatus?.(`Changelog: pushed ${commitSha.stdout} to ${plan.repo}@${plan.base} with [skip-ci]`);
+    return {
+      ...plan,
+      status: 'passed',
+      version,
+      actionsHeadSha,
+      actionsRuns,
+      durationMs: Date.now() - startedAt,
+      committed: true,
+      pushed: true,
+      commitSha: commitSha.stdout,
+      currentBranch: plan.base,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ...plan,
+      status: 'failed',
+      actionsHeadSha,
+      actionsRuns,
+      durationMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 function buildVictorySummary(
   prRef: string,
   issueRef: string | undefined,
@@ -1368,8 +2284,8 @@ function planLocalCleanup(
   };
 }
 
-export function runPrEngage(workspaceRoot: string, options: PrOptions): PrPlanResult {
-  if (!options.issue) throw new Error('warroom pr engage requires --issue owner/repo#number.');
+export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlanResult {
+  if (!options.issue) throw new Error('warroom issue next requires --issue owner/repo#number for direct starts.');
   const ref = parseIssueRef(options.issue);
   const issue = ghJson<{
     title?: string;
@@ -1381,52 +2297,87 @@ export function runPrEngage(workspaceRoot: string, options: PrOptions): PrPlanRe
     {}
   );
   const title = issue.title ?? options.issueTitle ?? 'unknown';
+  const base = options.base ?? 'main';
   const featureBranch = featureBranchForIssue(ref, title);
-  const issueComments = summarizeList(issue.comments, (comment) => {
+  const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
+  const adapterRepoId = repoIdForGitHub(workspaceRoot, ref.repo);
+  const adapterInvocation = getAdapterInvocation(workspaceRoot, adapterCwd, { repoId: adapterRepoId });
+  const requiresLocalCheckout = adapterInvocation.mode !== 'task';
+  const developmentBranch = createDevelopmentBranchResult(
+    workspaceRoot,
+    ref,
+    title,
+    base,
+    options.dryRun === false,
+    requiresLocalCheckout
+  );
+  const issueCommentRows = (issue.comments ?? []).map((comment, index) => {
     const author = comment.author?.login ?? 'unknown';
-    return `- ${author} at ${comment.createdAt ?? 'unknown'}: ${truncateText(comment.body, 1000)}`;
+    return `## Comment ${index + 1} by @${author} at ${comment.createdAt ?? 'unknown'}\n${fullText(comment.body)}`;
   });
+  const issueComments = issueCommentRows.length === 0 ? '(none)' : issueCommentRows.join('\n\n');
   const prompt = [
     `War Room implementation handoff for ${options.issue}`,
     '',
     `Title: ${title}`,
     `URL: ${issue.url ?? options.issueUrl ?? `https://github.com/${ref.repo}/issues/${ref.number}`}`,
-    `Base branch: ${options.base ?? 'main'} (use stage only as the second target option after validation)`,
+    `Base branch: ${base} (use stage only as the second target option after validation)`,
     `Feature branch: ${featureBranch}`,
+    `Development branch link: ${developmentBranch.applied ? 'created' : 'planned'} with \`${developmentBranch.command}\``,
     '',
     buildSpecialistContext(workspaceRoot, ref.repo),
     '',
     'Mission:',
     '- Implement the issue now. Do not stop after writing a plan, preflight, analysis note, or handoff markdown.',
-    `- Start from ${options.base ?? 'main'} and create or switch to feature branch ${featureBranch}.`,
+    `- Use the already prepared GitHub-linked development branch ${featureBranch}.`,
+    `- Before editing, verify the current branch. If this checkout is not already on ${featureBranch}, run \`git fetch origin ${featureBranch}\`, then \`git switch ${featureBranch}\` or \`git switch -c ${featureBranch} --track origin/${featureBranch}\`. Remote/cloud adapters may start on another branch; that is not a blocker unless the fetch/switch fails.`,
     '- Read and follow the repository AGENTS.md plus referenced development/testing instructions before editing.',
     '- Use the existing issue body and GitHub discussion as the accepted triage context.',
     '- Make the required code, test, and product documentation changes in this owning child repo.',
     '- Do not create standalone preflight, plan, or analysis markdown files unless the issue specifically asks for product documentation.',
     '- Run the most relevant validation commands for the changed surface; if the repo defines a full go/check command, run it before finishing when feasible.',
     '- Commit the implementation on the feature branch after validation passes. If validation cannot pass, leave the code changes in place and explain the blocker.',
-    '- Do not merge. Do not open a PR unless the repository workflow explicitly requires it after a completed, validated commit.',
+    `- When publishing the PR, include \`Closes ${options.issue}\` in the PR body so GitHub links the PR and closes the issue on merge.`,
+    '- Do not merge.',
     '',
-    'Issue body:',
-    truncateText(issue.body),
+    'Complete issue body:',
+    fullText(issue.body),
     '',
-    'GitHub discussion and triage comments:',
+    'Complete GitHub discussion and triage comments:',
     issueComments,
   ].join('\n');
   const artifact = options.writeArtifact
-    ? createRunArtifact(workspaceRoot, 'pr-engage', {
+    ? createRunArtifact(workspaceRoot, 'issue-start', {
         'prompt.md': prompt,
         'input.json': JSON.stringify(options, null, 2),
+        'issue.json': JSON.stringify(issue, null, 2),
       })
     : null;
-  const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
-  const adapterRepoId = repoIdForGitHub(workspaceRoot, ref.repo);
-  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd, { repoId: adapterRepoId }).display;
+  const adapterCommand = adapterInvocation.display;
+  if (
+    options.dryRun === false &&
+    (developmentBranch.blocked.length > 0 ||
+      !developmentBranch.applied ||
+      (developmentBranch.checkoutRequired && !developmentBranch.checkedOut))
+  ) {
+    return {
+      prompt,
+      artifact,
+      launched: false,
+      adapterCommand,
+      action: 'issue-start',
+      campaignStatus: null,
+      developmentBranch,
+      contextSummary: { promptCharacters: prompt.length, comments: issue.comments?.length ?? 0 },
+      adapterCwd,
+      launchError: developmentBranch.error ?? developmentBranch.blocked.join(' '),
+    };
+  }
   const campaignStatus = setCampaignStatus(options.issue, 'battlefield-active', { confirm: options.confirmStatus });
 
   const contextSummary = { promptCharacters: prompt.length, comments: issue.comments?.length ?? 0 };
   if (options.dryRun !== false) {
-    return { prompt, artifact, launched: false, adapterCommand, action: 'engage', campaignStatus, contextSummary, adapterCwd };
+    return { prompt, artifact, launched: false, adapterCommand, action: 'issue-start', campaignStatus, developmentBranch, contextSummary, adapterCwd };
   }
   const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd, repoId: adapterRepoId });
   return {
@@ -1434,126 +2385,183 @@ export function runPrEngage(workspaceRoot: string, options: PrOptions): PrPlanRe
     artifact,
     launched: launch.launched,
     adapterCommand: launch.invocation.display,
-    action: 'engage',
+    action: 'issue-start',
     campaignStatus,
+    developmentBranch,
     contextSummary,
     adapterCwd,
     launchError: launch.error,
   };
 }
 
-export function runPrReview(workspaceRoot: string, options: PrOptions): PrPlanResult {
+function buildCodeRabbitPrReviewPrompt(prUrl: string) {
+  return `Please analyze the latest [@coderabbit](plugin://coderabbit@openai-curated)
+ feedback for the latest commit on the [@github](plugin://github@openai-curated)
+ PR ${prUrl}
+
+Please loop over each comment in the latest [@coderabbit](plugin://coderabbit@openai-curated) one by one.
+
+First, add the eyes (👀) emoji to the comment to show you're currently working on the comment.
+
+Second, review the feedback and grill-me for additional context to complete the work. If a code change is required, please implement an update.
+
+Finally, once complete, replace the eyes (👀) emoji with either:
+
+-  Green Tick (✅) emoji with a reply to the comment about what was changed in the code to address the issue
+-  Red Cross (❌) emoji with a reply to the comment explaining why it was not valid
+
+Once all comments are complete and you've looped through all outstanding feedback, please commit the code into the PR branch.`;
+}
+
+async function runCodeRabbitPrReviewLoop(
+  workspaceRoot: string,
+  ref: { repo: string; number: number },
+  prompt: string,
+  adapterCwd: string,
+  adapterRepoId: string | null,
+  initialSnapshot: PrReviewSnapshot,
+  options: PrOptions
+): Promise<{ loop: PrReviewLoopResult; launched: boolean; adapterCommand: string | null; launchError: string | null }> {
+  const config = prReviewLoopConfig();
+  const iterations: PrReviewLoopResult['iterations'] = [];
+  const blocked: string[] = [];
+  let currentHeadSha = initialSnapshot.headRefOid ?? null;
+  let adapterCommand: string | null = null;
+
+  if (!currentHeadSha) {
+    blocked.push('Could not read the PR head commit before launching the review loop.');
+    return {
+      loop: { status: 'failed', completed: false, iterations, blocked, error: blocked.join(' ') },
+      launched: false,
+      adapterCommand,
+      launchError: blocked.join(' '),
+    };
+  }
+
+  for (let index = 1; index <= config.maxLoops; index += 1) {
+    options.reviewStatus?.(`PR review loop ${index}: launching adapter for ${ref.repo}#${ref.number}.`);
+    const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd, repoId: adapterRepoId, forceForeground: true });
+    adapterCommand = launch.invocation.display;
+    const iteration: PrReviewLoopResult['iterations'][number] = {
+      iteration: index,
+      startHeadSha: currentHeadSha,
+      endHeadSha: null,
+      adapterLaunched: launch.launched,
+      adapterError: launch.error,
+      outstandingCodeRabbitComments: null,
+    };
+
+    if (!launch.launched) {
+      iterations.push(iteration);
+      const error = launch.error ?? 'LLM adapter failed.';
+      const launchedAny = iterations.some((entry) => entry.adapterLaunched);
+      return {
+        loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
+        launched: launchedAny,
+        adapterCommand,
+        launchError: error,
+      };
+    }
+
+    options.reviewStatus?.(
+      `PR review loop ${index}: waiting for a new commit on ${initialSnapshot.headRefName ?? 'the PR branch'} after ${shortSha(currentHeadSha)}.`
+    );
+    const commit = await waitForPrHeadChange(ref, currentHeadSha, config.commitTimeoutMs, config.pollMs);
+    if (!commit.changed || !commit.snapshot.headRefOid) {
+      iteration.endHeadSha = commit.snapshot.headRefOid ?? currentHeadSha;
+      iterations.push(iteration);
+      const error = `No new PR commit was detected within ${config.commitTimeoutMs}ms after adapter completion.`;
+      return {
+        loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
+        launched: true,
+        adapterCommand,
+        launchError: error,
+      };
+    }
+
+    currentHeadSha = commit.snapshot.headRefOid;
+    iteration.endHeadSha = currentHeadSha;
+    options.reviewStatus?.(`PR review loop ${index}: detected PR commit ${shortSha(currentHeadSha)}.`);
+    options.reviewStatus?.(`PR review loop ${index}: waiting for CodeRabbit feedback on the latest commit.`);
+    const feedback = await waitForCodeRabbitFeedback(ref, currentHeadSha, config.codeRabbitTimeoutMs, config.pollMs);
+    const outstanding = feedback.threads.length;
+    iteration.outstandingCodeRabbitComments = outstanding;
+    iterations.push(iteration);
+
+    if (outstanding === 0) {
+      options.reviewStatus?.(`PR review loop ${index}: no outstanding CodeRabbit feedback remains.`);
+      return {
+        loop: { status: 'passed', completed: true, iterations, blocked: [], error: null },
+        launched: true,
+        adapterCommand,
+        launchError: null,
+      };
+    }
+
+    options.reviewStatus?.(
+      `PR review loop ${index}: ${outstanding} outstanding CodeRabbit comment${outstanding === 1 ? ' remains' : 's remain'}; starting another adapter loop.`
+    );
+  }
+
+  const error = `CodeRabbit feedback still requires work after ${config.maxLoops} adapter loop${config.maxLoops === 1 ? '' : 's'}.`;
+  return {
+    loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
+    launched: true,
+    adapterCommand,
+    launchError: error,
+  };
+}
+
+export async function runPrReview(workspaceRoot: string, options: PrOptions): Promise<PrPlanResult> {
   if (!options.pr) throw new Error('warroom pr review requires --pr owner/repo#number.');
   const ref = parsePrRef(options.pr);
-  const pr = ghJson<{
-    title?: string;
-    body?: string;
-    url?: string;
-    headRefName?: string;
-    baseRefName?: string;
-    files?: Array<{ path?: string; additions?: number; deletions?: number }>;
-    comments?: Array<{ author?: { login?: string }; body?: string; createdAt?: string }>;
-    latestReviews?: Array<{ author?: { login?: string }; state?: string; body?: string; submittedAt?: string }>;
-    statusCheckRollup?: Array<{ name?: string; status?: string; conclusion?: string; workflowName?: string }>;
-  }>(
-    [
-      'pr',
-      'view',
-      String(ref.number),
-      '--repo',
-      ref.repo,
-      '--json',
-      'title,body,url,headRefName,baseRefName,files,comments,latestReviews,statusCheckRollup',
-    ],
-    {}
-  );
-  const files = summarizeList(
-    pr.files,
-    (file) => `- ${file.path ?? 'unknown'} (+${file.additions ?? 0}/-${file.deletions ?? 0})`
-  );
-  const comments = summarizeList(pr.comments, (comment) => {
-    const author = comment.author?.login ?? 'unknown';
-    return `- ${author} at ${comment.createdAt ?? 'unknown'}: ${truncateText(comment.body, 500)}`;
-  });
-  const reviews = summarizeList(pr.latestReviews, (review) => {
-    const author = review.author?.login ?? 'unknown';
-    return `- ${review.state ?? 'UNKNOWN'} by ${author} at ${review.submittedAt ?? 'unknown'}: ${truncateText(review.body, 500)}`;
-  });
-  const checks = summarizeList(pr.statusCheckRollup, (check) => {
-    const state = check.conclusion ?? check.status ?? 'unknown';
-    const workflow = check.workflowName ? ` (${check.workflowName})` : '';
-    return `- ${check.name ?? 'unknown'}${workflow}: ${state}`;
-  });
-  const checkInMinutes = options.checkInMinutes ?? 60;
-  const prompt = [
-    `War Room PR review handoff for ${options.pr}`,
-    '',
-    `Title: ${pr.title ?? 'unknown'}`,
-    `URL: ${pr.url ?? `https://github.com/${ref.repo}/pull/${ref.number}`}`,
-    `Branch: ${pr.headRefName ?? 'unknown'} -> ${pr.baseRefName ?? 'unknown'}`,
-    '',
-    buildSpecialistContext(workspaceRoot, ref.repo),
-    '',
-    'Required review loop:',
-    '- Gather current GitHub and CodeRabbit feedback before editing.',
-    '- Reply to each actionable comment with an outcome marker after handling it.',
-    '- Pause on vague, repeated, or circular feedback.',
-    '- Keep context scoped to changed files, comments, and repo instructions.',
-    '- Use eyes-in-progress replies before starting comment-by-comment feedback work when posting is explicitly confirmed.',
-    '- Reply with ✅ for completed feedback and ❌ plus a concise reason when feedback is not actionable.',
-    `- Check back every ${checkInMinutes} minutes while the skirmish remains active, then continue or retreat through warroom abort.`,
-    '- Use warroom abort for preservation-first recovery if the loop needs to stop.',
-    '',
-    'Changed files:',
-    files,
-    '',
-    'Latest reviews:',
-    reviews,
-    '',
-    'Comments:',
-    comments,
-    '',
-    'Checks:',
-    checks,
-    '',
-    'PR body:',
-    truncateText(pr.body),
-  ].join('\n');
+  const pr = prReviewSnapshot(ref);
+  const prUrl = pr.url ?? `https://github.com/${ref.repo}/pull/${ref.number}`;
+  const prompt = buildCodeRabbitPrReviewPrompt(prUrl);
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'pr-review', {
         'prompt.md': prompt,
         'input.json': JSON.stringify(options, null, 2),
+        'pr.json': JSON.stringify(pr, null, 2),
       })
     : null;
   const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
   const adapterRepoId = repoIdForGitHub(workspaceRoot, ref.repo);
-  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd, { repoId: adapterRepoId }).display;
+  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd, { repoId: adapterRepoId, forceForeground: true }).display;
   const campaignStatus = options.issue
     ? setCampaignStatus(options.issue, 'skirmish', { confirm: options.confirmStatus })
     : null;
   const contextSummary = {
     promptCharacters: prompt.length,
-    changedFiles: pr.files?.length ?? 0,
-    comments: pr.comments?.length ?? 0,
-    reviews: pr.latestReviews?.length ?? 0,
     checks: pr.statusCheckRollup?.length ?? 0,
-    checkInMinutes,
   };
 
   if (options.dryRun !== false) {
-    return { prompt, artifact, launched: false, adapterCommand, action: 'review', campaignStatus, contextSummary, adapterCwd };
+    return {
+      prompt,
+      artifact,
+      launched: false,
+      adapterCommand,
+      action: 'review',
+      campaignStatus,
+      contextSummary,
+      adapterCwd,
+      prReviewLoop: { status: 'planned', completed: false, iterations: [], blocked: [], error: null },
+    };
   }
-  const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd, repoId: adapterRepoId });
+
+  const loop = await runCodeRabbitPrReviewLoop(workspaceRoot, ref, prompt, adapterCwd, adapterRepoId, pr, options);
   return {
     prompt,
     artifact,
-    launched: launch.launched,
-    adapterCommand: launch.invocation.display,
+    launched: loop.launched,
+    adapterCommand: loop.adapterCommand ?? adapterCommand,
     action: 'review',
     campaignStatus,
     contextSummary,
     adapterCwd,
-    launchError: launch.error,
+    prReviewLoop: loop.loop,
+    launchError: loop.launchError,
   };
 }
 
@@ -1562,6 +2570,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
   const ref = parsePrRef(options.pr);
   const pr = ghJson<{
     title?: string;
+    body?: string;
     url?: string;
     mergeStateStatus?: string;
     mergeable?: string;
@@ -1569,6 +2578,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     headRefName?: string;
     baseRefName?: string;
     isDraft?: boolean;
+    files?: Array<{ path?: string; additions?: number; deletions?: number }>;
     reviewRequests?: Array<{ login?: string; name?: string; slug?: string; __typename?: string }>;
     latestReviews?: Array<{ state?: string; author?: { login?: string }; submittedAt?: string }>;
     statusCheckRollup?: Array<{
@@ -1589,14 +2599,17 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
       '--repo',
       ref.repo,
       '--json',
-      'title,url,mergeStateStatus,mergeable,reviewDecision,headRefName,baseRefName,isDraft,reviewRequests,latestReviews,statusCheckRollup',
+      'title,body,url,mergeStateStatus,mergeable,reviewDecision,headRefName,baseRefName,isDraft,files,reviewRequests,latestReviews,statusCheckRollup',
     ],
     {}
   );
   const reviewThreads = listPullRequestReviewThreads(ref);
   const readiness = buildMergeReadiness(pr, reviewThreads);
+  const targetBase = pr.baseRefName ?? loadRepoManifest(workspaceRoot).defaults.default_branch;
   const mergePlaywright = mergePlaywrightRequirement(workspaceRoot, ref.repo);
+  const mergeChangelogRequirementResult = mergeChangelogRequirement(workspaceRoot, ref.repo);
   let mergeE2E = createMergeE2EPlan(workspaceRoot, mergePlaywright);
+  let mergeChangelog = createMergeChangelogPlan(workspaceRoot, ref.repo, targetBase, mergeChangelogRequirementResult);
   const summary = buildVictorySummary(options.pr, options.issue, pr, readiness, options.summary);
   const blockerDetails = readiness.details.length
     ? readiness.details
@@ -1622,10 +2635,13 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     '- Confirm validation status and target branch.',
     mergeE2E.required
       ? `- Run full demo Playwright e2e: start backend with \`${mergeE2E.backendCommand}\`, wait for ${mergeE2E.backendReadyUrl}, then run \`${mergeE2E.demoCommand}\` from the demo repo.`
-      : `- Demo Playwright e2e skipped: ${mergeE2E.skipReason ?? 'merge_playwright is not enabled for this repo.'}`,
+      : `- Demo Playwright e2e skipped: ${mergeE2E.skipReason ?? 'merge.playwright is not enabled for this repo.'}`,
     mergeE2E.required
       ? '- All demo Playwright e2e tests must pass before merging.'
       : '- Merge may proceed without the demo Playwright e2e gate for this repo.',
+    mergeChangelog.required
+      ? `- After merge, wait for GitHub Actions on ${targetBase}, pull the latest ${targetBase}, update CHANGELOG.md with the LLM, and push a [skip-ci] changelog commit.`
+      : `- CHANGELOG.md update skipped: ${mergeChangelog.skipReason ?? 'merge.changelog is not enabled for this repo.'}`,
     '- Merge only after explicit confirmation.',
     '- Post issue/PR summary and return local checkout to the default branch safely.',
   ];
@@ -1665,6 +2681,9 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
 
   if (options.confirm) {
     if (readiness.blocked.length > 0) throw new Error(`PR is not merge-ready: ${readiness.blocked.join(' ')}`);
+    if (mergeChangelog.required && mergeChangelog.blocked.length > 0) {
+      throw new Error(`PR cannot be merged until the changelog gate is ready. ${mergeChangelog.blocked.join(' ')}`);
+    }
     mergeE2E = await runMergeE2E(workspaceRoot, mergePlaywright, options);
     if (mergeE2E.required && mergeE2E.status !== 'passed') {
       const blockers = [...mergeE2E.blocked, mergeE2E.error].filter(Boolean).join(' ');
@@ -1677,12 +2696,17 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     );
     if (result.status !== 0) throw new Error(`gh pr merge failed with exit ${result.status ?? 'unknown'}.`);
     merged = true;
+    mergeChangelog = await runMergeChangelog(workspaceRoot, mergeChangelog, options, pr);
   }
 
-  const summaryPosts = buildSummaryPostPlan(options, summary, readiness);
+  const completionReadiness =
+    mergeChangelog.required && mergeChangelog.status === 'failed'
+      ? { ...readiness, blocked: [...readiness.blocked, 'Required CHANGELOG.md update failed.'] }
+      : readiness;
+  const summaryPosts = buildSummaryPostPlan(options, summary, completionReadiness);
   const localCleanup = planLocalCleanup(workspaceRoot, ref.repo, pr.headRefName, pr.baseRefName, options);
   const campaignStatus = options.issue
-    ? setCampaignStatus(options.issue, 'victory', { confirm: options.confirmStatus && readiness.blocked.length === 0 })
+    ? setCampaignStatus(options.issue, 'victory', { confirm: options.confirmStatus && completionReadiness.blocked.length === 0 })
     : null;
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'pr-merge', {
@@ -1691,6 +2715,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
         'pr.json': JSON.stringify(pr, null, 2),
         'readiness.json': JSON.stringify(readiness, null, 2),
         'merge-e2e.json': JSON.stringify(mergeE2E, null, 2),
+        'merge-changelog.json': JSON.stringify(mergeChangelog, null, 2),
         'summary.md': summary,
         'summary-posts.json': JSON.stringify(summaryPosts, null, 2),
         'local-cleanup.json': JSON.stringify(localCleanup, null, 2),
@@ -1706,6 +2731,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     campaignStatus,
     mergeReadiness: readiness,
     mergeE2E,
+    mergeChangelog,
     summary,
     summaryPosts,
     merged,

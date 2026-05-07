@@ -11,7 +11,9 @@ repos:
     ssh_url: git@github.com:TeamFloPay/sdk.git
     local_path: maps/repos/sdk
     status: active
-    merge_playwright: true
+    merge:
+      playwright: true
+      changelog: true
     owner: sdk
     description: SDK packages published as @flopay/*.
     specialist:
@@ -36,7 +38,9 @@ repos:
     ssh_url: git@github.com:TeamFloPay/backend.git
     local_path: maps/repos/backend
     status: active
-    merge_playwright: true
+    merge:
+      playwright: true
+      changelog: false
     owner: backend
     description: Central API and server-side application.
     specialist:
@@ -62,7 +66,9 @@ repos:
     ssh_url: git@github.com:TeamFloPay/infra.git
     local_path: maps/repos/infra
     status: active
-    merge_playwright: false
+    merge:
+      playwright: false
+      changelog: false
     owner: infra
     description: Live infrastructure and operational configuration.
     specialist:
@@ -86,7 +92,9 @@ repos:
     ssh_url: git@github.com:TeamFloPay/demo.git
     local_path: maps/repos/demo
     status: active
-    merge_playwright: true
+    merge:
+      playwright: true
+      changelog: false
     owner: app-demo
     description: Standalone SDK demo app after extraction from sdk/apps/demo.
     specialist:
@@ -114,7 +122,9 @@ repos:
     ssh_url: git@github.com:TeamFloPay/docs.git
     local_path: maps/repos/docs
     status: active
-    merge_playwright: false
+    merge:
+      playwright: false
+      changelog: false
     owner: app-docs
     description: Standalone SDK documentation site after extraction from sdk/apps/docs.
     specialist:
@@ -138,7 +148,9 @@ repos:
     ssh_url: git@github.com:TeamFloPay/dashboard.git
     local_path: maps/repos/dashboard
     status: active
-    merge_playwright: false
+    merge:
+      playwright: false
+      changelog: false
     owner: app-dashboard
     description: Standalone dashboard app after extraction from sdk/apps/dashboard.
     specialist:
@@ -162,7 +174,9 @@ repos:
     ssh_url: git@github.com:TeamFloPay/landing.git
     local_path: maps/repos/landing
     status: active
-    merge_playwright: false
+    merge:
+      playwright: false
+      changelog: false
     owner: app-landing
     description: Standalone marketing site after extraction from sdk/apps/landing.
     specialist:

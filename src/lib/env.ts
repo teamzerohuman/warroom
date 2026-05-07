@@ -29,6 +29,7 @@ export type AdapterRunResult = {
 
 export type AdapterInvocationOptions = {
   repoId?: string | null;
+  forceForeground?: boolean;
 };
 
 export type AdapterRunOptions = AdapterInvocationOptions & {
@@ -42,9 +43,30 @@ function parseEnv(raw: string) {
     if (!trimmed || trimmed.startsWith('#')) continue;
     const separator = trimmed.indexOf('=');
     if (separator === -1) continue;
-    values.set(trimmed.slice(0, separator), trimmed.slice(separator + 1));
+    const key = trimmed.slice(0, separator).trim().replace(/^export\s+/, '');
+    values.set(key, parseEnvValue(trimmed.slice(separator + 1)));
   }
   return values;
+}
+
+function parseEnvValue(raw: string) {
+  const value = raw.trim();
+  const quote = value[0];
+  if ((quote === '"' || quote === "'") && value.endsWith(quote)) {
+    const inner = value.slice(1, -1);
+    if (quote === '"') return inner.replace(/\\n/g, '\n').replace(/\\"/g, '"').replace(/\\\\/g, '\\');
+    return inner.replace(/\\'/g, "'");
+  }
+  return value;
+}
+
+function readEnvMap(filePath: string) {
+  return existsSync(filePath) ? parseEnv(readFileSync(filePath, 'utf8')) : new Map<string, string>();
+}
+
+function localProcessEnv(workspaceRoot: string) {
+  const localPath = path.join(workspaceRoot, '.env.local');
+  return Object.fromEntries(readEnvMap(localPath));
 }
 
 function codexCloudSetupNote() {
@@ -95,8 +117,8 @@ export function getEnvStatus(workspaceRoot: string): EnvStatus {
   const exampleExists = existsSync(examplePath);
   const localExists = existsSync(localPath);
   const notes: string[] = [];
-  const example = exampleExists ? parseEnv(readFileSync(examplePath, 'utf8')) : new Map<string, string>();
-  const local = localExists ? parseEnv(readFileSync(localPath, 'utf8')) : new Map<string, string>();
+  const example = readEnvMap(examplePath);
+  const local = readEnvMap(localPath);
   const adapter = local.get('LLM_ADAPTER') ?? example.get('LLM_ADAPTER') ?? null;
   const adapterSupported = adapter === 'codex' || adapter === 'codex-cloud' || adapter === 'claude';
 
@@ -129,15 +151,15 @@ export function getAdapterInvocation(
 ): AdapterInvocation {
   const examplePath = path.join(workspaceRoot, '.env.local.example');
   const localPath = path.join(workspaceRoot, '.env.local');
-  const example = existsSync(examplePath) ? parseEnv(readFileSync(examplePath, 'utf8')) : new Map<string, string>();
-  const local = existsSync(localPath) ? parseEnv(readFileSync(localPath, 'utf8')) : new Map<string, string>();
+  const example = readEnvMap(examplePath);
+  const local = readEnvMap(localPath);
   const adapter = local.get('LLM_ADAPTER') ?? example.get('LLM_ADAPTER') ?? 'codex';
   if (adapter === 'claude') {
     const command = local.get('CLAUDE_COMMAND') ?? example.get('CLAUDE_COMMAND') ?? 'claude';
     return { command, args: [], display: command, cwd, mode: 'foreground' };
   }
 
-  if (adapter === 'codex-cloud') {
+  if (adapter === 'codex-cloud' && !options.forceForeground) {
     const command = local.get('CODEX_COMMAND') ?? example.get('CODEX_COMMAND') ?? 'codex';
     const envVar = codexCloudEnvVar(options.repoId);
     const env = local.get(envVar) ?? example.get(envVar);
@@ -160,6 +182,10 @@ export function runAdapter(workspaceRoot: string, prompt: string, options: Adapt
     input: taskMode ? undefined : prompt,
     stdio: ['pipe', 'inherit', 'inherit'],
     encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...localProcessEnv(workspaceRoot),
+    },
   });
   const error =
     result.error?.message ??

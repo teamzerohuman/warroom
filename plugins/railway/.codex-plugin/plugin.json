@@ -1,0 +1,38 @@
+{
+  "name": "railway",
+  "version": "0.1.0",
+  "description": "War Room pinned Railway MCP access for deployment and infrastructure workflows.",
+  "author": {
+    "name": "TeamFloPay",
+    "url": "https://github.com/TeamFloPay"
+  },
+  "homepage": "https://railway.com/",
+  "repository": "https://github.com/railwayapp",
+  "license": "UNLICENSED",
+  "keywords": [
+    "railway",
+    "mcp",
+    "deployment",
+    "infrastructure"
+  ],
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Railway",
+    "shortDescription": "Railway remote MCP access pinned for War Room.",
+    "longDescription": "Expose Railway's remote MCP server through the War Room plugin marketplace so Codex workflows can inspect and operate Railway resources after OAuth or bearer-token authentication is configured locally.",
+    "developerName": "TeamFloPay",
+    "category": "Coding",
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
+    "websiteURL": "https://railway.com/",
+    "privacyPolicyURL": "https://railway.com/legal/privacy",
+    "termsOfServiceURL": "https://railway.com/legal/terms",
+    "defaultPrompt": [
+      "Inspect Railway services, deployments, environment variables, and logs for this project."
+    ],
+    "brandColor": "#0B0D0E",
+    "screenshots": []
+  }
+}

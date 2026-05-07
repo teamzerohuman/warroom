@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "railway": {
+      "type": "http",
+      "url": "https://mcp.railway.com",
+      "bearer_token_env_var": "RAILWAY_TOKEN",
+      "note": "Railway remote MCP server pinned for War Room. Authenticate with OAuth via `codex mcp login railway`, or expose RAILWAY_TOKEN in the Codex process environment for bearer-token automation."
+    }
+  }
+}

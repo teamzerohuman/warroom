@@ -1,8 +1,12 @@
 # LLM Operations
 
-War Room launches LLM adapters only when a command is explicitly given `--launch`, except interactive `issue next`, where selecting an issue launches the configured adapter by default. Without launch behavior, issue and PR commands print scoped prompts and can write local artifacts under `.warroom/runs/*`; for `issue next`, use `--dry-run` for that preview path.
+War Room launches LLM adapters only when a command is explicitly given `--launch`, except interactive `issue next`, where selecting an issue launches the configured adapter by default, and interactive `pr review`, where confirming a detected PR launches the review loop. Without launch behavior, issue and PR commands print scoped prompts and can write local artifacts under `.warroom/runs/*`; for `issue next`, use `--dry-run` for that preview path.
 
-`pr engage` and interactive `issue next` are implementation launches. They instruct the adapter to create or switch to a feature branch, use the GitHub issue body and discussion as already-triaged context, edit the owning child repo, run relevant validation, and commit when validation passes. They must not stop at a preflight or create standalone planning markdown unless the issue specifically asks for product documentation.
+Interactive `issue next` and direct `issue next --issue owner/repo#number` are implementation launches. Before launching, War Room creates a GitHub-linked development branch with `gh issue develop` so the issue, branch, and eventual PR stay connected in GitHub. Foreground/local adapters require a clean checkout because War Room checks out that branch locally before launch. Codex Cloud task adapters create the linked branch without local checkout, so unrelated local dirty files do not block the cloud task. The adapter is instructed to use that branch, fetching and switching to it first if the remote/cloud checkout starts on another branch. It uses the complete GitHub issue body and discussion as already-triaged context, edits the owning child repo, runs relevant validation, commits when validation passes, and includes `Closes <issue>` in the PR body. It must not stop at a preflight or create standalone planning markdown unless the issue specifically asks for product documentation.
+
+`pr create` is the publication step after implementation work is committed. It runs from the mapped child repo, uses the current or supplied branch, infers the linked issue from `warroom/<issue-number>-...` when possible, generates a PR title/body from issue and commit context unless supplied explicitly, and creates the GitHub PR only with `--confirm`.
+
+`pr review` uses a fixed GitHub/CodeRabbit handoff. Launched runs wait for a new PR commit after each adapter pass, check current unresolved CodeRabbit comments, and relaunch the adapter while CodeRabbit feedback remains. This command always uses the foreground adapter, even when `LLM_ADAPTER=codex-cloud`, because Codex Cloud environments do not inherit local GitHub/CodeRabbit app access, `gh` auth, or local PR remotes.
 
 ## Configuration
 
@@ -36,7 +40,8 @@ Real provider keys and local secrets belong in `.env.local`, ally-specific `.env
 
 ```sh
 npm run warroom -- issue triage --issue TeamFloPay/infra#4 --write-artifact
-npm run warroom -- pr engage --issue TeamFloPay/infra#4 --write-artifact
+npm run warroom -- issue next --issue TeamFloPay/infra#4 --dry-run --write-artifact
+npm run warroom -- pr create --write-artifact
 npm run warroom -- pr review --pr TeamFloPay/warroom#1 --write-artifact
 npm run warroom -- pr merge --pr TeamFloPay/warroom#1 --issue TeamFloPay/infra#4 --write-artifact
 ```

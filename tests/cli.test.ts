@@ -13,7 +13,7 @@ import { runCampaignStatusCheck } from '../src/commands/campaign.js';
 import { runCommitCreate } from '../src/commands/commit-create.js';
 import { runDoctor } from '../src/commands/doctor.js';
 import { runDevStatus } from '../src/commands/dev-link.js';
-import { getAdapterInvocation, getEnvStatus } from '../src/lib/env.js';
+import { getAdapterInvocation, getEnvStatus, runAdapter } from '../src/lib/env.js';
 import { runMapsAssign } from '../src/commands/maps-assign.js';
 import { runMapsStudy } from '../src/commands/maps-study.js';
 import { runSync } from '../src/commands/sync.js';
@@ -89,7 +89,7 @@ describe('phase-1 CLI', () => {
     expect(lines.some((line) => line.includes('clicktech: active'))).toBe(true);
   });
 
-  it('selects a ready issue and creates a PR engagement handoff', async () => {
+  it('selects a ready issue and starts implementation on a linked branch', async () => {
     const root = makeDevFixture();
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
@@ -108,21 +108,35 @@ describe('phase-1 CLI', () => {
 
       expect(lines).toContain('Issues with Campaign status ready-to-engage: 1');
       expect(lines.some((line) => line.startsWith('1. TeamFloPay/sdk#7'))).toBe(true);
-      expect(lines).toContain('Engaging TeamFloPay/sdk#7');
-      expect(lines).toContain('PR engage: launched');
+      expect(lines).toContain('Starting TeamFloPay/sdk#7');
+      expect(lines).toContain('Issue start: launched');
       expect(lines.some((line) => line.startsWith('Adapter: codex exec --cd '))).toBe(true);
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
+      expect(lines).toContain('Development branch: ready warroom/7-build-the-selector from main');
+      expect(lines.some((line) => line.includes('Development branch link: created gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(true);
+      expect(lines).toContain('Development checkout: checked out');
       expect(lines.some((line) => line.includes('War Room implementation handoff for TeamFloPay/sdk#7'))).toBe(true);
       expect(lines.some((line) => line.includes('Title: Build the selector'))).toBe(true);
       expect(lines.some((line) => line.includes('Feature branch: warroom/7-build-the-selector'))).toBe(true);
+      expect(lines.some((line) => line.includes('Development branch link: created with `gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout`'))).toBe(true);
+      expect(lines.some((line) => line.includes('Closes TeamFloPay/sdk#7'))).toBe(true);
       expect(lines.some((line) => line.includes('Do not stop after writing a plan'))).toBe(true);
+      expect(lines.some((line) => line.includes('git fetch origin warroom/7-build-the-selector'))).toBe(true);
+      expect(lines.some((line) => line.includes('Remote/cloud adapters may start on another branch'))).toBe(true);
       expect(lines.some((line) => line.includes('Triage complete: build the feature directly.'))).toBe(true);
+      expect(lines.at(-1)).toBe('Outcome: handed off to LLM adapter on warroom/7-build-the-selector. Campaign status updated to battlefield-active.');
+
+      const branch = spawnSync('git', ['branch', '--show-current'], {
+        cwd: path.resolve(root, '..', 'sdk'),
+        encoding: 'utf8',
+      });
+      expect(branch.stdout.trim()).toBe('warroom/7-build-the-selector');
     } finally {
       process.env.PATH = originalPath;
     }
   });
 
-  it('can submit PR engagement through Codex Cloud adapter', async () => {
+  it('can start implementation through Codex Cloud adapter', async () => {
     const root = makeDevFixture();
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
@@ -137,12 +151,238 @@ describe('phase-1 CLI', () => {
       const lines: string[] = [];
       const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
 
-      await program.parseAsync(['node', 'warroom', 'pr', 'engage', '--issue', 'TeamFloPay/sdk#7', '--launch', '--confirm-status']);
+      await program.parseAsync(['node', 'warroom', 'issue', 'next', '--issue', 'TeamFloPay/sdk#7', '--confirm-status']);
 
-      expect(lines).toContain('Preparing implementation for TeamFloPay/sdk#7...');
-      expect(lines).toContain('PR engage: launched');
+      expect(lines).toContain('Starting TeamFloPay/sdk#7');
+      expect(lines).toContain('Issue start: launched');
       expect(lines.some((line) => line.includes('Adapter: codex cloud exec --env env_fixture <prompt>'))).toBe(true);
+      expect(lines.some((line) => line.includes('git switch -c warroom/7-build-the-selector --track origin/warroom/7-build-the-selector'))).toBe(true);
+      expect(lines.some((line) => line.includes('not a blocker unless the fetch/switch fails'))).toBe(true);
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
+      expect(lines.at(-1)).toBe('Outcome: handed off to LLM adapter on warroom/7-build-the-selector. Campaign status updated to battlefield-active.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('starts Codex Cloud implementation without requiring a clean local checkout', async () => {
+    const root = makeDevFixture();
+    const sdk = path.resolve(root, '..', 'sdk');
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeCodexFixture(bin);
+    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\nCODEX_CLOUD_ENV_SDK=env_fixture\n');
+    writeFileSync(path.join(sdk, 'dirty-local-note.md'), 'local work in progress\n');
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'issue', 'next', '--issue', 'TeamFloPay/sdk#7', '--confirm-status']);
+
+      expect(lines).toContain('Issue start: launched');
+      expect(lines.some((line) => line.includes('Adapter error:'))).toBe(false);
+      expect(lines).toContain('Development branch: ready warroom/7-build-the-selector from main');
+      expect(lines.some((line) => line.includes('Development branch link: created gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector'))).toBe(true);
+      expect(lines.some((line) => line.includes('Development branch link: created gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(false);
+      expect(lines).toContain('Development checkout: not required for task adapter');
+      expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
+      expect(lines.at(-1)).toBe('Outcome: handed off to LLM adapter on warroom/7-build-the-selector. Campaign status updated to battlefield-active.');
+
+      const branch = spawnSync('git', ['branch', '--show-current'], { cwd: sdk, encoding: 'utf8' });
+      expect(branch.stdout.trim()).toBe('main');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('prints a clear outcome when issue next is blocked before handoff', async () => {
+    const root = makeDevFixture();
+    const sdk = path.resolve(root, '..', 'sdk');
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeCodexFixture(bin);
+    writeFileSync(path.join(sdk, 'dirty-local-note.md'), 'local work in progress\n');
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'issue', 'next', '--issue', 'TeamFloPay/sdk#7', '--confirm-status']);
+
+      expect(lines).toContain('Issue start: blocked');
+      expect(lines.some((line) => line.includes('branch blocked: Mapped checkout has local changes.'))).toBe(true);
+      expect(lines.at(-1)).toBe('Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.');
+    } finally {
+      process.env.PATH = originalPath;
+      process.exitCode = undefined;
+    }
+  });
+
+  it('scopes issue next to the current mapped child repo', async () => {
+    const root = makeDevFixture();
+    const demo = path.resolve(root, '..', 'demo');
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const scopedLines: string[] = [];
+      const scopedProgram = buildProgram({ cwd: demo, output: (line) => scopedLines.push(line) });
+
+      await scopedProgram.parseAsync(['node', 'warroom', 'issue', 'next']);
+
+      expect(scopedLines[0]).toBe('Issues with Campaign status ready-to-engage for TeamFloPay/demo: 0');
+      expect(scopedLines.some((line) => line.includes('TeamFloPay/sdk#7'))).toBe(false);
+      expect(scopedLines).toContain('Outcome: no ready issues found; no issue started.');
+
+      const allLines: string[] = [];
+      const allProgram = buildProgram({ cwd: demo, output: (line) => allLines.push(line) });
+
+      await allProgram.parseAsync(['node', 'warroom', 'issue', 'next', '--all']);
+
+      expect(allLines[0]).toBe('Issues with Campaign status ready-to-engage: 1');
+      expect(allLines.some((line) => line.includes('TeamFloPay/sdk#7'))).toBe(true);
+      expect(allLines).toContain('Outcome: no issue started.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('includes complete issue details in issue start handoffs', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
+
+      await program.parseAsync([
+        'node',
+        'warroom',
+        'issue',
+        'next',
+        '--issue',
+        'TeamFloPay/sdk#17',
+        '--dry-run',
+        '--no-status',
+        '--write-artifact',
+      ]);
+
+      const output = lines.join('\n');
+      expect(output).toContain('Complete issue body:');
+      expect(output).toContain('FULL_BODY_SENTINEL');
+      expect(output).toContain('FULL_COMMENT_SENTINEL');
+      expect(output).not.toContain('Truncated by War Room');
+
+      const artifactLine = lines.find((line) => line.startsWith('Artifact: '));
+      expect(artifactLine).toBeDefined();
+      const runDir = artifactLine!.replace('Artifact: ', '');
+      expect(readFileSync(path.join(runDir, 'issue.json'), 'utf8')).toContain('FULL_BODY_SENTINEL');
+      expect(readFileSync(path.join(runDir, 'issue.json'), 'utf8')).toContain('FULL_COMMENT_SENTINEL');
+      expect(lines.at(-1)).toBe('Outcome: dry run only; no LLM handoff was launched, no development branch was created, and no Campaign status was updated.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('creates a GitHub PR from the current development branch', async () => {
+    const { root, sdk, sdkRemote } = makeCommitFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeFileSync(path.join(sdk, 'README.md'), '# SDK\n');
+    commitAll(sdk, 'fixture sdk');
+    const branch = spawnSync('git', ['switch', '-c', 'warroom/7-build-the-selector'], { cwd: sdk, encoding: 'utf8' });
+    if (branch.status !== 0) throw new Error(branch.stderr);
+    writeFileSync(path.join(sdk, 'selector.ts'), 'export const selector = true;\n');
+    commitAll(sdk, 'feat: build selector');
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'create', '--confirm', '--confirm-status']);
+
+      expect(lines).toContain('PR create: created');
+      expect(lines).toContain('Repo: TeamFloPay/sdk');
+      expect(lines).toContain('Branch: warroom/7-build-the-selector -> main');
+      expect(lines).toContain('Issue: TeamFloPay/sdk#7');
+      expect(lines).toContain('Title: Build the selector');
+      expect(lines).toContain('URL: https://github.com/TeamFloPay/sdk/pull/12');
+      expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> skirmish');
+      expect(lines.some((line) => line.includes('Push: pushed git push -u origin warroom/7-build-the-selector'))).toBe(true);
+      expect(lines.some((line) => line.includes('Create: created gh pr create --repo TeamFloPay/sdk'))).toBe(true);
+      expect(lines.some((line) => line.includes('Closes TeamFloPay/sdk#7'))).toBe(true);
+      expect(lines.some((line) => line.includes('- feat: build selector'))).toBe(true);
+      expect(lines.at(-1)).toBe('PR URL: https://github.com/TeamFloPay/sdk/pull/12');
+
+      const remoteBranch = spawnSync(
+        'git',
+        ['--git-dir', sdkRemote, 'rev-parse', '--verify', 'refs/heads/warroom/7-build-the-selector'],
+        { encoding: 'utf8' }
+      );
+      expect(remoteBranch.status).toBe(0);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('prompts from PR create preflight into PR creation and ends with the URL', async () => {
+    const { root, sdk, sdkRemote } = makeCommitFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeFileSync(path.join(sdk, 'README.md'), '# SDK\n');
+    commitAll(sdk, 'fixture sdk');
+    const branch = spawnSync('git', ['switch', '-c', 'warroom/7-build-the-selector'], { cwd: sdk, encoding: 'utf8' });
+    if (branch.status !== 0) throw new Error(branch.stderr);
+    writeFileSync(path.join(sdk, 'selector.ts'), 'export const selector = true;\n');
+    commitAll(sdk, 'feat: build selector');
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = Readable.from(['yes\n']);
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line), input, interactive: true });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'create', '--confirm-status']);
+
+      expect(lines).toContain('PR create: preflight only');
+      expect(lines).toContain('Outcome: PR not created. This was a preflight; run `warroom pr create --confirm` or answer yes in an interactive terminal to push and create the PR.');
+      expect(lines).toContain('Push this branch and create the GitHub PR now? [y/N]');
+      expect(lines).toContain('Creating PR...');
+      expect(lines).toContain('PR create: created');
+      expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> skirmish');
+      expect(lines.at(-1)).toBe('PR URL: https://github.com/TeamFloPay/sdk/pull/12');
+
+      const remoteBranch = spawnSync(
+        'git',
+        ['--git-dir', sdkRemote, 'rev-parse', '--verify', 'refs/heads/warroom/7-build-the-selector'],
+        { encoding: 'utf8' }
+      );
+      expect(remoteBranch.status).toBe(0);
     } finally {
       process.env.PATH = originalPath;
     }
@@ -168,6 +408,128 @@ describe('phase-1 CLI', () => {
       expect(lines[1]).toContain('updated 2026-05-06T12:00:00Z; issue TeamFloPay/sdk#8 battlefield-active');
       expect(lines[2]).toContain('TeamFloPay/demo#3 Review demo follow-up');
       expect(lines[2]).toContain('updated 2026-05-05T12:00:00Z; issue TeamFloPay/demo#9 skirmish');
+      expect(lines[3]).toBe(
+        'Outcome: listed 2 PRs ready for review; no LLM handoff was launched. Run `warroom pr review --pr <owner/repo#number> --launch` to start one.'
+      );
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('prompts from the PR review queue into a launched review handoff', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    const stateFile = path.join(root, 'review-state.txt');
+    mkdirSync(bin, { recursive: true });
+    writePrReviewLoopGhFixture(bin, stateFile, { queue: 'multi', outstandingFirst: true });
+    writePrReviewLoopCodexFixture(bin, stateFile);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = Readable.from(['1\n']);
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'review']);
+
+      expect(lines[0]).toBe('Open PRs for Campaign statuses battlefield-active, skirmish: 2');
+      expect(lines[1]).toContain('1. TeamFloPay/sdk#12 Review active SDK work');
+      expect(lines[2]).toContain('2. TeamFloPay/demo#3 Review demo follow-up');
+      expect(lines).toContain('Select a PR number to review, or enter 0 to cancel.');
+      expect(lines).toContain('Starting PR review for TeamFloPay/sdk#12');
+      expect(lines).toContain('PR review loop 1: 1 outstanding CodeRabbit comment remains; starting another adapter loop.');
+      expect(lines).toContain('PR review loop 2: no outstanding CodeRabbit feedback remains.');
+      expect(lines).toContain('PR review: launched');
+      expect(lines.some((line) => line.startsWith('Adapter: codex exec --cd '))).toBe(true);
+      expect(lines.some((line) => line.includes('Please analyze the latest [@coderabbit](plugin://coderabbit@openai-curated)'))).toBe(true);
+      expect(lines).toContain('PR review loop iterations: 2');
+      expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('confirms a single detected PR review queue item before launching', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    const stateFile = path.join(root, 'review-state.txt');
+    mkdirSync(bin, { recursive: true });
+    writePrReviewLoopGhFixture(bin, stateFile, { queue: 'single', outstandingFirst: false });
+    writePrReviewLoopCodexFixture(bin, stateFile);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = Readable.from(['y\n']);
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'review']);
+
+      expect(lines[0]).toBe('Open PRs for Campaign statuses battlefield-active, skirmish: 1');
+      expect(lines[1]).toContain('TeamFloPay/backend#657 Remove Recurly & Chargebee Support');
+      expect(lines).toContain(
+        'Start PR review handoff for TeamFloPay/backend#657 now? This will run `warroom pr review --pr TeamFloPay/backend#657 --launch`. [y/N]'
+      );
+      expect(lines).toContain('Starting PR review for TeamFloPay/backend#657');
+      expect(lines).toContain('PR review: launched');
+      expect(lines).toContain('PR review loop 1: no outstanding CodeRabbit feedback remains.');
+      expect(lines.some((line) => line.includes('PR https://github.com/TeamFloPay/backend/pull/657'))).toBe(true);
+      expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('uses the foreground adapter for PR review even when Codex Cloud is configured', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    const stateFile = path.join(root, 'review-state.txt');
+    mkdirSync(bin, { recursive: true });
+    writePrReviewLoopGhFixture(bin, stateFile, { queue: 'multi', outstandingFirst: false });
+    writePrReviewLoopCodexFixture(bin, stateFile);
+    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex-cloud\nCODEX_COMMAND=codex\nCODEX_CLOUD_ENV_SDK=env_fixture\n');
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'review', '--pr', 'TeamFloPay/sdk#12', '--launch']);
+
+      expect(lines).toContain('PR review: launched');
+      expect(lines.some((line) => line.startsWith('Adapter: codex exec --cd '))).toBe(true);
+      expect(lines.some((line) => line.includes('codex cloud exec'))).toBe(false);
+      expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('prints a clear outcome for PR review preflight handoffs', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'review', '--pr', 'TeamFloPay/backend#655']);
+
+      expect(lines).toContain('PR review: preflight only');
+      expect(lines.some((line) => line.includes('Please analyze the latest [@coderabbit](plugin://coderabbit@openai-curated)'))).toBe(true);
+      expect(lines.some((line) => line.includes('PR https://github.com/TeamFloPay/backend/pull/655'))).toBe(true);
+      expect(lines.at(-1)).toBe('Outcome: preflight only; no LLM handoff was launched. Rerun with `--launch` to start the PR review loop.');
     } finally {
       process.env.PATH = originalPath;
     }
@@ -202,6 +564,26 @@ describe('phase-1 CLI', () => {
 
     expect(() => getAdapterInvocation(root, root, { repoId: 'sdk' })).toThrow(/CODEX_CLOUD_ENV_SDK is required/);
     expect(getAdapterInvocation(root, root, { repoId: 'backend' }).display).toContain('codex cloud exec --env env_backend <prompt>');
+  });
+
+  it('passes .env.local values into local adapter launches', () => {
+    const root = makeDevFixture();
+    const capturePath = path.join(root, 'adapter-env.txt');
+    const adapterPath = path.join(root, 'fake-codex');
+    writeFileSync(
+      adapterPath,
+      '#!/bin/sh\nprintf "%s" "$RAILWAY_TOKEN" > "$WARROOM_CAPTURE_PATH"\nexit 0\n'
+    );
+    chmodSync(adapterPath, 0o755);
+    writeFileSync(
+      path.join(root, '.env.local'),
+      `LLM_ADAPTER=codex\nCODEX_COMMAND=${adapterPath}\nexport RAILWAY_TOKEN="railway_fixture"\nWARROOM_CAPTURE_PATH=${capturePath}\n`
+    );
+
+    const result = runAdapter(root, 'prompt', { cwd: root });
+
+    expect(result.launched).toBe(true);
+    expect(readFileSync(capturePath, 'utf8')).toBe('railway_fixture');
   });
 
   it('reports SDK-to-demo link state from sibling checkouts', () => {
@@ -435,7 +817,7 @@ describe('phase-1 CLI', () => {
     }
   });
 
-  it('skips demo Playwright e2e for repos without merge_playwright enabled', async () => {
+  it('skips demo Playwright e2e for repos without merge.playwright enabled', async () => {
     const { root } = makeMergeFixture();
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
@@ -450,12 +832,67 @@ describe('phase-1 CLI', () => {
 
       await program.parseAsync(['node', 'warroom', 'pr', 'merge', '--pr', 'TeamFloPay/infra#655', '--confirm']);
 
-      expect(lines).toContain('Merge e2e: skipped (repos.yaml has merge_playwright: false for TeamFloPay/infra.)');
+      expect(lines).toContain('Merge e2e: skipped (repos.yaml has merge.playwright: false for TeamFloPay/infra.)');
       expect(lines).toContain('Merged: yes');
       expect(lines.some((line) => line.startsWith('Backend:'))).toBe(false);
       expect(existsSync(path.join(root, 'backend-started.txt'))).toBe(false);
     } finally {
       process.env.PATH = originalPath;
+    }
+  });
+
+  it('updates and pushes CHANGELOG.md after SDK merge actions pass', async () => {
+    const { root, sdk, sdkRemote } = makeChangelogMergeFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeChangelogMergeGhFixture(bin, sdkRemote);
+    writeChangelogCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    const envKeys = [
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS',
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS',
+    ] as const;
+    const originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS = '0';
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS = '0';
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'merge', '--pr', 'TeamFloPay/sdk#655', '--confirm']);
+
+      const output = lines.join('\n');
+      expect(output).toContain('Merge e2e: skipped (repos.yaml has merge.playwright: false for TeamFloPay/sdk.)');
+      expect(output).toContain('Merge changelog: passed');
+      expect(output).toContain('Changelog version: 1.0.1');
+      expect(lines.some((line) => line.startsWith('Changelog commit: pushed '))).toBe(true);
+      expect(lines).toContain('Merged: yes');
+
+      const remoteChangelog = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/main:CHANGELOG.md'], {
+        encoding: 'utf8',
+      });
+      expect(remoteChangelog.stdout).toContain('## 1.0.1');
+      expect(remoteChangelog.stdout).toContain('Ready SDK PR');
+
+      const remotePackage = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/main:package.json'], {
+        encoding: 'utf8',
+      });
+      expect(JSON.parse(remotePackage.stdout).version).toBe('1.0.1');
+
+      const remoteSubject = spawnSync('git', ['--git-dir', sdkRemote, 'log', '-1', '--pretty=%s', 'refs/heads/main'], {
+        encoding: 'utf8',
+      });
+      expect(remoteSubject.stdout.trim()).toBe('docs(changelog): update for 1.0.1 [skip-ci]');
+    } finally {
+      process.env.PATH = originalPath;
+      for (const key of envKeys) {
+        const value = originalEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
     }
   });
 
@@ -691,8 +1128,8 @@ function makeDevFixture() {
 
   mkdirSync(root, { recursive: true });
   mkdirSync(path.join(root, 'maps', 'repos'), { recursive: true });
-  mkdirSync(path.join(sdk, '.git'), { recursive: true });
-  mkdirSync(path.join(demo, '.git'), { recursive: true });
+  initGitRepo(sdk);
+  initGitRepo(demo);
   mkdirSync(path.join(demo, 'node_modules', '@flopay'), { recursive: true });
 
   writeFileSync(
@@ -749,6 +1186,9 @@ repos:
     writeFileSync(path.join(mirrorPath, 'package.json'), `{"name":"@flopay/${packageName}"}\n`);
     symlinkSync(mirrorPath, path.join(demo, 'node_modules', '@flopay', packageName), 'dir');
   }
+
+  commitAll(sdk, 'fixture sdk');
+  commitAll(demo, 'fixture demo');
 
   return root;
 }
@@ -840,7 +1280,9 @@ repos:
     ssh_url: git@github.com:TeamFloPay/backend.git
     local_path: maps/repos/backend
     status: active
-    merge_playwright: true
+    merge:
+      playwright: true
+      changelog: false
     owner: backend
     description: Backend.
     specialist:
@@ -855,7 +1297,9 @@ repos:
     ssh_url: git@github.com:TeamFloPay/infra.git
     local_path: maps/repos/infra
     status: active
-    merge_playwright: false
+    merge:
+      playwright: false
+      changelog: false
     owner: infra
     description: Infra.
     specialist:
@@ -870,7 +1314,9 @@ repos:
     ssh_url: git@github.com:TeamFloPay/demo.git
     local_path: maps/repos/demo
     status: active
-    merge_playwright: true
+    merge:
+      playwright: true
+      changelog: false
     owner: demo
     description: Demo.
     specialist:
@@ -936,6 +1382,61 @@ console.log('demo e2e passed');
   if (branch.status !== 0) throw new Error(branch.stderr);
 
   return { root, backend, demo };
+}
+
+function makeChangelogMergeFixture() {
+  const base = mkdtempSync(path.join(tmpdir(), 'warroom-changelog-'));
+  const root = path.join(base, 'warroom');
+  const sdk = path.join(base, 'sdk');
+  const sdkRemote = path.join(base, 'sdk-remote.git');
+
+  mkdirSync(root, { recursive: true });
+  mkdirSync(path.join(root, 'maps', 'repos'), { recursive: true });
+  initGitRepo(sdk);
+  initBareRemote(sdkRemote);
+  spawnSync('git', ['remote', 'add', 'origin', sdkRemote], { cwd: sdk });
+
+  writeFileSync(
+    path.join(root, 'repos.yaml'),
+    `version: 1
+defaults:
+  owner: TeamFloPay
+  clone_protocol: ssh
+  default_branch: main
+  local_root: maps/repos
+repos:
+  - id: sdk
+    name: sdk
+    github: TeamFloPay/sdk
+    ssh_url: git@github.com:TeamFloPay/sdk.git
+    local_path: maps/repos/sdk
+    status: active
+    merge:
+      playwright: false
+      changelog: true
+    owner: sdk
+    description: SDK packages.
+    specialist:
+      name: SDK Sergeant
+      context:
+        frameworks: []
+        domains: []
+        resources: []
+`
+  );
+  writeResourcesFixture(root);
+  writeFileSync(path.join(sdk, 'package.json'), JSON.stringify({ name: '@flopay/sdk', version: '1.0.0' }, null, 2));
+  writeFileSync(path.join(sdk, 'CHANGELOG.md'), '# Changelog\n\n## 1.0.0\n- Initial release.\n');
+  commitAll(sdk, 'fixture sdk release');
+  const pushMain = spawnSync('git', ['push', '-u', 'origin', 'main'], { cwd: sdk, encoding: 'utf8' });
+  if (pushMain.status !== 0) throw new Error(pushMain.stderr);
+
+  const branch = spawnSync('git', ['switch', '-c', 'feature/sdk'], { cwd: sdk, encoding: 'utf8' });
+  if (branch.status !== 0) throw new Error(branch.stderr);
+  writeFileSync(path.join(sdk, 'index.ts'), 'export const changed = true;\n');
+  commitAll(sdk, 'feat: ready sdk change');
+
+  return { root, sdk, sdkRemote };
 }
 
 async function waitForUrl(url: string, timeoutMs = 10_000) {
@@ -1080,9 +1581,15 @@ function writeGhFixture(bin: string) {
     ghPath,
     `#!/usr/bin/env node
 const args = process.argv.slice(2);
+const { spawnSync } = require('node:child_process');
 
 function json(value) {
   process.stdout.write(JSON.stringify(value));
+}
+
+function optionValue(name) {
+  const index = args.indexOf(name);
+  return index === -1 ? undefined : args[index + 1];
 }
 
 if (args[0] === 'project' && args[1] === 'item-list') {
@@ -1200,10 +1707,43 @@ if (args[0] === 'api' && args[1] === 'graphql') {
   process.exit(0);
 }
 
+if (args[0] === 'issue' && args[1] === 'develop') {
+  const branch = optionValue('--name');
+  if (branch && args.includes('--checkout')) {
+    const exists = spawnSync('git', ['show-ref', '--verify', '--quiet', 'refs/heads/' + branch], { encoding: 'utf8' });
+    const git = exists.status === 0
+      ? spawnSync('git', ['switch', branch], { encoding: 'utf8' })
+      : spawnSync('git', ['switch', '-c', branch], { encoding: 'utf8' });
+    if (git.status !== 0) {
+      process.stderr.write(git.stderr || 'git switch failed');
+      process.exit(git.status || 1);
+    }
+  }
+  process.stdout.write('https://github.com/TeamFloPay/sdk/tree/' + (branch || 'warroom/7-build-the-selector'));
+  process.exit(0);
+}
+
 if (args[0] === 'issue' && args[1] === 'view') {
+  const issueNumber = args[2];
+  if (issueNumber === '17') {
+    json({
+      title: 'Long implementation issue',
+      body: 'A'.repeat(6500) + 'FULL_BODY_SENTINEL',
+      url: 'https://github.com/TeamFloPay/sdk/issues/17',
+      comments: [
+        {
+          author: { login: 'andrewslack' },
+          body: 'B'.repeat(1200) + 'FULL_COMMENT_SENTINEL',
+          createdAt: '2026-05-05T00:00:00Z'
+        }
+      ]
+    });
+    process.exit(0);
+  }
+
   json({
     title: 'Build the selector',
-    body: 'Allow operators to pick a ready issue and start PR engagement.',
+    body: 'Allow operators to pick a ready issue and start implementation.',
     url: 'https://github.com/TeamFloPay/sdk/issues/7',
     comments: [
       {
@@ -1233,14 +1773,27 @@ if (args[0] === 'pr' && args[1] === 'view') {
 }
 
 if (args[0] === 'pr' && args[1] === 'list') {
-  json([
-    {
-      number: 655,
-      title: 'Ready backend PR',
-      url: 'https://github.com/TeamFloPay/backend/pull/655',
-      headRefName: 'feature/backend'
-    }
-  ]);
+  const repo = optionValue('--repo');
+  const head = optionValue('--head');
+  if (repo === 'TeamFloPay/backend' && (!head || head === 'feature/backend')) {
+    json([
+      {
+        number: 655,
+        title: 'Ready backend PR',
+        url: 'https://github.com/TeamFloPay/backend/pull/655',
+        headRefName: 'feature/backend'
+      }
+    ]);
+    process.exit(0);
+  }
+  json([]);
+  process.exit(0);
+}
+
+if (args[0] === 'pr' && args[1] === 'create') {
+  const repo = optionValue('--repo') || 'TeamFloPay/sdk';
+  const number = repo === 'TeamFloPay/sdk' ? 12 : 655;
+  process.stdout.write('https://github.com/' + repo + '/pull/' + number);
   process.exit(0);
 }
 
@@ -1293,6 +1846,386 @@ process.exit(1);
 `
   );
   chmodSync(ghPath, 0o755);
+}
+
+function writePrReviewLoopGhFixture(
+  bin: string,
+  stateFile: string,
+  options: { queue: 'single' | 'multi'; outstandingFirst: boolean }
+) {
+  const ghPath = path.join(bin, 'gh');
+  writeFileSync(
+    ghPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const { readFileSync } = require('node:fs');
+const stateFile = ${JSON.stringify(stateFile)};
+const options = ${JSON.stringify(options)};
+
+function json(value) {
+  process.stdout.write(JSON.stringify(value));
+}
+
+function optionValue(name) {
+  const index = args.indexOf(name);
+  return index === -1 ? undefined : args[index + 1];
+}
+
+function valueFor(name) {
+  for (let index = 0; index < args.length - 1; index += 1) {
+    if (args[index] !== '-f' && args[index] !== '-F') continue;
+    const [key, value] = args[index + 1].split('=');
+    if (key === name) return value;
+  }
+}
+
+function loopCount() {
+  try {
+    const value = Number(readFileSync(stateFile, 'utf8').trim());
+    return Number.isFinite(value) ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+function headSha() {
+  const count = loopCount();
+  if (count <= 0) return '0000000000000000000000000000000000000000';
+  if (count === 1) return '1111111111111111111111111111111111111111';
+  return '2222222222222222222222222222222222222222';
+}
+
+function prNode(repo, number, title, updatedAt) {
+  return {
+    __typename: 'PullRequest',
+    number,
+    title,
+    url: 'https://github.com/' + repo + '/pull/' + number,
+    state: 'OPEN',
+    updatedAt,
+    repository: { nameWithOwner: repo }
+  };
+}
+
+if (args[0] === 'project' && args[1] === 'item-list') {
+  const items = options.queue === 'single'
+    ? [
+        {
+          id: 'PVTI_active_backend',
+          title: 'Remove Recurly & Chargebee Support',
+          status: 'battlefield-active',
+          labels: ['battlefield-active'],
+          content: {
+            repository: 'TeamFloPay/backend',
+            number: 632,
+            title: 'Remove Recurly & Chargebee Support',
+            type: 'Issue',
+            url: 'https://github.com/TeamFloPay/backend/issues/632'
+          }
+        }
+      ]
+    : [
+        {
+          id: 'PVTI_active',
+          title: 'Active SDK work',
+          status: 'battlefield-active',
+          labels: ['battlefield-active'],
+          content: {
+            repository: 'TeamFloPay/sdk',
+            number: 8,
+            title: 'Active SDK work',
+            type: 'Issue',
+            url: 'https://github.com/TeamFloPay/sdk/issues/8'
+          }
+        },
+        {
+          id: 'PVTI_skirmish',
+          title: 'Demo follow-up',
+          status: 'skirmish',
+          labels: ['skirmish'],
+          content: {
+            repository: 'TeamFloPay/demo',
+            number: 9,
+            title: 'Demo follow-up',
+            type: 'Issue',
+            url: 'https://github.com/TeamFloPay/demo/issues/9'
+          }
+        }
+      ];
+  json({ items });
+  process.exit(0);
+}
+
+if (args[0] === 'api' && args[1] === 'graphql') {
+  const repo = valueFor('repo');
+  const number = Number(valueFor('number'));
+  const query = valueFor('query') || '';
+
+  if (query.includes('pullRequest')) {
+    const hasOutstanding = options.outstandingFirst && loopCount() === 1;
+    json({
+      data: {
+        repository: {
+          pullRequest: {
+            reviewThreads: {
+              nodes: hasOutstanding
+                ? [
+                    {
+                      isResolved: false,
+                      isOutdated: false,
+                      comments: {
+                        nodes: [
+                          {
+                            path: 'src/billing.ts',
+                            line: 12,
+                            url: 'https://github.com/TeamFloPay/sdk/pull/12#discussion_r1',
+                            body: 'CodeRabbit follow-up requested.',
+                            author: { login: 'coderabbitai' }
+                          }
+                        ]
+                      }
+                    }
+                  ]
+                : []
+            }
+          }
+        }
+      }
+    });
+    process.exit(0);
+  }
+
+  if (repo === 'backend' && number === 632) {
+    json({
+      data: {
+        repository: {
+          issue: {
+            closedByPullRequestsReferences: {
+              nodes: [prNode('TeamFloPay/backend', 657, 'Remove Recurly & Chargebee Support', '2026-05-06T18:54:12Z')]
+            },
+            timelineItems: { nodes: [] }
+          }
+        }
+      }
+    });
+    process.exit(0);
+  }
+
+  if (repo === 'sdk' && number === 8) {
+    json({
+      data: {
+        repository: {
+          issue: {
+            closedByPullRequestsReferences: {
+              nodes: [prNode('TeamFloPay/sdk', 12, 'Review active SDK work', '2026-05-06T12:00:00Z')]
+            },
+            timelineItems: { nodes: [] }
+          }
+        }
+      }
+    });
+    process.exit(0);
+  }
+
+  if (repo === 'demo' && number === 9) {
+    json({
+      data: {
+        repository: {
+          issue: {
+            closedByPullRequestsReferences: {
+              nodes: [prNode('TeamFloPay/demo', 3, 'Review demo follow-up', '2026-05-05T12:00:00Z')]
+            },
+            timelineItems: { nodes: [] }
+          }
+        }
+      }
+    });
+    process.exit(0);
+  }
+
+  json({ data: { repository: { issue: { closedByPullRequestsReferences: { nodes: [] }, timelineItems: { nodes: [] } } } } });
+  process.exit(0);
+}
+
+if (args[0] === 'pr' && args[1] === 'view') {
+  const repo = optionValue('--repo') || 'TeamFloPay/backend';
+  const number = Number(args[2]);
+  const isSdk = repo === 'TeamFloPay/sdk';
+  const isDemo = repo === 'TeamFloPay/demo';
+  json({
+    title: isSdk ? 'Review active SDK work' : isDemo ? 'Review demo follow-up' : 'Remove Recurly & Chargebee Support',
+    body: 'Review CodeRabbit feedback.',
+    url: 'https://github.com/' + repo + '/pull/' + number,
+    headRefName: isSdk ? 'warroom/8-active-sdk-work' : isDemo ? 'warroom/9-demo-follow-up' : 'warroom/632-remove-recurly-chargebee',
+    baseRefName: 'main',
+    headRefOid: headSha(),
+    statusCheckRollup: [
+      { name: 'CodeRabbit', status: 'COMPLETED', conclusion: 'SUCCESS' }
+    ]
+  });
+  process.exit(0);
+}
+
+console.error('Unexpected gh fixture call: ' + args.join(' '));
+process.exit(1);
+`
+  );
+  chmodSync(ghPath, 0o755);
+}
+
+function writePrReviewLoopCodexFixture(bin: string, stateFile: string) {
+  const codexPath = path.join(bin, 'codex');
+  writeFileSync(
+    codexPath,
+    `#!/usr/bin/env node
+const { readFileSync, writeFileSync } = require('node:fs');
+const stateFile = ${JSON.stringify(stateFile)};
+
+let count = 0;
+try {
+  count = Number(readFileSync(stateFile, 'utf8').trim()) || 0;
+} catch {
+  count = 0;
+}
+writeFileSync(stateFile, String(count + 1));
+
+process.stdin.resume();
+process.stdin.on('end', () => process.exit(0));
+`
+  );
+  chmodSync(codexPath, 0o755);
+}
+
+function writeChangelogMergeGhFixture(bin: string, sdkRemote: string) {
+  const ghPath = path.join(bin, 'gh');
+  writeFileSync(
+    ghPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const { mkdtempSync, readFileSync, writeFileSync } = require('node:fs');
+const { tmpdir } = require('node:os');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const sdkRemote = ${JSON.stringify(sdkRemote)};
+
+function json(value) {
+  process.stdout.write(JSON.stringify(value));
+}
+
+function optionValue(name) {
+  const index = args.indexOf(name);
+  return index === -1 ? undefined : args[index + 1];
+}
+
+function remoteMainSha() {
+  const result = spawnSync('git', ['--git-dir', sdkRemote, 'rev-parse', 'refs/heads/main'], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr);
+    process.exit(result.status || 1);
+  }
+  return result.stdout.trim();
+}
+
+if (args[0] === 'pr' && args[1] === 'view') {
+  json({
+    title: 'Ready SDK PR',
+    body: 'Adds the SDK behavior that should be reflected in the changelog.',
+    url: 'https://github.com/TeamFloPay/sdk/pull/655',
+    mergeStateStatus: 'CLEAN',
+    mergeable: 'MERGEABLE',
+    reviewDecision: 'APPROVED',
+    headRefName: 'feature/sdk',
+    baseRefName: 'main',
+    isDraft: false,
+    files: [
+      { path: 'index.ts', additions: 1, deletions: 0 }
+    ],
+    statusCheckRollup: [
+      { name: 'build', status: 'COMPLETED', conclusion: 'SUCCESS' }
+    ]
+  });
+  process.exit(0);
+}
+
+if (args[0] === 'api' && args[1] === 'graphql') {
+  json({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } });
+  process.exit(0);
+}
+
+if (args[0] === 'api' && args[1] === 'repos/TeamFloPay/sdk/commits/main') {
+  process.stdout.write(remoteMainSha());
+  process.exit(0);
+}
+
+if (args[0] === 'run' && args[1] === 'list') {
+  const sha = remoteMainSha();
+  json([
+    {
+      databaseId: 42,
+      name: 'Release',
+      status: 'COMPLETED',
+      conclusion: 'SUCCESS',
+      headSha: sha,
+      url: 'https://github.com/TeamFloPay/sdk/actions/runs/42'
+    }
+  ]);
+  process.exit(0);
+}
+
+if (args[0] === 'pr' && args[1] === 'merge') {
+  const worktree = mkdtempSync(path.join(tmpdir(), 'sdk-release-'));
+  let result = spawnSync('git', ['clone', '--branch', 'main', sdkRemote, worktree], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr);
+    process.exit(result.status || 1);
+  }
+  spawnSync('git', ['config', 'user.email', 'warroom@example.com'], { cwd: worktree });
+  spawnSync('git', ['config', 'user.name', 'War Room'], { cwd: worktree });
+  const packagePath = path.join(worktree, 'package.json');
+  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+  packageJson.version = '1.0.1';
+  writeFileSync(packagePath, JSON.stringify(packageJson, null, 2) + '\\n');
+  result = spawnSync('git', ['add', 'package.json'], { cwd: worktree, encoding: 'utf8' });
+  if (result.status !== 0) process.exit(result.status || 1);
+  result = spawnSync('git', ['commit', '-m', 'chore(release): 1.0.1'], { cwd: worktree, encoding: 'utf8' });
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr);
+    process.exit(result.status || 1);
+  }
+  result = spawnSync('git', ['push', 'origin', 'main'], { cwd: worktree, encoding: 'utf8' });
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr);
+    process.exit(result.status || 1);
+  }
+  process.exit(0);
+}
+
+console.error('Unexpected gh fixture call: ' + args.join(' '));
+process.exit(1);
+`
+  );
+  chmodSync(ghPath, 0o755);
+}
+
+function writeChangelogCodexFixture(bin: string) {
+  const codexPath = path.join(bin, 'codex');
+  writeFileSync(
+    codexPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const fs = require('node:fs');
+const path = require('node:path');
+const cdIndex = args.indexOf('--cd');
+const cwd = cdIndex === -1 ? process.cwd() : args[cdIndex + 1];
+
+fs.writeFileSync(
+  path.join(cwd, 'CHANGELOG.md'),
+  '# Changelog\\n\\n## 1.0.1\\n- Ready SDK PR updates the SDK behavior.\\n\\n## 1.0.0\\n- Initial release.\\n'
+);
+process.exit(0);
+`
+  );
+  chmodSync(codexPath, 0o755);
 }
 
 function writeBlockedMergeGhFixture(bin: string) {

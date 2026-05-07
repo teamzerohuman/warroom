@@ -56,7 +56,7 @@ npm run warroom -- maps study
 npm run warroom -- issue next
 ```
 
-In an interactive terminal, `issue next` prints numbered ready issues and lets you choose one to start the PR engagement handoff. The selected issue is moved to `battlefield-active` and handed to the configured LLM adapter; add `--dry-run` to preview without launching or moving status.
+In an interactive terminal, `issue next` prints numbered ready issues and lets you choose one to start implementation. From a mapped child repo checkout, the list is scoped to that repo by default; add `--all` to show the cross-repo queue. War Room creates a GitHub-linked development branch with `gh issue develop`, moves the selected issue to `battlefield-active`, and hands the work to the configured LLM adapter. Foreground/local adapters check out that branch locally and require a clean checkout; Codex Cloud task adapters skip local checkout, so local dirty files do not block the cloud task. Cloud adapters are instructed to fetch and switch to the prepared branch if their environment starts elsewhere. The command ends with an explicit `Outcome:` line, so it is clear whether the issue was handed off, previewed, blocked, or not started. Add `--dry-run` to preview without creating the branch, launching, or moving status.
 
 If you already keep sibling checkouts next to War Room, such as `../sdk` or `../demo`, the CLI can detect those when the mapped `maps/repos/*` checkout is missing. `repos.yaml` remains the ownership map either way.
 
@@ -66,7 +66,6 @@ Use this flow when an existing GitHub issue should move from triage to an opened
 
 ```sh
 ISSUE=TeamFloPay/backend#562
-REPO=TeamFloPay/backend
 BASE=main
 ```
 
@@ -99,10 +98,10 @@ warroom issue next
 Direct issue launch:
 
 ```sh
-warroom pr engage --issue "$ISSUE" --base "$BASE" --launch --confirm-status --write-artifact
+warroom issue next --issue "$ISSUE" --base "$BASE" --confirm-status --write-artifact
 ```
 
-The implementation handoff creates or switches to a feature branch in the owning child repo, uses the issue body and discussion as accepted context, and moves the issue to `battlefield-active` when status movement is confirmed.
+The implementation handoff creates and checks out a GitHub-linked development branch in the owning child repo with `gh issue develop`, uses the issue body and discussion as accepted context, and moves the issue to `battlefield-active` when status movement is confirmed. The handoff also tells the implementer to include `Closes <issue>` in the PR body so GitHub links the PR and closes the issue on merge.
 
 4. Work in the owning child repo and validate there.
 
@@ -124,33 +123,11 @@ When run interactively from a mapped child checkout, `commit create` first print
 
 6. Publish the PR on GitHub.
 
-```
-TODO: what happens when you run warroom pr engage (this should create the PR with LLM generated commit?)
-```
-
 ```sh
-PR_BODY=$(mktemp)
-cat > "$PR_BODY" <<EOF
-Closes $ISSUE
-
-## Summary
-- <what changed>
-
-## Validation
-- npm test
-EOF
-
-gh pr create \
-  --repo "$REPO" \
-  --base "$BASE" \
-  --head "$(git branch --show-current)" \
-  --title "<clear PR title>" \
-  --body-file "$PR_BODY"
-
-rm "$PR_BODY"
+warroom pr create --confirm --confirm-status --write-artifact
 ```
 
-At this point the PR is published. Copy the PR ref from GitHub, for example `TeamFloPay/backend#655`.
+Run this from the development branch in the owning child repo, or pass `--branch <name>`. `pr create` infers `TeamFloPay/backend#562` from a `warroom/562-...` branch, builds a PR title/body from the issue and commits, includes `Closes <issue>`, pushes the branch, creates the GitHub PR, and moves the issue to `skirmish` when `--confirm-status` is present. At this point the PR is published. Copy the PR ref from GitHub, for example `TeamFloPay/backend#655`.
 
 7. Move into the review loop.
 
@@ -159,7 +136,7 @@ warroom pr review
 warroom pr review --pr TeamFloPay/backend#655 --issue "$ISSUE" --launch --confirm-status --write-artifact
 ```
 
-Without `--pr`, `pr review` lists open PRs linked from issues in `battlefield-active` or `skirmish`, ordered by latest update. With `--pr`, it creates a scoped review-loop handoff and moves the issue to `skirmish` when confirmed.
+Without `--pr`, `pr review` lists open PRs linked from issues in `battlefield-active` or `skirmish`, ordered by latest update. In an interactive terminal it asks whether to launch the detected PR review handoff, using the selected PR as if `--pr <owner/repo#number> --launch` was passed. Non-interactive runs only list the queue and print an explicit `Outcome:` line. With `--pr --launch`, it sends the fixed GitHub/CodeRabbit feedback handoff to the adapter, waits for a new PR commit, checks outstanding current CodeRabbit comments, and repeats the adapter loop until no CodeRabbit feedback remains or the loop blocks. It moves the issue to `skirmish` when confirmed.
 
 8. Finish through the merge gate when review is clear.
 
@@ -170,7 +147,7 @@ warroom pr merge
 warroom pr merge --issue "$ISSUE" --confirm
 ```
 
-`pr merge` explains merge-readiness blockers, requested reviewers, unresolved review threads, and check state. Without `--confirm`, an interactive preflight asks whether to continue into the confirmed merge path. A confirmed merge first reruns merge readiness. For repos with `merge_playwright: true` in `repos.yaml`, it then runs the required demo Playwright `test:e2e` gate against the local backend API, printing backend readiness progress and streaming the Playwright command output in the terminal. Repos with `merge_playwright: false` skip that backend/demo gate. If required gates pass, War Room runs `gh pr merge --squash --delete-branch`. After a successful interactive merge, War Room prompts to post the victory summary and then prompts for local cleanup.
+`pr merge` explains merge-readiness blockers, requested reviewers, unresolved review threads, and check state. Without `--confirm`, an interactive preflight asks whether to continue into the confirmed merge path. A confirmed merge first reruns merge readiness. For repos with `merge.playwright: true` in `repos.yaml`, it then runs the required demo Playwright `test:e2e` gate against the local backend API, printing backend readiness progress and streaming the Playwright command output in the terminal. Repos with `merge.playwright: false` skip that backend/demo gate. If `merge.changelog: true`, War Room waits for base-branch GitHub Actions after merge, pulls the latest files, asks the LLM to update `CHANGELOG.md`, and pushes a `[skip-ci]` changelog commit to the base branch. After a successful interactive merge, War Room prompts to post the victory summary and then prompts for local cleanup.
 
 If work becomes blocked, mark it explicitly:
 
@@ -235,7 +212,7 @@ Use `npm run warroom -- dev unlink` to restore published-package behavior.
 
 The machine-readable source of truth is `repos.yaml`. The human-readable view is `maps/campaign-atlas.md`.
 
-`merge_playwright` controls the confirmed PR merge e2e gate. It is enabled for `sdk`, `backend`, and `demo`; all other mapped repos skip the demo Playwright gate during `warroom pr merge`.
+The nested `merge` config controls confirmed PR merge gates. `merge.playwright` is enabled for `sdk`, `backend`, and `demo`; all other mapped repos skip the demo Playwright gate during `warroom pr merge`. `merge.changelog` is enabled for `sdk` only, so SDK merges update `CHANGELOG.md` after release actions publish the new package version.
 
 The merge gate checks backend readiness with a direct GET to `https://api.local.flopay.com/v1/health`. For local hosts (`localhost`, loopback, and `*.local.flopay.com`), War Room accepts untrusted local TLS certificates by default so it can reuse an already-running API instead of starting another one. When the demo e2e run targets a local HTTPS backend, War Room also passes `NODE_OPTIONS=--use-system-ca` to the Playwright process so the demo web server can trust locally installed development certificates. Set `WARROOM_MERGE_BACKEND_STRICT_TLS=true` to require trusted certificates for the readiness probe, or `WARROOM_MERGE_DEMO_USE_SYSTEM_CA=false` to disable the demo Node system CA flag.
 

@@ -28,11 +28,13 @@ import { runMapsAssign, type MapsAssignResult } from './commands/maps-assign.js'
 import { runMapsStudy } from './commands/maps-study.js';
 import {
   inferPrRefForCurrentBranch,
-  runPrEngage,
+  runIssueStart,
+  runPrCreate,
   runPrMerge,
   runPrReview,
   runPrReviewQueue,
   type LocalCleanupResult,
+  type PrCreateResult,
   type PrPlanResult,
   type PrReviewQueueResult,
   type SummaryPostResult,
@@ -111,7 +113,8 @@ function printMapsAssign(output: Output, result: MapsAssignResult) {
 
 function printIssueList(output: Output, result: IssueListResult, options: { numbered?: boolean } = {}) {
   const selector = result.source === 'campaign' ? `Campaign status ${result.status}` : `label ${result.label}`;
-  output(`Issues with ${selector}: ${result.issues.length}`);
+  const repo = result.repo ? ` for ${result.repo}` : '';
+  output(`Issues with ${selector}${repo}: ${result.issues.length}`);
   result.issues.forEach((issue, index) => {
     const prefix = options.numbered ? `${index + 1}. ` : '';
     output(`${prefix}${issue.repo}#${issue.number} ${issue.title} ${issue.url}`);
@@ -121,7 +124,7 @@ function printIssueList(output: Output, result: IssueListResult, options: { numb
 async function promptIssueSelection(output: Output, input: Input, issues: IssueSummary[]) {
   if (issues.length === 0) return null;
 
-  output('Select an issue number to engage, or enter 0 to cancel.');
+  output('Select an issue number to start, or enter 0 to cancel.');
   output('Selection:');
 
   const readline = createInterface({ input, crlfDelay: Infinity });
@@ -136,6 +139,49 @@ async function promptIssueSelection(output: Output, input: Input, issues: IssueS
       }
 
       output(`Enter a number from 1 to ${issues.length}, or 0 to cancel.`);
+      output('Selection:');
+    }
+  } finally {
+    readline.close();
+  }
+
+  return null;
+}
+
+function prReviewRef(pr: PrReviewQueueResult['prs'][number]) {
+  return `${pr.repo}#${pr.number}`;
+}
+
+async function promptPrReviewSelection(output: Output, input: Input, prs: PrReviewQueueResult['prs']) {
+  if (prs.length === 0) return null;
+
+  if (prs.length === 1) {
+    const pr = prs[0];
+    if (!pr) return null;
+    return (await promptConfirmation(
+      output,
+      input,
+      `Start PR review handoff for ${prReviewRef(pr)} now? This will run \`warroom pr review --pr ${prReviewRef(pr)} --launch\`. [y/N]`
+    ))
+      ? pr
+      : null;
+  }
+
+  output('Select a PR number to review, or enter 0 to cancel.');
+  output('Selection:');
+
+  const readline = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of readline) {
+      const answer = line.trim().toLowerCase();
+      if (answer === '0' || answer === 'q' || answer === 'quit' || answer === 'cancel') return null;
+
+      const selected = Number(answer);
+      if (Number.isInteger(selected) && selected >= 1 && selected <= prs.length) {
+        return prs[selected - 1] ?? null;
+      }
+
+      output(`Enter a number from 1 to ${prs.length}, or 0 to cancel.`);
       output('Selection:');
     }
   } finally {
@@ -194,9 +240,54 @@ function printIssueHandoff(output: Output, result: IssueHandoffResult) {
   output(result.prompt);
 }
 
+function issueStartOutcome(result: PrPlanResult) {
+  if (result.action !== 'issue-start') return null;
+
+  const status = result.campaignStatus
+    ? result.campaignStatus.applied
+      ? ` Campaign status updated to ${result.campaignStatus.status}.`
+      : ` Campaign status not updated; planned ${result.campaignStatus.issue} -> ${result.campaignStatus.status}.`
+    : '';
+  const branch = result.developmentBranch?.branch ? ` on ${result.developmentBranch.branch}` : '';
+
+  if (result.launched) {
+    return `Outcome: handed off to LLM adapter${branch}.${status}`;
+  }
+
+  if (result.launchError) {
+    return `Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.`;
+  }
+
+  return `Outcome: dry run only; no LLM handoff was launched, no development branch was created, and no Campaign status was updated.`;
+}
+
+function prReviewOutcome(result: PrPlanResult) {
+  if (result.action !== 'review') return null;
+
+  const status = result.campaignStatus
+    ? result.campaignStatus.applied
+      ? ` Campaign status updated to ${result.campaignStatus.status}.`
+      : ` Campaign status not updated; planned ${result.campaignStatus.issue} -> ${result.campaignStatus.status}.`
+    : '';
+
+  if (result.launchError || result.prReviewLoop?.status === 'failed') {
+    return 'Outcome: PR review loop blocked. Resolve the blocker above, then rerun the PR review command.';
+  }
+
+  if (result.launched) {
+    if (result.prReviewLoop?.completed) {
+      return 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.';
+    }
+    return `Outcome: handed off to LLM adapter for PR review.${status}`;
+  }
+
+  return 'Outcome: preflight only; no LLM handoff was launched. Rerun with `--launch` to start the PR review loop.';
+}
+
 function printPrPlan(output: Output, result: PrPlanResult) {
-  const state = result.launched ? 'launched' : result.action === 'engage' ? 'dry run' : 'preflight only';
-  output(`PR ${result.action}: ${state}`);
+  const state = result.launchError ? 'blocked' : result.launched ? 'launched' : result.action === 'issue-start' ? 'dry run' : 'preflight only';
+  const label = result.action === 'issue-start' ? 'Issue start' : `PR ${result.action}`;
+  output(`${label}: ${state}`);
   if (result.adapterCommand) output(`Adapter: ${result.adapterCommand}`);
   if (result.adapterCwd) output(`Adapter cwd: ${result.adapterCwd}`);
   if (result.launchError) output(`Adapter error: ${result.launchError}`);
@@ -208,6 +299,16 @@ function printPrPlan(output: Output, result: PrPlanResult) {
     if (result.contextSummary.reviews !== undefined) output(`Reviews: ${result.contextSummary.reviews}`);
     if (result.contextSummary.checks !== undefined) output(`Checks: ${result.contextSummary.checks}`);
     if (result.contextSummary.checkInMinutes !== undefined) output(`Check-in: ${result.contextSummary.checkInMinutes} minutes`);
+  }
+  if (result.developmentBranch) {
+    const branch = result.developmentBranch;
+    output(`Development branch: ${branch.applied ? 'ready' : 'planned'} ${branch.branch} from ${branch.base}`);
+    output(`Development branch link: ${branch.linked ? 'created' : 'planned'} ${branch.command}`);
+    output(
+      `Development checkout: ${branch.checkoutRequired ? branch.checkedOut ? 'checked out' : branch.path ? `not checked out (${branch.path})` : 'missing checkout' : 'not required for task adapter'}`
+    );
+    for (const blocker of branch.blocked) output(`branch blocked: ${blocker}`);
+    if (branch.error) output(`branch error: ${branch.error}`);
   }
   if (result.mergeReadiness) {
     output(`Merge readiness: ${result.mergeReadiness.blocked.length === 0 ? 'clear' : 'blocked'}`);
@@ -238,6 +339,42 @@ function printPrPlan(output: Output, result: PrPlanResult) {
     for (const blocker of result.mergeE2E.blocked) output(`e2e blocked: ${blocker}`);
     if (result.mergeE2E.error) output(`e2e error: ${result.mergeE2E.error}`);
   }
+  if (result.mergeChangelog) {
+    output(`Merge changelog: ${result.mergeChangelog.status}${result.mergeChangelog.skipReason ? ` (${result.mergeChangelog.skipReason})` : ''}`);
+    if (result.mergeChangelog.required) {
+      output(`Changelog: ${result.mergeChangelog.changelogPath ?? 'missing'} (base ${result.mergeChangelog.base})`);
+      output(`Changelog actions: ${result.mergeChangelog.actionsHeadSha ?? 'planned'} (${result.mergeChangelog.actionsRuns.length} runs)`);
+      if (result.mergeChangelog.version) output(`Changelog version: ${result.mergeChangelog.version}`);
+      output(
+        `Changelog commit: ${
+          result.mergeChangelog.pushed
+            ? `pushed ${result.mergeChangelog.commitSha ?? 'unknown'}`
+            : result.mergeChangelog.committed
+              ? `committed ${result.mergeChangelog.commitSha ?? 'unknown'}`
+              : 'planned'
+        }`
+      );
+      if (result.mergeChangelog.durationMs !== null) output(`Changelog duration: ${result.mergeChangelog.durationMs}ms`);
+    }
+    for (const blocker of result.mergeChangelog.blocked) output(`changelog blocked: ${blocker}`);
+    if (result.mergeChangelog.error) output(`changelog error: ${result.mergeChangelog.error}`);
+  }
+  if (result.prReviewLoop) {
+    output(`PR review loop: ${result.prReviewLoop.status}`);
+    output(`PR review loop iterations: ${result.prReviewLoop.iterations.length}`);
+    for (const iteration of result.prReviewLoop.iterations) {
+      const comments =
+        iteration.outstandingCodeRabbitComments === null
+          ? 'unknown'
+          : String(iteration.outstandingCodeRabbitComments);
+      output(
+        `review loop ${iteration.iteration}: ${iteration.startHeadSha ?? 'unknown'} -> ${iteration.endHeadSha ?? 'unknown'}; CodeRabbit comments ${comments}`
+      );
+      if (iteration.adapterError) output(`review loop ${iteration.iteration} adapter error: ${iteration.adapterError}`);
+    }
+    for (const blocker of result.prReviewLoop.blocked) output(`review loop blocked: ${blocker}`);
+    if (result.prReviewLoop.error) output(`review loop error: ${result.prReviewLoop.error}`);
+  }
   if (result.merged !== undefined) output(`Merged: ${result.merged ? 'yes' : 'no'}`);
   printSummaryPosts(output, result.summaryPosts);
   printLocalCleanup(output, result.localCleanup);
@@ -245,6 +382,34 @@ function printPrPlan(output: Output, result: PrPlanResult) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
   }
   output(result.prompt);
+  const outcome = issueStartOutcome(result) ?? prReviewOutcome(result);
+  if (outcome) output(outcome);
+}
+
+function printPrCreate(output: Output, result: PrCreateResult) {
+  output(`PR create: ${result.created ? 'created' : 'preflight only'}`);
+  output(`Repo: ${result.repo}`);
+  output(`Path: ${result.path}`);
+  output(`Branch: ${result.branch} -> ${result.base}`);
+  output(`Issue: ${result.issue ?? 'none inferred'}`);
+  output(`Title: ${result.title}`);
+  output(`Draft: ${result.draft ? 'yes' : 'no'}`);
+  if (result.pushCommand) output(`Push: ${result.pushed ? 'pushed' : 'planned'} ${result.pushCommand}`);
+  output(`Create: ${result.created ? 'created' : 'planned'} ${result.createCommand}`);
+  if (result.url) output(`URL: ${result.url}`);
+  if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
+  for (const blocker of result.blocked) output(`blocked: ${blocker}`);
+  if (result.campaignStatus) {
+    output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
+  }
+  output(result.body);
+  if (result.created && result.url) {
+    output(`PR URL: ${result.url}`);
+  } else if (result.blocked.length > 0) {
+    output('Outcome: PR not created. Resolve the blocked items above, then rerun `warroom pr create --confirm`.');
+  } else {
+    output('Outcome: PR not created. This was a preflight; run `warroom pr create --confirm` or answer yes in an interactive terminal to push and create the PR.');
+  }
 }
 
 function printSummaryPosts(output: Output, posts: SummaryPostResult[] | undefined) {
@@ -301,13 +466,22 @@ async function promptPrMergeFollowUps(
   }
 }
 
-function printPrReviewQueue(output: Output, result: PrReviewQueueResult) {
+function printPrReviewQueue(output: Output, result: PrReviewQueueResult, options: { numbered?: boolean; suppressOutcome?: boolean } = {}) {
   output(`Open PRs for Campaign statuses ${result.statuses.join(', ')}: ${result.prs.length}`);
-  for (const pr of result.prs) {
+  result.prs.forEach((pr, index) => {
     const issues = pr.issues
       .map((issue) => `${issue.repo}#${issue.number}${issue.status ? ` ${issue.status}` : ''}`)
       .join(', ');
-    output(`${pr.repo}#${pr.number} ${pr.title} (updated ${pr.updatedAt ?? 'unknown'}; issue ${issues}) ${pr.url}`);
+    const prefix = options.numbered ? `${index + 1}. ` : '';
+    output(`${prefix}${pr.repo}#${pr.number} ${pr.title} (updated ${pr.updatedAt ?? 'unknown'}; issue ${issues}) ${pr.url}`);
+  });
+  if (options.suppressOutcome) return;
+  if (result.prs.length === 0) {
+    output(`Outcome: no open PRs found for Campaign statuses ${result.statuses.join(', ')}.`);
+  } else {
+    output(
+      `Outcome: listed ${result.prs.length} PR${result.prs.length === 1 ? '' : 's'} ready for review; no LLM handoff was launched. Run \`warroom pr review --pr <owner/repo#number> --launch\` to start one.`
+    );
   }
 }
 
@@ -673,6 +847,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
   issue
     .command('next')
     .description('List issues ready for implementation and select one to start development.')
+    .option('--issue <owner/repo#number>', 'Start this issue directly instead of prompting for a selection.')
     .option('--label <label>', 'Ready label to query.', 'ready-to-engage')
     .option('--base <branch>', 'Target branch for the eventual PR.', 'main')
     .option('--dry-run', 'Print the selected issue handoff without launching the adapter or moving Campaign Map status.')
@@ -681,9 +856,11 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--no-status', 'Do not move the selected issue to battlefield-active.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--no-select', 'List issues without prompting for a selection.')
+    .option('--all', 'List ready issues across all mapped repos, even from inside a child repo checkout.')
     .option('--json', 'Print machine-readable output.')
     .action(
       async (opts: {
+        issue?: string;
         label?: string;
         base?: string;
         dryRun?: boolean;
@@ -692,9 +869,33 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         status?: boolean;
         writeArtifact?: boolean;
         select?: boolean;
+        all?: boolean;
         json?: boolean;
       }) => {
-        const result = runIssueNext(workspaceRoot, opts.label);
+        if (opts.issue) {
+          const dryRun = opts.dryRun === true;
+          if (!opts.json) output(`Starting ${opts.issue}`);
+          const plan = runIssueStart(workspaceRoot, {
+            issue: opts.issue,
+            base: opts.base,
+            dryRun,
+            confirmStatus: dryRun ? false : opts.status !== false || opts.confirmStatus === true,
+            writeArtifact: opts.writeArtifact,
+          });
+          if (opts.json) {
+            printJson(output, plan);
+            return;
+          }
+          printPrPlan(output, plan);
+          if (plan.launchError) process.exitCode = 1;
+          return;
+        }
+
+        const result = runIssueNext(workspaceRoot, {
+          label: opts.label,
+          currentPath: invocationCwd,
+          allRepos: opts.all,
+        });
         if (opts.json) {
           printJson(output, result);
           return;
@@ -705,22 +906,24 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         if (!canSelect) {
           if (opts.select !== false && result.issues.length > 0 && !interactive) {
             output(
-              'Selection is available in an interactive terminal. Run warroom pr engage --issue <owner/repo#number> to engage one directly.'
+              'Selection is available in an interactive terminal. Run warroom issue next --issue <owner/repo#number> to start one directly.'
             );
           }
+          output(result.issues.length === 0 ? 'Outcome: no ready issues found; no issue started.' : 'Outcome: no issue started.');
           return;
         }
 
         const selected = await promptIssueSelection(output, input, result.issues);
         if (!selected) {
           output('No issue selected.');
+          output('Outcome: no issue started.');
           return;
         }
 
         const issueRef = `${selected.repo}#${selected.number}`;
-        output(`Engaging ${issueRef}`);
+        output(`Starting ${issueRef}`);
         const dryRun = opts.dryRun === true;
-        const plan = runPrEngage(workspaceRoot, {
+        const plan = runIssueStart(workspaceRoot, {
           issue: issueRef,
           base: opts.base,
           dryRun,
@@ -730,36 +933,85 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           issueUrl: selected.url,
         });
         printPrPlan(output, plan);
+        if (plan.launchError) process.exitCode = 1;
       }
     );
 
   const pr = program.command('pr').description('Pull request workflow commands.');
   pr
-    .command('engage')
-    .description('Creates a PR from an issue.')
-    .requiredOption('--issue <owner/repo#number>', 'Issue to implement.')
-    .option('--base <branch>', 'Target branch for the eventual PR.', 'main')
-    .option('--dry-run', 'Print the structured handoff without launching the configured LLM adapter.')
-    .option('--launch', 'Launch the configured LLM adapter. Defaults to dry-run handoff output.')
-    .option('--confirm-status', 'Move the issue to battlefield-active on the Campaign Map.')
-    .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
+    .command('create')
+    .description('Create a GitHub PR from the current or selected branch.')
+    .option('--branch <name>', 'Branch to publish. Defaults to the current branch.')
+    .option('--issue <owner/repo#number>', 'Issue to link in the PR body. Defaults to warroom/<number>-... branch inference.')
+    .option('--base <branch>', 'Target base branch. Defaults to branch gh-merge-base or the repo default branch.')
+    .option('--title <text>', 'PR title. Defaults to the linked issue title or first commit subject.')
+    .option('--body <markdown>', 'PR body markdown. Defaults to a generated body with Closes <issue> when an issue is known.')
+    .option('--draft', 'Create the PR as a draft.')
+    .option('--confirm', 'Push the branch and create the PR.')
+    .option('--confirm-status', 'Move the linked issue to skirmish after creating the PR.')
+    .option('--no-push', 'Create the PR without pushing first.')
+    .option('--write-artifact', 'Write PR body/result artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: { issue: string; base?: string; dryRun?: boolean; launch?: boolean; confirmStatus?: boolean; writeArtifact?: boolean; json?: boolean }) => {
-      if (opts.launch && opts.dryRun !== true && !opts.json) {
-        output(`Preparing implementation for ${opts.issue}...`);
-      }
-      const result = runPrEngage(workspaceRoot, {
+    .action(async (opts: {
+      branch?: string;
+      issue?: string;
+      base?: string;
+      title?: string;
+      body?: string;
+      draft?: boolean;
+      confirm?: boolean;
+      confirmStatus?: boolean;
+      push?: boolean;
+      writeArtifact?: boolean;
+      json?: boolean;
+    }) => {
+      const result = runPrCreate(workspaceRoot, {
+        branch: opts.branch,
         issue: opts.issue,
         base: opts.base,
-        dryRun: opts.dryRun ?? !opts.launch,
+        title: opts.title,
+        body: opts.body,
+        draft: opts.draft,
+        confirm: opts.confirm,
         confirmStatus: opts.confirmStatus,
+        push: opts.push,
         writeArtifact: opts.writeArtifact,
+        currentPath: invocationCwd,
       });
       if (opts.json) {
         printJson(output, result);
         return;
       }
-      printPrPlan(output, result);
+      printPrCreate(output, result);
+
+      if (opts.confirm || !interactive || result.created || result.blocked.length > 0) return;
+
+      const confirmed = await promptConfirmation(output, input, 'Push this branch and create the GitHub PR now? [y/N]');
+      if (!confirmed) {
+        output('PR not created.');
+        return;
+      }
+
+      output('Creating PR...');
+      try {
+        const created = runPrCreate(workspaceRoot, {
+          branch: opts.branch,
+          issue: opts.issue,
+          base: opts.base,
+          title: opts.title,
+          body: opts.body,
+          draft: opts.draft,
+          confirm: true,
+          confirmStatus: opts.confirmStatus,
+          push: opts.push,
+          writeArtifact: opts.writeArtifact,
+          currentPath: invocationCwd,
+        });
+        printPrCreate(output, created);
+      } catch (error) {
+        output(`PR create failed: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
     });
   pr
     .command('review')
@@ -768,34 +1020,58 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--issue <owner/repo#number>', 'Linked issue to move to skirmish.')
     .option('--dry-run', 'Print the structured handoff and context summary without launching the configured LLM adapter.')
     .option('--launch', 'Launch the configured LLM adapter. Defaults to dry-run handoff output.')
-    .option('--check-in-minutes <minutes>', 'Review-loop check-in interval for the handoff.', (value) => Number(value), 60)
+    .option('--check-in-minutes <minutes>', 'Compatibility option; review polling is controlled by WARROOM_PR_REVIEW_* env vars.', (value) => Number(value), 60)
     .option('--confirm-status', 'Move the linked issue to skirmish on the Campaign Map.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--json', 'Print machine-readable output.')
-    .action((opts: { pr?: string; issue?: string; dryRun?: boolean; launch?: boolean; checkInMinutes?: number; confirmStatus?: boolean; writeArtifact?: boolean; json?: boolean }) => {
+    .action(async (opts: { pr?: string; issue?: string; dryRun?: boolean; launch?: boolean; checkInMinutes?: number; confirmStatus?: boolean; writeArtifact?: boolean; json?: boolean }) => {
       if (!opts.pr) {
         const result = runPrReviewQueue();
         if (opts.json) {
           printJson(output, result);
           return;
         }
-        printPrReviewQueue(output, result);
+        const canStart = interactive && opts.dryRun !== true && result.prs.length > 0;
+        printPrReviewQueue(output, result, { numbered: canStart && result.prs.length > 1, suppressOutcome: canStart });
+        if (!canStart) return;
+
+        const selected = await promptPrReviewSelection(output, input, result.prs);
+        if (!selected) {
+          output('Outcome: no PR review handoff started.');
+          return;
+        }
+
+        const selectedPr = prReviewRef(selected);
+        output(`Starting PR review for ${selectedPr}`);
+        const review = await runPrReview(workspaceRoot, {
+          pr: selectedPr,
+          issue: opts.issue,
+          dryRun: false,
+          checkInMinutes: opts.checkInMinutes,
+          confirmStatus: opts.confirmStatus,
+          writeArtifact: opts.writeArtifact,
+          reviewStatus: output,
+        });
+        printPrPlan(output, review);
+        if (review.launchError) process.exitCode = 1;
         return;
       }
 
-      const result = runPrReview(workspaceRoot, {
+      const result = await runPrReview(workspaceRoot, {
         pr: opts.pr,
         issue: opts.issue,
         dryRun: opts.dryRun ?? !opts.launch,
         checkInMinutes: opts.checkInMinutes,
         confirmStatus: opts.confirmStatus,
         writeArtifact: opts.writeArtifact,
+        reviewStatus: opts.json ? undefined : output,
       });
       if (opts.json) {
         printJson(output, result);
         return;
       }
       printPrPlan(output, result);
+      if (result.launchError) process.exitCode = 1;
     });
   pr
     .command('merge')
@@ -831,6 +1107,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         : {
             e2eStatus: output,
             e2eOutput: createE2EOutput(output, customOutput),
+            mergeStatus: output,
           };
 
       const result = await runPrMerge(workspaceRoot, {
@@ -851,6 +1128,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         return;
       }
       printPrPlan(output, result);
+      if (result.mergeChangelog?.required && result.mergeChangelog.status === 'failed') process.exitCode = 1;
 
       let confirmedResult = result;
       if (interactive && !opts.confirm && !result.merged) {
@@ -878,10 +1156,12 @@ export function buildProgram(options: BuildProgramOptions = {}) {
             ...liveE2EOutput,
           });
           printPrPlan(output, confirmedResult);
+          if (confirmedResult.mergeChangelog?.required && confirmedResult.mergeChangelog.status === 'failed') process.exitCode = 1;
         }
       }
 
       if (!interactive || !confirmedResult.merged) return;
+      if (confirmedResult.mergeChangelog?.required && confirmedResult.mergeChangelog.status === 'failed') return;
 
       await promptPrMergeFollowUps(workspaceRoot, output, input, {
         pr: resolvedPr,

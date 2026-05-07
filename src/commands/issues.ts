@@ -1,4 +1,5 @@
 import { spawnSync } from 'node:child_process';
+import path from 'node:path';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
 import { listCampaignIssuesByStatus, setCampaignStatus, type CampaignStatusSetResult } from '../lib/campaign.js';
 import { getAdapterInvocation, runAdapter } from '../lib/env.js';
@@ -21,6 +22,7 @@ export type IssueSummary = IssueRef & {
 export type IssueListResult = {
   label?: string;
   status?: string;
+  repo?: string;
   source: 'campaign' | 'labels';
   issues: IssueSummary[];
 };
@@ -51,6 +53,12 @@ export type IssueTriageOptions = {
   writeArtifact?: boolean;
 };
 
+export type IssueNextOptions = {
+  label?: string;
+  currentPath?: string;
+  allRepos?: boolean;
+};
+
 function ghJson<T>(args: string[], fallback: T): T {
   const result = spawnSync('gh', args, { encoding: 'utf8' });
   if (result.status !== 0 || !result.stdout.trim()) return fallback;
@@ -73,11 +81,26 @@ function truncateText(value: string | undefined, limit = 6000) {
   return `${value.slice(0, limit)}\n\n[Truncated by War Room to keep the handoff scoped. Re-run with direct GitHub inspection if more issue body context is needed.]`;
 }
 
-export function listIssuesByLabel(workspaceRoot: string, label: string): IssueListResult {
+function containsPath(parent: string, child: string) {
+  const relative = path.relative(parent, child);
+  return relative === '' || (!relative.startsWith('..') && !path.isAbsolute(relative));
+}
+
+function repoForCurrentPath(workspaceRoot: string, currentPath: string | undefined) {
+  if (!currentPath) return null;
+
+  const resolved = path.resolve(currentPath);
+  return loadRepoManifest(workspaceRoot).repos
+    .map((entry) => getRepoHealth(workspaceRoot, entry))
+    .filter((repo) => repo.checkedOut && containsPath(repo.resolvedPath, resolved))
+    .sort((left, right) => right.resolvedPath.length - left.resolvedPath.length)[0] ?? null;
+}
+
+export function listIssuesByLabel(workspaceRoot: string, label: string, repoFilter: string | null = null): IssueListResult {
   const manifest = loadRepoManifest(workspaceRoot);
   const issues: IssueSummary[] = [];
 
-  for (const repo of manifest.repos) {
+  for (const repo of manifest.repos.filter((entry) => !repoFilter || entry.github === repoFilter)) {
     const rows = ghJson<Array<{ number: number; title: string; url: string; labels: Array<{ name?: string }> }>>(
       ['issue', 'list', '--repo', repo.github, '--state', 'open', '--label', label, '--json', 'number,title,url,labels'],
       []
@@ -93,7 +116,7 @@ export function listIssuesByLabel(workspaceRoot: string, label: string): IssueLi
     }
   }
 
-  return { label, source: 'labels', issues };
+  return { label, repo: repoFilter ?? undefined, source: 'labels', issues };
 }
 
 function issueContext(ref: IssueRef) {
@@ -142,10 +165,14 @@ function repoIdForGitHub(workspaceRoot: string, githubRepo: string) {
   return repoEntryForGitHub(workspaceRoot, githubRepo)?.id ?? null;
 }
 
-export function runIssueNext(workspaceRoot: string, label = 'ready-to-engage') {
-  const issues = listIssuesByCampaignStatus('ready-to-engage');
-  if (issues.length > 0) return { status: 'ready-to-engage', source: 'campaign' as const, issues };
-  return listIssuesByLabel(workspaceRoot, label);
+export function runIssueNext(workspaceRoot: string, options: IssueNextOptions | string = {}) {
+  const label = typeof options === 'string' ? options : options.label ?? 'ready-to-engage';
+  const currentRepo = typeof options === 'string' || options.allRepos ? null : repoForCurrentPath(workspaceRoot, options.currentPath);
+  const repoFilter = currentRepo?.github ?? null;
+  const campaignIssues = listIssuesByCampaignStatus('ready-to-engage');
+  const issues = campaignIssues.filter((issue) => !repoFilter || issue.repo === repoFilter);
+  if (campaignIssues.length > 0) return { status: 'ready-to-engage', repo: repoFilter ?? undefined, source: 'campaign' as const, issues };
+  return listIssuesByLabel(workspaceRoot, label, repoFilter);
 }
 
 function listIssuesByCampaignStatus(status: 'needs-triage' | 'ready-to-engage') {

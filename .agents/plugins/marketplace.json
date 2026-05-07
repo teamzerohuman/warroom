@@ -1,0 +1,56 @@
+{
+  "name": "openai-curated",
+  "interface": {
+    "displayName": "War Room Pinned OpenAI Curated Plugins"
+  },
+  "plugins": [
+    {
+      "name": "github",
+      "source": {
+        "source": "local",
+        "path": "./plugins/github"
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Coding"
+    },
+    {
+      "name": "coderabbit",
+      "source": {
+        "source": "local",
+        "path": "./plugins/coderabbit"
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Coding"
+    },
+    {
+      "name": "cloudflare",
+      "source": {
+        "source": "local",
+        "path": "./plugins/cloudflare"
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Coding"
+    },
+    {
+      "name": "railway",
+      "source": {
+        "source": "local",
+        "path": "./plugins/railway"
+      },
+      "policy": {
+        "installation": "INSTALLED_BY_DEFAULT",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Coding"
+    }
+  ]
+}
