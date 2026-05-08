@@ -1,3 +1,4 @@
+import { resolveAllyIssueRepo } from './allies.js';
 import { loadRepoManifest, type RepoEntry } from './repos.js';
 import { loadResourcesManifest, type ResourceEntry } from './resources.js';
 
@@ -23,6 +24,17 @@ export function repoForGitHub(workspaceRoot: string, githubRepo: string): RepoEn
 export function buildSpecialistContext(workspaceRoot: string, githubRepo: string) {
   const repo = repoForGitHub(workspaceRoot, githubRepo);
   if (!repo) {
+    const allyIssueRepo = resolveAllyIssueRepo(workspaceRoot, githubRepo);
+    if (allyIssueRepo) {
+      return [
+        `Ally issue repo context for ${githubRepo}`,
+        `Ally: ${allyIssueRepo.ally.name} (${allyIssueRepo.ally.id})`,
+        `Local checkout: ${allyIssueRepo.issueRepoPath}${allyIssueRepo.issueRepoCheckedOut ? '' : ' (missing)'}`,
+        `Sync: ${allyIssueRepo.ally.issue_repo.sync} from ${allyIssueRepo.ally.issue_repo.client_system}`,
+        '- This is an ally issue repo, not product source. Keep triage scoped to safe issue context and avoid committing client data, secrets, or private endpoints.',
+      ].join('\n');
+    }
+
     return `Repo specialist context for ${githubRepo}:\n- No mapped repo found in repos.yaml. Confirm owner repo before editing.`;
   }
 

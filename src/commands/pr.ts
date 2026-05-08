@@ -1,8 +1,9 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync, readdirSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import * as http from 'node:http';
 import * as https from 'node:https';
 import { isIP } from 'node:net';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
 import {
@@ -16,6 +17,12 @@ import { getAdapterInvocation, runAdapter } from '../lib/env.js';
 import { getRepoHealth, loadRepoManifest, runGit } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
 import { parseIssueRef, type IssueRef } from './issues.js';
+
+export type PrTextResult = {
+  source: 'adapter' | 'fallback' | 'manual';
+  adapterCommand: string | null;
+  error: string | null;
+};
 
 export type PrOptions = {
   issue?: string;
@@ -40,6 +47,7 @@ export type PrOptions = {
   allowUnresolvedReviewThreads?: boolean;
   issueTitle?: string;
   issueUrl?: string;
+  prText?: PrTextResult;
   currentPath?: string;
   e2eStatus?: (message: string) => void;
   e2eOutput?: (chunk: string, stream: 'stdout' | 'stderr') => void;
@@ -205,6 +213,7 @@ export type PrCreateResult = {
   url: string | null;
   blocked: string[];
   campaignStatus: CampaignStatusSetResult | null;
+  prText: PrTextResult;
   artifact?: RunArtifact;
 };
 
@@ -266,6 +275,8 @@ const DEFAULT_PR_REVIEW_COMMIT_TIMEOUT_MS = 30 * 60_000;
 const DEFAULT_PR_REVIEW_CODERABBIT_TIMEOUT_MS = 15 * 60_000;
 const DEFAULT_PR_REVIEW_CODERABBIT_SETTLE_MS = 60_000;
 const DEFAULT_PR_REVIEW_POLL_MS = 15_000;
+const PR_TEXT_DIRECT_DIFF_LIMIT = 60_000;
+const PR_TEXT_DIFF_CHUNK_SIZE = 45_000;
 
 function ghJson<T>(args: string[], fallback: T): T {
   const result = spawnSync('gh', args, { encoding: 'utf8' });
@@ -1244,6 +1255,32 @@ function changedFiles(repoPath: string, base: string, branch: string) {
   return result.status === 0 ? result.stdout.split(/\r?\n/).filter(Boolean).slice(0, 40) : [];
 }
 
+function commitDetails(repoPath: string, base: string, branch: string) {
+  const range = `${base}..${branch}`;
+  const result = runGit(repoPath, [
+    'log',
+    '--reverse',
+    '--format=commit %H%nsubject: %s%nbody:%n%b%n---',
+    range,
+  ]);
+  return result.status === 0 ? result.stdout : '';
+}
+
+function diffStat(repoPath: string, base: string, branch: string) {
+  const result = runGit(repoPath, ['diff', '--stat', `${base}...${branch}`]);
+  return result.status === 0 ? result.stdout : '';
+}
+
+function diffNameStatus(repoPath: string, base: string, branch: string) {
+  const result = runGit(repoPath, ['diff', '--name-status', `${base}...${branch}`]);
+  return result.status === 0 ? result.stdout : '';
+}
+
+function diffPatch(repoPath: string, base: string, branch: string) {
+  const result = runGit(repoPath, ['diff', '--find-renames', '--find-copies', '--unified=3', `${base}...${branch}`]);
+  return result.status === 0 ? result.stdout : '';
+}
+
 function formatPrBody(issueRef: string | null, issueBody: string | undefined, commits: string[], files: string[]) {
   const lines = [
     issueRef ? `Closes ${issueRef}` : null,
@@ -1262,6 +1299,336 @@ function formatPrBody(issueRef: string | null, issueBody: string | undefined, co
   return lines.filter((line): line is string => line !== null).join('\n');
 }
 
+type PrTextPromptOptions = {
+  repo: string;
+  branch: string;
+  base: string;
+  issueRef: string | null;
+  issueTitle?: string;
+  issueBody?: string;
+  commits: string[];
+  files: string[];
+  commitDetails: string;
+  diffStat: string;
+  diffNameStatus: string;
+  diffPatch?: string;
+  diffSummaries?: string[];
+};
+
+function buildPrTextPrompt(options: PrTextPromptOptions) {
+  const diffContext =
+    options.diffSummaries && options.diffSummaries.length > 0
+      ? [
+          `Summarized full diff in ${options.diffSummaries.length} chunk${options.diffSummaries.length === 1 ? '' : 's'}:`,
+          options.diffSummaries.map((summary, index) => `### Diff chunk ${index + 1}\n${summary}`).join('\n\n'),
+        ]
+      : ['Full branch diff:', options.diffPatch || '(no diff detected)'];
+
+  return [
+    'Generate GitHub pull request metadata for `warroom pr create`.',
+    '',
+    'Return only JSON with exactly these string fields:',
+    '{"title":"...","body":"..."}',
+    '',
+    'Rules:',
+    '- Base the title and body on the actual branch commits and diff below, not the issue title alone.',
+    '- Keep the title under 80 characters and make it useful in a PR list.',
+    options.issueRef ? `- The body must include an exact \`Closes ${options.issueRef}\` line.` : '- Do not invent a linked issue.',
+    '- Use concise markdown in the body with `## Summary` and `## Validation` sections.',
+    '- Do not claim validation was run unless it is evident from the commits or diff.',
+    '- Do not include secrets, private env values, or PII from the diff in the PR body.',
+    '- Do not wrap the JSON in markdown fences.',
+    options.diffSummaries && options.diffSummaries.length > 0
+      ? '- The raw diff was too large for one final prompt, so every diff chunk was summarized first. Treat the chunk summaries as full diff coverage.'
+      : null,
+    '',
+    `Repository: ${options.repo}`,
+    `Branch: ${options.branch}`,
+    `Base: ${options.base}`,
+    options.issueRef ? `Linked issue: ${options.issueRef}` : 'Linked issue: none inferred',
+    options.issueTitle ? `Issue title: ${options.issueTitle}` : null,
+    options.issueBody ? `Issue body:\n${options.issueBody}` : null,
+    '',
+    'Commit subjects:',
+    options.commits.length ? options.commits.join('\n') : '(no commit subjects detected)',
+    '',
+    'Full branch commit log:',
+    options.commitDetails || '(no commit details detected)',
+    '',
+    'Diff stat:',
+    options.diffStat || '(no diff stat detected)',
+    '',
+    'Diff name-status:',
+    options.diffNameStatus || (options.files.length ? options.files.join('\n') : '(no changed files detected)'),
+    '',
+    ...diffContext,
+  ].filter((line): line is string => line !== null).join('\n');
+}
+
+function parseJsonObject(raw: string): unknown {
+  const trimmed = raw.trim();
+  const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/);
+  const candidate = fenced?.[1] ?? trimmed;
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    const start = candidate.indexOf('{');
+    const end = candidate.lastIndexOf('}');
+    if (start === -1 || end <= start) throw new Error('Adapter output did not contain a JSON object.');
+    return JSON.parse(candidate.slice(start, end + 1));
+  }
+}
+
+function ensureClosingLine(body: string, issueRef: string | null) {
+  if (!issueRef) return body.trim();
+  if (body.includes(`Closes ${issueRef}`) || body.includes(`Fixes ${issueRef}`) || body.includes(`Resolves ${issueRef}`)) {
+    return body.trim();
+  }
+  return `Closes ${issueRef}\n\n${body.trim()}`;
+}
+
+function parsePrTextDraft(raw: string, issueRef: string | null) {
+  const parsed = parseJsonObject(raw);
+  if (!parsed || typeof parsed !== 'object') throw new Error('Adapter output JSON was not an object.');
+  const record = parsed as Record<string, unknown>;
+  const title = typeof record.title === 'string' ? record.title.trim().replace(/\s+/g, ' ') : '';
+  const body = typeof record.body === 'string' ? ensureClosingLine(record.body, issueRef) : '';
+  if (!title) throw new Error('Adapter output did not include a non-empty title.');
+  if (!body) throw new Error('Adapter output did not include a non-empty body.');
+  return { title, body };
+}
+
+function parseDiffChunkSummary(raw: string) {
+  const parsed = parseJsonObject(raw);
+  if (!parsed || typeof parsed !== 'object') throw new Error('Adapter output JSON was not an object.');
+  const summary = (parsed as Record<string, unknown>).summary;
+  if (typeof summary !== 'string' || !summary.trim()) {
+    throw new Error('Adapter output did not include a non-empty summary.');
+  }
+  return summary.trim();
+}
+
+function runAdapterForFinalMessage(workspaceRoot: string, repoPath: string, prompt: string) {
+  const outputDir = mkdtempSync(path.join(tmpdir(), 'warroom-adapter-message-'));
+  const outputPath = path.join(outputDir, 'last-message.txt');
+  try {
+    const launch = runAdapter(workspaceRoot, prompt, {
+      cwd: repoPath,
+      outputLastMessagePath: outputPath,
+      captureStdout: true,
+    });
+    const message = existsSync(outputPath) ? readFileSync(outputPath, 'utf8') : (launch.stdout?.trim() ?? '');
+    return {
+      message,
+      adapterCommand: launch.invocation.display,
+      error: launch.launched ? null : launch.error ?? 'LLM adapter failed.',
+    };
+  } finally {
+    rmSync(outputDir, { recursive: true, force: true });
+  }
+}
+
+function splitTextByLines(value: string, chunkSize: number) {
+  const chunks: string[] = [];
+  let current = '';
+  for (const line of value.split(/\n/)) {
+    const next = current ? `${current}\n${line}` : line;
+    if (current && next.length > chunkSize) {
+      chunks.push(current);
+      current = line;
+      continue;
+    }
+    current = next;
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function splitLargeFilePatch(value: string, chunkSize: number) {
+  const lines = value.split(/\n/);
+  const firstHunk = lines.findIndex((line) => line.startsWith('@@'));
+  const headerEnd = firstHunk === -1 ? Math.min(lines.length, 6) : firstHunk;
+  const header = lines.slice(0, headerEnd).join('\n');
+  const body = lines.slice(headerEnd).join('\n');
+  const bodyChunkSize = Math.max(10_000, chunkSize - header.length - 80);
+  return splitTextByLines(body, bodyChunkSize).map((chunk, index) =>
+    [header, index === 0 ? null : '[continued diff for the same file]', chunk]
+      .filter((line): line is string => Boolean(line))
+      .join('\n')
+  );
+}
+
+function splitDiffPatch(value: string, chunkSize = PR_TEXT_DIFF_CHUNK_SIZE) {
+  if (value.length <= chunkSize) return [value];
+  const filePatches = value.split(/\n(?=diff --git )/);
+  const chunks: string[] = [];
+  let current = '';
+
+  for (const patch of filePatches) {
+    if (patch.length > chunkSize) {
+      if (current) {
+        chunks.push(current);
+        current = '';
+      }
+      chunks.push(...splitLargeFilePatch(patch, chunkSize));
+      continue;
+    }
+
+    const next = current ? `${current}\n${patch}` : patch;
+    if (current && next.length > chunkSize) {
+      chunks.push(current);
+      current = patch;
+      continue;
+    }
+    current = next;
+  }
+
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+function buildDiffChunkSummaryPrompt(options: PrTextPromptOptions, chunk: string, index: number, total: number) {
+  return [
+    'Summarize one chunk of a Git diff for later GitHub PR title/body generation.',
+    '',
+    'Return only JSON with exactly this string field:',
+    '{"summary":"..."}',
+    '',
+    'Rules:',
+    '- Summarize concrete behavior, files, tests, migrations, docs, and operational impact visible in this chunk.',
+    '- Preserve important names of public APIs, modules, commands, config keys, database columns, and validation evidence.',
+    '- Do not include secrets, private env values, PII, or raw customer data.',
+    '- Do not claim validation was run unless it is visible in this chunk or commit context.',
+    '- Do not wrap the JSON in markdown fences.',
+    '',
+    `Repository: ${options.repo}`,
+    `Branch: ${options.branch}`,
+    `Base: ${options.base}`,
+    `Diff chunk: ${index + 1} of ${total}`,
+    '',
+    'Commit subjects:',
+    options.commits.length ? options.commits.join('\n') : '(no commit subjects detected)',
+    '',
+    'Diff stat:',
+    options.diffStat || '(no diff stat detected)',
+    '',
+    'Diff name-status:',
+    options.diffNameStatus || (options.files.length ? options.files.join('\n') : '(no changed files detected)'),
+    '',
+    'Diff chunk content:',
+    chunk,
+  ].join('\n');
+}
+
+function summarizeDiffForPrText(workspaceRoot: string, repoPath: string, options: PrTextPromptOptions) {
+  const diffPatch = options.diffPatch ?? '';
+  if (diffPatch.length <= PR_TEXT_DIRECT_DIFF_LIMIT) {
+    return { summaries: null as string[] | null, calls: 0, adapterCommand: null as string | null, error: null as string | null };
+  }
+
+  const chunks = splitDiffPatch(diffPatch);
+  const summaries: string[] = [];
+  let adapterCommand: string | null = null;
+  for (const [index, chunk] of chunks.entries()) {
+    const result = runAdapterForFinalMessage(
+      workspaceRoot,
+      repoPath,
+      buildDiffChunkSummaryPrompt(options, chunk, index, chunks.length)
+    );
+    adapterCommand = result.adapterCommand;
+    if (result.error) {
+      return {
+        summaries: null,
+        calls: index + 1,
+        adapterCommand,
+        error: `LLM adapter failed while summarizing diff chunk ${index + 1}/${chunks.length}: ${result.error}`,
+      };
+    }
+    if (!result.message) {
+      return {
+        summaries: null,
+        calls: index + 1,
+        adapterCommand,
+        error: `LLM adapter completed diff chunk ${index + 1}/${chunks.length} but did not return a final message.`,
+      };
+    }
+
+    try {
+      summaries.push(parseDiffChunkSummary(result.message));
+    } catch (error) {
+      return {
+        summaries: null,
+        calls: index + 1,
+        adapterCommand,
+        error: `Could not parse diff chunk ${index + 1}/${chunks.length} summary: ${error instanceof Error ? error.message : String(error)}`,
+      };
+    }
+  }
+
+  return { summaries, calls: chunks.length, adapterCommand, error: null };
+}
+
+function generatePrText(
+  workspaceRoot: string,
+  repoPath: string,
+  options: PrTextPromptOptions
+): {
+  title: string | null;
+  body: string | null;
+  adapterCommand: string | null;
+  error: string | null;
+} {
+  let adapterCommand: string | null = null;
+  try {
+    const diffSummary = summarizeDiffForPrText(workspaceRoot, repoPath, options);
+    adapterCommand = diffSummary.adapterCommand;
+    if (diffSummary.error) {
+      return {
+        title: null,
+        body: null,
+        adapterCommand: diffSummary.adapterCommand,
+        error: diffSummary.error,
+      };
+    }
+
+    const promptOptions = diffSummary.summaries
+      ? { ...options, diffPatch: undefined, diffSummaries: diffSummary.summaries }
+      : options;
+    const result = runAdapterForFinalMessage(workspaceRoot, repoPath, buildPrTextPrompt(promptOptions));
+    adapterCommand =
+      diffSummary.calls > 0
+        ? `${result.adapterCommand} (${diffSummary.calls + 1} LLM calls; full diff summarized in ${diffSummary.calls} chunks)`
+        : result.adapterCommand;
+
+    if (result.error) {
+      return {
+        title: null,
+        body: null,
+        adapterCommand,
+        error: `LLM adapter failed while generating PR text: ${result.error}`,
+      };
+    }
+    if (!result.message) {
+      return { title: null, body: null, adapterCommand, error: 'LLM adapter completed but did not return a final message.' };
+    }
+
+    const draft = parsePrTextDraft(result.message, options.issueRef);
+    return {
+      title: draft.title,
+      body: draft.body,
+      adapterCommand,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      title: null,
+      body: null,
+      adapterCommand: adapterCommand ?? getAdapterInvocation(workspaceRoot, repoPath).display,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 function prCreateMarkdown(result: Omit<PrCreateResult, 'artifact'>) {
   return [
     `# PR Create: ${result.repo}`,
@@ -1271,6 +1638,9 @@ function prCreateMarkdown(result: Omit<PrCreateResult, 'artifact'>) {
     `- Issue: ${result.issue ?? 'none inferred'}`,
     `- Title: ${result.title}`,
     `- Draft: ${result.draft ? 'yes' : 'no'}`,
+    `- PR text: ${result.prText.source}`,
+    result.prText.adapterCommand ? `- Adapter: ${result.prText.adapterCommand}` : null,
+    result.prText.error ? `- Adapter warning: ${result.prText.error}` : null,
     `- Created: ${result.created ? 'yes' : 'no'}`,
     result.url ? `- URL: ${result.url}` : null,
     result.pushCommand ? `- Push: ${result.pushed ? 'pushed' : 'planned'} ${result.pushCommand}` : '- Push: skipped',
@@ -1337,12 +1707,19 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
     : {};
   const commits = commitSummary(repo.resolvedPath, base, branch);
   const files = changedFiles(repo.resolvedPath, base, branch);
-  const title =
+  const fallbackTitle =
     options.title ??
     issue.title ??
     commits[0]?.replace(/^[a-f0-9]+\s+/, '') ??
     `Publish ${branch}`;
-  const body = options.body ?? formatPrBody(issueRef, issue.body, commits, files);
+  const fallbackBody = options.body ?? formatPrBody(issueRef, issue.body, commits, files);
+  let title = fallbackTitle;
+  let body = fallbackBody;
+  let prText: PrTextResult =
+    options.prText ??
+    (options.title && options.body
+      ? { source: 'manual', adapterCommand: null, error: null }
+      : { source: 'fallback', adapterCommand: null, error: null });
   const draft = options.draft ?? false;
   const blocked: string[] = [];
 
@@ -1366,6 +1743,30 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
   const pushCommand = pushArgs ? `git ${pushArgs.map(shellQuote).join(' ')}` : null;
   if (shouldPush && !hasOriginRemote(repo.resolvedPath)) {
     blocked.push('Repo has no origin remote for pushing the PR branch.');
+  }
+
+  if ((!options.title || !options.body) && blocked.length === 0) {
+    const generated = generatePrText(workspaceRoot, repo.resolvedPath, {
+      repo: repo.github,
+      branch,
+      base,
+      issueRef,
+      issueTitle: issue.title,
+      issueBody: issue.body,
+      commits,
+      files,
+      commitDetails: commitDetails(repo.resolvedPath, base, branch),
+      diffStat: diffStat(repo.resolvedPath, base, branch),
+      diffNameStatus: diffNameStatus(repo.resolvedPath, base, branch),
+      diffPatch: diffPatch(repo.resolvedPath, base, branch),
+    });
+    prText = {
+      source: generated.error ? 'fallback' : 'adapter',
+      adapterCommand: generated.adapterCommand,
+      error: generated.error,
+    };
+    if (!options.title && generated.title) title = generated.title;
+    if (!options.body && generated.body) body = generated.body;
   }
 
   const createArgs = [
@@ -1429,6 +1830,7 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
     url,
     blocked,
     campaignStatus,
+    prText,
   };
 
   if (!options.writeArtifact) return result;

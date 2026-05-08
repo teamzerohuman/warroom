@@ -85,7 +85,7 @@ warroom issue triage
 warroom issue triage --issue "$ISSUE" --launch --mark-ready --confirm-status --write-artifact
 ```
 
-`issue triage` lists `needs-triage` Campaign Map items when no issue is passed. With `--issue`, it builds a scoped triage handoff with repo specialist context. `--mark-ready --confirm-status` moves the issue to `ready-to-engage` after the triage handoff is launched.
+In an interactive terminal, `issue triage` prints numbered `needs-triage` Campaign Map items and lets you choose one to launch the scoped triage handoff in the Codex TUI, so `@grill-me` questions can be answered directly. Triage handoffs are planning-only: they may do read-only investigation, ask questions, and post final triage notes back to the GitHub issue, but must not edit code, create branches, commit, or open PRs. War Room starts Codex with workspace-write sandboxing plus outbound network access for read-only API checks. Add `--dry-run` to preview the selected handoff without launching. With `--issue`, it builds that handoff directly with repo specialist context and previews by default unless `--launch` is passed. Ally issue repos fall back to the matching `allies.yaml` checkout when they are not in `repos.yaml`. The command ends with an explicit `Outcome:` line for completed, dry-run, or blocked handoffs. `--mark-ready --confirm-status` moves the issue to `ready-to-engage` after the triage handoff is launched.
 
 3. Start implementation from the ready issue.
 
@@ -127,7 +127,7 @@ When run interactively from a mapped child checkout, `commit create` first print
 warroom pr create --confirm --confirm-status --write-artifact
 ```
 
-Run this from the development branch in the owning child repo, or pass `--branch <name>`. `pr create` infers `TeamFloPay/backend#562` from a `warroom/562-...` branch, builds a PR title/body from the issue and commits, includes `Closes <issue>`, pushes the branch, creates the GitHub PR, and moves the issue to `skirmish` when `--confirm-status` is present. At this point the PR is published. Copy the PR ref from GitHub, for example `TeamFloPay/backend#655`.
+Run this from the development branch in the owning child repo, or pass `--branch <name>`. `pr create` infers `TeamFloPay/backend#562` from a `warroom/562-...` branch, asks the LLM adapter to draft a PR title/body from the actual branch commits and diff, includes `Closes <issue>`, pushes the branch, creates the GitHub PR, and moves the issue to `skirmish` when `--confirm-status` is present. Large diffs are summarized across multiple adapter chunk calls before the final PR text prompt instead of being clipped from the prompt. If the adapter fails, War Room falls back to a local issue/commit summary. At this point the PR is published. Copy the PR ref from GitHub, for example `TeamFloPay/backend#655`.
 
 7. Move into the review loop.
 
@@ -136,7 +136,7 @@ warroom pr review
 warroom pr review --pr TeamFloPay/backend#655 --issue "$ISSUE" --launch --confirm-status --write-artifact
 ```
 
-Without `--pr`, `pr review` lists open PRs linked from issues in `battlefield-active` or `skirmish`, ordered by latest update. In an interactive terminal it asks whether to launch the detected PR review handoff, using the selected PR as if `--pr <owner/repo#number> --launch` was passed. Non-interactive runs only list the queue and print an explicit `Outcome:` line. With `--pr --launch`, it sends the fixed GitHub/CodeRabbit feedback handoff to the adapter, waits for a new PR commit, waits for CodeRabbit to appear and settle on that commit, checks outstanding current CodeRabbit comments, and repeats the adapter loop until no CodeRabbit feedback remains or the loop blocks. It moves the issue to `skirmish` when confirmed.
+Without `--pr`, `pr review` lists open PRs linked from issues in `battlefield-active` or `skirmish`, ordered by latest update. If that Campaign queue is empty and the command is run inside a mapped child repo branch with a single open PR, it falls back to that current-branch PR. In an interactive terminal it asks whether to launch the detected PR review handoff, using the selected PR as if `--pr <owner/repo#number> --launch` was passed. Non-interactive fallback runs print the current-branch PR preflight. With `--pr --launch`, it sends the fixed GitHub/CodeRabbit feedback handoff to the adapter, waits for a new PR commit, waits for CodeRabbit to appear and settle on that commit, checks outstanding current CodeRabbit comments, and repeats the adapter loop until no CodeRabbit feedback remains or the loop blocks. It moves the issue to `skirmish` when confirmed.
 
 8. Finish through the merge gate when review is clear.
 

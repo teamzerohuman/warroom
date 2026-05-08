@@ -13,7 +13,7 @@ import { runCampaignStatusCheck } from '../src/commands/campaign.js';
 import { runCommitCreate } from '../src/commands/commit-create.js';
 import { runDoctor } from '../src/commands/doctor.js';
 import { runDevStatus } from '../src/commands/dev-link.js';
-import { getAdapterInvocation, getEnvStatus, runAdapter } from '../src/lib/env.js';
+import { getAdapterInvocation, getEnvStatus, getInteractiveAdapterInvocation, runAdapter } from '../src/lib/env.js';
 import { runMapsAssign } from '../src/commands/maps-assign.js';
 import { runMapsStudy } from '../src/commands/maps-study.js';
 import { runSync } from '../src/commands/sync.js';
@@ -123,7 +123,7 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.startsWith('1. TeamFloPay/sdk#7'))).toBe(true);
       expect(lines).toContain('Starting TeamFloPay/sdk#7');
       expect(lines).toContain('Issue start: launched');
-      expect(lines.some((line) => line.startsWith('Adapter: codex exec --cd '))).toBe(true);
+      expect(lines.some((line) => line.startsWith('Adapter: codex exec --model gpt-5.5 '))).toBe(true);
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
       expect(lines).toContain('Development branch: ready warroom/7-build-the-selector from main');
       expect(lines.some((line) => line.includes('Development branch link: created gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(true);
@@ -149,6 +149,81 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('selects a triage issue and launches a scoped triage handoff', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = Readable.from(['1\n']);
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      await program.parseAsync(['node', 'warroom', 'issue', 'triage']);
+
+      expect(lines).toContain('Issues with Campaign status needs-triage: 1');
+      expect(lines.some((line) => line.startsWith('1. TeamFloPay/sdk#4 Shape the triage workflow'))).toBe(true);
+      expect(lines).toContain('Select an issue number to triage, or enter 0 to cancel.');
+      expect(lines).toContain('Triaging TeamFloPay/sdk#4');
+      expect(
+        lines.some(
+          (line) =>
+            line.includes(
+              'Adapter: codex --model gpt-5.5 -c model_reasoning_effort="xhigh" --disable fast_mode --sandbox workspace-write -c sandbox_workspace_write.network_access=true --cd '
+            ) && line.endsWith(' <prompt> (launched)')
+        )
+      ).toBe(true);
+      expect(lines.some((line) => line.includes('War Room issue triage handoff for TeamFloPay/sdk#4'))).toBe(true);
+      expect(lines.some((line) => line.includes('Title: Shape the triage workflow'))).toBe(true);
+      expect(lines.some((line) => line.includes('This is planning and issue triage only. Do not implement code.'))).toBe(true);
+      expect(lines.some((line) => line.includes('Do not edit repository files, create branches, commit changes, open pull requests'))).toBe(true);
+      expect(lines.some((line) => line.includes('Use @grill-me: ask blocking clarification questions one at a time'))).toBe(true);
+      expect(lines.some((line) => line.includes('Post the final triage notes back to this GitHub issue'))).toBe(true);
+      expect(lines.some((line) => line.includes('Issue body:'))).toBe(true);
+      expect(lines.some((line) => line.includes('Clarify how operators should move needs-triage issues toward a ready plan.'))).toBe(true);
+      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('launches selected ally triage issues from the ally issue repo checkout', async () => {
+    const root = makeDevFixture();
+    const allyRepo = path.join(root, 'allies', 'clicktech', 'repos', 'ally-clicktech');
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    initGitRepo(allyRepo);
+    writeFileSync(path.join(root, 'allies.yaml'), allyManifestFixture());
+    writeAllyTriageGhFixture(bin);
+    writeCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = Readable.from(['1\n']);
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      await program.parseAsync(['node', 'warroom', 'issue', 'triage']);
+
+      expect(lines).toContain('Issues with Campaign status needs-triage: 1');
+      expect(lines.some((line) => line.startsWith('1. TeamFloPay/ally-clicktech#5 Possible AVS issue'))).toBe(true);
+      expect(lines).toContain('Triaging TeamFloPay/ally-clicktech#5');
+      expect(lines.some((line) => line === `Adapter: codex --model gpt-5.5 -c model_reasoning_effort="xhigh" --disable fast_mode --sandbox workspace-write -c sandbox_workspace_write.network_access=true --cd ${allyRepo} <prompt> (launched)`)).toBe(true);
+      expect(lines.some((line) => line.includes('Ally issue repo context for TeamFloPay/ally-clicktech'))).toBe(true);
+      expect(lines.some((line) => line.includes(`Local checkout: ${allyRepo}`))).toBe(true);
+      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
   it('treats legacy Codex Cloud config as a local Codex implementation launch', async () => {
     const root = makeDevFixture();
     const bin = path.join(root, 'bin');
@@ -168,7 +243,7 @@ describe('phase-1 CLI', () => {
 
       expect(lines).toContain('Starting TeamFloPay/sdk#7');
       expect(lines).toContain('Issue start: launched');
-      expect(lines.some((line) => line.startsWith('Adapter: codex exec --cd '))).toBe(true);
+      expect(lines.some((line) => line.startsWith('Adapter: codex exec --model gpt-5.5 '))).toBe(true);
       expect(lines.some((line) => line.includes('codex cloud exec'))).toBe(false);
       expect(lines.some((line) => line.includes('gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(true);
       expect(lines.some((line) => line.includes('git switch -c warroom/7-build-the-selector --track origin/warroom/7-build-the-selector'))).toBe(true);
@@ -200,7 +275,7 @@ describe('phase-1 CLI', () => {
       await program.parseAsync(['node', 'warroom', 'issue', 'next', '--issue', 'TeamFloPay/sdk#7', '--confirm-status']);
 
       expect(lines).toContain('Issue start: blocked');
-      expect(lines.some((line) => line.startsWith('Adapter: codex exec --cd '))).toBe(true);
+      expect(lines.some((line) => line.startsWith('Adapter: codex exec --model gpt-5.5 '))).toBe(true);
       expect(lines).toContain('Development branch: planned warroom/7-build-the-selector from main');
       expect(lines.some((line) => line.includes('Development branch link: planned gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(true);
       expect(lines.some((line) => line.startsWith('Development checkout: not checked out'))).toBe(true);
@@ -248,6 +323,7 @@ describe('phase-1 CLI', () => {
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeGhFixture(bin);
+    writeCodexFixture(bin);
 
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
@@ -322,6 +398,7 @@ describe('phase-1 CLI', () => {
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeGhFixture(bin);
+    writeCodexFixture(bin);
     writeFileSync(path.join(sdk, 'README.md'), '# SDK\n');
     commitAll(sdk, 'fixture sdk');
     const branch = spawnSync('git', ['switch', '-c', 'warroom/7-build-the-selector'], { cwd: sdk, encoding: 'utf8' });
@@ -343,6 +420,8 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Branch: warroom/7-build-the-selector -> main');
       expect(lines).toContain('Issue: TeamFloPay/sdk#7');
       expect(lines).toContain('Title: Build the selector');
+      expect(lines).toContain('PR text: generated by LLM adapter');
+      expect(lines.some((line) => line.includes('Adapter: codex exec -o '))).toBe(true);
       expect(lines).toContain('URL: https://github.com/TeamFloPay/sdk/pull/12');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> skirmish');
       expect(lines.some((line) => line.includes('Push: pushed git push -u origin warroom/7-build-the-selector'))).toBe(true);
@@ -362,11 +441,51 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('summarizes large PR diffs in chunks instead of truncating the adapter prompt', async () => {
+    const { root, sdk } = makeCommitFixture();
+    const bin = path.join(root, 'bin');
+    const promptLog = path.join(root, 'codex-prompts.log');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeCodexFixture(bin);
+    writeFileSync(path.join(sdk, 'README.md'), '# SDK\n');
+    commitAll(sdk, 'fixture sdk');
+    const branch = spawnSync('git', ['switch', '-c', 'warroom/7-build-the-selector'], { cwd: sdk, encoding: 'utf8' });
+    if (branch.status !== 0) throw new Error(branch.stderr);
+    const largeSelector = Array.from({ length: 7_000 }, (_, index) => `export const selector${index} = ${index};`).join('\n');
+    writeFileSync(path.join(sdk, 'selector.ts'), `${largeSelector}\n`);
+    commitAll(sdk, 'feat: build selector');
+
+    const originalPath = process.env.PATH;
+    const originalPromptLog = process.env.WARROOM_CODEX_PROMPT_LOG;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    process.env.WARROOM_CODEX_PROMPT_LOG = promptLog;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'create']);
+
+      const prompts = readFileSync(promptLog, 'utf8');
+      expect(prompts).toContain('Summarize one chunk of a Git diff');
+      expect(prompts).toContain('Summarized full diff in');
+      expect(prompts).not.toContain('[truncated');
+      expect(lines).toContain('PR create: preflight only');
+      expect(lines.some((line) => line.includes('full diff summarized in'))).toBe(true);
+    } finally {
+      process.env.PATH = originalPath;
+      if (originalPromptLog === undefined) delete process.env.WARROOM_CODEX_PROMPT_LOG;
+      else process.env.WARROOM_CODEX_PROMPT_LOG = originalPromptLog;
+    }
+  });
+
   it('prompts from PR create preflight into PR creation and ends with the URL', async () => {
     const { root, sdk, sdkRemote } = makeCommitFixture();
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeGhFixture(bin);
+    writeCodexFixture(bin);
     writeFileSync(path.join(sdk, 'README.md'), '# SDK\n');
     commitAll(sdk, 'fixture sdk');
     const branch = spawnSync('git', ['switch', '-c', 'warroom/7-build-the-selector'], { cwd: sdk, encoding: 'utf8' });
@@ -431,6 +550,35 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('falls back to the current branch PR when the review queue is empty', async () => {
+    const { root, sdk } = makeCommitFixture();
+    const branch = spawnSync('git', ['switch', '-c', 'fix/stripe-avs-address-preservation'], { cwd: sdk, encoding: 'utf8' });
+    if (branch.status !== 0) throw new Error(branch.stderr);
+
+    const bin = path.join(root, 'bin');
+    const stateFile = path.join(root, 'review-state.txt');
+    mkdirSync(bin, { recursive: true });
+    writePrReviewLoopGhFixture(bin, stateFile, { queue: 'empty', outstandingFirst: false });
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'review']);
+
+      expect(lines[0]).toBe('Open PRs for Campaign statuses battlefield-active, skirmish: 0');
+      expect(lines).toContain('Resolved current branch PR: TeamFloPay/sdk#659');
+      expect(lines).toContain('PR review: preflight only');
+      expect(lines.some((line) => line.includes('PR https://github.com/TeamFloPay/sdk/pull/659'))).toBe(true);
+      expect(lines.at(-1)).toBe('Outcome: preflight only; no LLM handoff was launched. Rerun with `--launch` to start the PR review loop.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
   it('prompts from the PR review queue into a launched review handoff', async () => {
     const root = makeDevFixture();
     const bin = path.join(root, 'bin');
@@ -458,7 +606,7 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('PR review loop 1: 1 outstanding CodeRabbit comment remains; starting another adapter loop.');
       expect(lines).toContain('PR review loop 2: no outstanding CodeRabbit feedback remains.');
       expect(lines).toContain('PR review: launched');
-      expect(lines.some((line) => line.startsWith('Adapter: codex exec --cd '))).toBe(true);
+      expect(lines.some((line) => line.startsWith('Adapter: codex exec --model gpt-5.5 '))).toBe(true);
       expect(lines.some((line) => line.includes('Please analyze the latest [@coderabbit](plugin://coderabbit@openai-curated)'))).toBe(true);
       expect(lines).toContain('PR review loop iterations: 2');
       expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
@@ -551,7 +699,7 @@ describe('phase-1 CLI', () => {
       await program.parseAsync(['node', 'warroom', 'pr', 'review', '--pr', 'TeamFloPay/sdk#12', '--launch']);
 
       expect(lines).toContain('PR review: launched');
-      expect(lines.some((line) => line.startsWith('Adapter: codex exec --cd '))).toBe(true);
+      expect(lines.some((line) => line.startsWith('Adapter: codex exec --model gpt-5.5 '))).toBe(true);
       expect(lines.some((line) => line.includes('codex cloud exec'))).toBe(false);
       expect(lines.at(-1)).toBe('Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
     } finally {
@@ -601,8 +749,60 @@ describe('phase-1 CLI', () => {
 
     const invocation = getAdapterInvocation(root, root);
     expect(invocation.mode).toBe('foreground');
-    expect(invocation.display).toContain('codex exec --cd');
+    expect(invocation.display).toContain('codex exec --model gpt-5.5');
+    expect(invocation.display).toContain('model_reasoning_effort="xhigh"');
+    expect(invocation.display).toContain('--disable fast_mode');
     expect(invocation.display).not.toContain('codex cloud exec');
+  });
+
+  it('uses Codex TUI invocation for interactive adapter launches', () => {
+    const root = makeDevFixture();
+    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=codex\nCODEX_COMMAND=codex\n');
+
+    const invocation = getInteractiveAdapterInvocation(root, root, 'prompt');
+
+    expect(invocation.mode).toBe('interactive');
+    expect(invocation.args).toEqual([
+      '--model',
+      'gpt-5.5',
+      '-c',
+      'model_reasoning_effort="xhigh"',
+      '--disable',
+      'fast_mode',
+      '--sandbox',
+      'workspace-write',
+      '-c',
+      'sandbox_workspace_write.network_access=true',
+      '--cd',
+      root,
+      'prompt',
+    ]);
+    expect(invocation.display).toBe(
+      `codex --model gpt-5.5 -c model_reasoning_effort="xhigh" --disable fast_mode --sandbox workspace-write -c sandbox_workspace_write.network_access=true --cd ${root} <prompt>`
+    );
+  });
+
+  it('allows interactive Codex sandbox and network overrides', () => {
+    const root = makeDevFixture();
+    writeFileSync(
+      path.join(root, '.env.local'),
+      'LLM_ADAPTER=codex\nCODEX_COMMAND=codex\nCODEX_INTERACTIVE_MODEL=gpt-5.4\nCODEX_INTERACTIVE_REASONING_EFFORT=high\nCODEX_INTERACTIVE_FAST_MODE=true\nCODEX_INTERACTIVE_SANDBOX=danger-full-access\nCODEX_INTERACTIVE_NETWORK_ACCESS=false\n'
+    );
+
+    const invocation = getInteractiveAdapterInvocation(root, root, 'prompt');
+
+    expect(invocation.args).toEqual([
+      '--model',
+      'gpt-5.4',
+      '-c',
+      'model_reasoning_effort="high"',
+      '--sandbox',
+      'danger-full-access',
+      '--cd',
+      root,
+      'prompt',
+    ]);
+    expect(invocation.display).toBe(`codex --model gpt-5.4 -c model_reasoning_effort="high" --sandbox danger-full-access --cd ${root} <prompt>`);
   });
 
   it('passes .env.local values into local adapter launches', () => {
@@ -796,6 +996,7 @@ describe('phase-1 CLI', () => {
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeGhFixture(bin);
+    writeCodexFixture(bin);
 
     const originalPath = process.env.PATH;
     process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
@@ -1803,6 +2004,73 @@ resources:
   );
 }
 
+function allyManifestFixture() {
+  return `version: 1
+allies:
+  - id: clicktech
+    name: ClickTech
+    status: active
+    local_path: allies/clicktech
+    issue_repo:
+      github: TeamFloPay/ally-clicktech
+      local_path: allies/clicktech/repos/ally-clicktech
+      sync: unito
+      client_system: jira
+    env:
+      example: allies/clicktech/.env.local.example
+      local: allies/clicktech/.env.local
+    docs: []
+`;
+}
+
+function writeAllyTriageGhFixture(bin: string) {
+  const ghPath = path.join(bin, 'gh');
+  writeFileSync(
+    ghPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+
+function json(value) {
+  process.stdout.write(JSON.stringify(value));
+}
+
+if (args[0] === 'project' && args[1] === 'item-list') {
+  json({
+    items: [
+      {
+        id: 'PVTI_ally_needs',
+        title: 'Possible AVS issue',
+        status: 'needs-triage',
+        labels: ['needs-triage', 'ally', 'clicktech'],
+        content: {
+          repository: 'TeamFloPay/ally-clicktech',
+          number: 5,
+          title: 'Possible AVS issue',
+          url: 'https://github.com/TeamFloPay/ally-clicktech/issues/5'
+        }
+      }
+    ]
+  });
+  process.exit(0);
+}
+
+if (args[0] === 'issue' && args[1] === 'view') {
+  json({
+    title: 'Possible AVS issue',
+    body: 'Check the customer AVS behavior on initial transaction and rebill.',
+    url: 'https://github.com/TeamFloPay/ally-clicktech/issues/5',
+    labels: [{ name: 'needs-triage' }, { name: 'ally' }, { name: 'clicktech' }]
+  });
+  process.exit(0);
+}
+
+console.error('Unexpected gh fixture call: ' + args.join(' '));
+process.exit(1);
+`
+  );
+  chmodSync(ghPath, 0o755);
+}
+
 function writeGhFixture(bin: string) {
   const ghPath = path.join(bin, 'gh');
   writeFileSync(
@@ -1823,6 +2091,18 @@ function optionValue(name) {
 if (args[0] === 'project' && args[1] === 'item-list') {
   json({
     items: [
+      {
+        id: 'PVTI_needs',
+        title: 'Shape the triage workflow',
+        status: 'needs-triage',
+        labels: ['needs-triage'],
+        content: {
+          repository: 'TeamFloPay/sdk',
+          number: 4,
+          title: 'Shape the triage workflow',
+          url: 'https://github.com/TeamFloPay/sdk/issues/4'
+        }
+      },
       {
         id: 'PVTI_ready',
         title: 'Build the selector',
@@ -1953,6 +2233,16 @@ if (args[0] === 'issue' && args[1] === 'develop') {
 
 if (args[0] === 'issue' && args[1] === 'view') {
   const issueNumber = args[2];
+  if (issueNumber === '4') {
+    json({
+      title: 'Shape the triage workflow',
+      body: 'Clarify how operators should move needs-triage issues toward a ready plan.',
+      url: 'https://github.com/TeamFloPay/sdk/issues/4',
+      labels: [{ name: 'needs-triage' }]
+    });
+    process.exit(0);
+  }
+
   if (issueNumber === '17') {
     json({
       title: 'Long implementation issue',
@@ -2079,7 +2369,7 @@ process.exit(1);
 function writePrReviewLoopGhFixture(
   bin: string,
   stateFile: string,
-  options: { queue: 'single' | 'multi'; outstandingFirst: boolean; delayedCodeRabbit?: boolean }
+  options: { queue: 'empty' | 'single' | 'multi'; outstandingFirst: boolean; delayedCodeRabbit?: boolean }
 ) {
   const ghPath = path.join(bin, 'gh');
   writeFileSync(
@@ -2155,7 +2445,9 @@ function prNode(repo, number, title, updatedAt) {
 }
 
 if (args[0] === 'project' && args[1] === 'item-list') {
-  const items = options.queue === 'single'
+  const items = options.queue === 'empty'
+    ? []
+    : options.queue === 'single'
     ? [
         {
           id: 'PVTI_active_backend',
@@ -2200,6 +2492,24 @@ if (args[0] === 'project' && args[1] === 'item-list') {
         }
       ];
   json({ items });
+  process.exit(0);
+}
+
+if (args[0] === 'pr' && args[1] === 'list') {
+  const repo = optionValue('--repo');
+  const head = optionValue('--head');
+  if (options.queue === 'empty' && repo === 'TeamFloPay/sdk' && head === 'fix/stripe-avs-address-preservation') {
+    json([
+      {
+        number: 659,
+        title: 'Preserve Stripe AVS billing address',
+        url: 'https://github.com/TeamFloPay/sdk/pull/659',
+        headRefName: 'fix/stripe-avs-address-preservation'
+      }
+    ]);
+    process.exit(0);
+  }
+  json([]);
   process.exit(0);
 }
 
@@ -2298,16 +2608,17 @@ if (args[0] === 'api' && args[1] === 'graphql') {
 if (args[0] === 'pr' && args[1] === 'view') {
   const repo = optionValue('--repo') || 'TeamFloPay/backend';
   const number = Number(args[2]);
+  const isCurrentBranchFallback = number === 659;
   const isSdk = repo === 'TeamFloPay/sdk';
   const isDemo = repo === 'TeamFloPay/demo';
   const currentHead = headSha();
   const poll = incrementPollCount();
   const delayedCheckPending = options.delayedCodeRabbit && loopCount() === 1 && poll < 4;
   json({
-    title: isSdk ? 'Review active SDK work' : isDemo ? 'Review demo follow-up' : 'Remove Recurly & Chargebee Support',
+    title: isCurrentBranchFallback ? 'Preserve Stripe AVS billing address' : isSdk ? 'Review active SDK work' : isDemo ? 'Review demo follow-up' : 'Remove Recurly & Chargebee Support',
     body: 'Review CodeRabbit feedback.',
     url: 'https://github.com/' + repo + '/pull/' + number,
-    headRefName: isSdk ? 'warroom/8-active-sdk-work' : isDemo ? 'warroom/9-demo-follow-up' : 'warroom/632-remove-recurly-chargebee',
+    headRefName: isCurrentBranchFallback ? 'fix/stripe-avs-address-preservation' : isSdk ? 'warroom/8-active-sdk-work' : isDemo ? 'warroom/9-demo-follow-up' : 'warroom/632-remove-recurly-chargebee',
     baseRefName: 'main',
     headRefOid: currentHead,
     reviews: delayedCheckPending
@@ -2665,8 +2976,43 @@ function writeCodexFixture(bin: string) {
   writeFileSync(
     codexPath,
     `#!/usr/bin/env node
-process.stdin.resume();
-process.stdin.on('end', () => process.exit(0));
+if (process.argv[2] !== 'exec') process.exit(0);
+const fs = require('node:fs');
+const args = process.argv.slice(2);
+const outputIndex = args.indexOf('-o');
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  input += chunk;
+});
+process.stdin.on('end', () => {
+  if (process.env.WARROOM_CODEX_PROMPT_LOG) {
+    fs.appendFileSync(process.env.WARROOM_CODEX_PROMPT_LOG, input + '\\n---PROMPT---\\n');
+  }
+  if (outputIndex !== -1) {
+    if (input.includes('Summarize one chunk of a Git diff')) {
+      fs.writeFileSync(args[outputIndex + 1], JSON.stringify({
+        summary: 'This chunk updates selector-related implementation details and preserves the important changed files for the final PR summary.'
+      }));
+    } else {
+      fs.writeFileSync(args[outputIndex + 1], JSON.stringify({
+        title: 'Build the selector',
+        body: [
+          'Closes TeamFloPay/sdk#7',
+          '',
+          '## Summary',
+          '- Builds selector support from the branch commits.',
+          '- Captures the actual change in selector.ts for reviewers.',
+          '- feat: build selector',
+          '',
+          '## Validation',
+          '- Not run by warroom pr create.'
+        ].join('\\n')
+      }));
+    }
+  }
+  process.exit(0);
+});
 `
   );
   chmodSync(codexPath, 0o755);

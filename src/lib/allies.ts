@@ -58,10 +58,35 @@ export type AllyHealth = AllyEntry & {
   structuralOk: boolean;
 };
 
+export type AllyIssueRepoResolution = {
+  ally: AllyEntry;
+  issueRepoPath: string;
+  issueRepoCheckedOut: boolean;
+};
+
 export function loadAlliesManifest(workspaceRoot: string): AlliesManifest {
   const manifestPath = path.join(workspaceRoot, 'allies.yaml');
   const raw = readFileSync(manifestPath, 'utf8');
   return AlliesManifestSchema.parse(YAML.parse(raw));
+}
+
+export function resolveAllyIssueRepo(workspaceRoot: string, githubRepo: string): AllyIssueRepoResolution | null {
+  let manifest: AlliesManifest;
+  try {
+    manifest = loadAlliesManifest(workspaceRoot);
+  } catch {
+    return null;
+  }
+
+  const ally = manifest.allies.find((entry) => entry.issue_repo.github === githubRepo);
+  if (!ally) return null;
+
+  const issueRepoPath = absolutePath(workspaceRoot, ally.issue_repo.local_path);
+  return {
+    ally,
+    issueRepoPath,
+    issueRepoCheckedOut: isGitCheckout(issueRepoPath),
+  };
 }
 
 function expectedLabels(ally: AllyEntry) {

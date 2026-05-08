@@ -32,6 +32,12 @@ STRIPE_GBP=
 STRIPE_EUR=
 ```
 
+STRIPE_USD is related to account: acct_1SLgSaCr7M3f6cXu
+STRIPE_GBP is related to account: acct_1QP3UVCZdfjaOnwJ
+STRIPE_EUR is related to account: acct_1SKy9rELRd0GNEUW
+
+
+
 When adding new Stripe accounts, prefer account-specific names only after the consuming workflow is clear:
 
 ```sh

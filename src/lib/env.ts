@@ -16,7 +16,7 @@ export type AdapterInvocation = {
   args: string[];
   display: string;
   cwd: string;
-  mode: 'foreground';
+  mode: 'foreground' | 'interactive';
 };
 
 export type AdapterRunResult = {
@@ -24,11 +24,14 @@ export type AdapterRunResult = {
   status: number | null;
   signal: NodeJS.Signals | null;
   error: string | null;
+  stdout: string | null;
   invocation: AdapterInvocation;
 };
 
 export type AdapterRunOptions = {
   cwd?: string;
+  outputLastMessagePath?: string;
+  captureStdout?: boolean;
 };
 
 function parseEnv(raw: string) {
@@ -62,6 +65,20 @@ function readEnvMap(filePath: string) {
 function localProcessEnv(workspaceRoot: string) {
   const localPath = path.join(workspaceRoot, '.env.local');
   return Object.fromEntries(readEnvMap(localPath));
+}
+
+function codexModelArgs(local: Map<string, string>, example: Map<string, string>, prefix = 'CODEX') {
+  const model = local.get(`${prefix}_MODEL`) ?? example.get(`${prefix}_MODEL`) ?? local.get('CODEX_MODEL') ?? example.get('CODEX_MODEL') ?? 'gpt-5.5';
+  const reasoningEffort =
+    local.get(`${prefix}_REASONING_EFFORT`) ?? example.get(`${prefix}_REASONING_EFFORT`) ?? local.get('CODEX_REASONING_EFFORT') ?? example.get('CODEX_REASONING_EFFORT') ?? 'xhigh';
+  const fastMode = local.get(`${prefix}_FAST_MODE`) ?? example.get(`${prefix}_FAST_MODE`) ?? local.get('CODEX_FAST_MODE') ?? example.get('CODEX_FAST_MODE') ?? 'false';
+  return [
+    '--model',
+    model,
+    '-c',
+    `model_reasoning_effort="${reasoningEffort}"`,
+    ...(fastMode === 'true' ? [] : ['--disable', 'fast_mode']),
+  ];
 }
 
 export function getEnvStatus(workspaceRoot: string): EnvStatus {
@@ -107,17 +124,48 @@ export function getAdapterInvocation(workspaceRoot: string, cwd = workspaceRoot)
   }
 
   const command = local.get('CODEX_COMMAND') ?? example.get('CODEX_COMMAND') ?? 'codex';
-  const args = ['exec', '--cd', cwd, '-'];
+  const modelArgs = codexModelArgs(local, example);
+  const args = ['exec', ...modelArgs, '--cd', cwd, '-'];
   return { command, args, display: [command, ...args].join(' '), cwd, mode: 'foreground' };
 }
 
+export function getInteractiveAdapterInvocation(workspaceRoot: string, cwd = workspaceRoot, prompt = '<prompt>'): AdapterInvocation {
+  const examplePath = path.join(workspaceRoot, '.env.local.example');
+  const localPath = path.join(workspaceRoot, '.env.local');
+  const example = readEnvMap(examplePath);
+  const local = readEnvMap(localPath);
+  const adapter = local.get('LLM_ADAPTER') ?? example.get('LLM_ADAPTER') ?? 'codex';
+  if (adapter === 'claude') {
+    const command = local.get('CLAUDE_COMMAND') ?? example.get('CLAUDE_COMMAND') ?? 'claude';
+    return { command, args: [prompt], display: `${command} <prompt>`, cwd, mode: 'interactive' };
+  }
+
+  const command = local.get('CODEX_COMMAND') ?? example.get('CODEX_COMMAND') ?? 'codex';
+  const sandbox = local.get('CODEX_INTERACTIVE_SANDBOX') ?? example.get('CODEX_INTERACTIVE_SANDBOX') ?? 'workspace-write';
+  const networkAccess = local.get('CODEX_INTERACTIVE_NETWORK_ACCESS') ?? example.get('CODEX_INTERACTIVE_NETWORK_ACCESS') ?? 'true';
+  const modelArgs = codexModelArgs(local, example, 'CODEX_INTERACTIVE');
+  const networkArgs = networkAccess === 'false' ? [] : ['-c', 'sandbox_workspace_write.network_access=true'];
+  const args = [...modelArgs, '--sandbox', sandbox, ...networkArgs, '--cd', cwd, prompt];
+  return {
+    command,
+    args,
+    display: [command, ...modelArgs, '--sandbox', sandbox, ...networkArgs, '--cd', cwd, '<prompt>'].join(' '),
+    cwd,
+    mode: 'interactive',
+  };
+}
+
 export function runAdapter(workspaceRoot: string, prompt: string, options: AdapterRunOptions = {}): AdapterRunResult {
-  const invocation = getAdapterInvocation(workspaceRoot, options.cwd ?? workspaceRoot);
+  const invocation = withLastMessageOutput(
+    getAdapterInvocation(workspaceRoot, options.cwd ?? workspaceRoot),
+    options.outputLastMessagePath
+  );
+  const captureStdout = options.captureStdout === true;
   process.stderr.write(`Launching adapter: ${invocation.display}\n`);
   const result = spawnSync(invocation.command, invocation.args, {
     cwd: invocation.cwd,
     input: prompt,
-    stdio: ['pipe', 'inherit', 'inherit'],
+    stdio: ['pipe', captureStdout ? 'pipe' : 'inherit', 'inherit'],
     encoding: 'utf8',
     env: {
       ...process.env,
@@ -133,6 +181,44 @@ export function runAdapter(workspaceRoot: string, prompt: string, options: Adapt
     status: result.status,
     signal: result.signal,
     error,
+    stdout: captureStdout ? result.stdout ?? '' : null,
+    invocation,
+  };
+}
+
+function withLastMessageOutput(invocation: AdapterInvocation, outputPath: string | undefined): AdapterInvocation {
+  if (!outputPath || invocation.args[0] !== 'exec') return invocation;
+
+  const args = ['exec', '-o', outputPath, ...invocation.args.slice(1)];
+  return {
+    ...invocation,
+    args,
+    display: [invocation.command, ...args].join(' '),
+  };
+}
+
+export function runInteractiveAdapter(workspaceRoot: string, prompt: string, options: AdapterRunOptions = {}): AdapterRunResult {
+  const invocation = getInteractiveAdapterInvocation(workspaceRoot, options.cwd ?? workspaceRoot, prompt);
+  process.stderr.write(`Launching interactive adapter: ${invocation.display}\n`);
+  const result = spawnSync(invocation.command, invocation.args, {
+    cwd: invocation.cwd,
+    stdio: 'inherit',
+    encoding: 'utf8',
+    env: {
+      ...process.env,
+      ...localProcessEnv(workspaceRoot),
+    },
+  });
+  const error =
+    result.error?.message ??
+    (result.status === 0 ? null : `Adapter exited with status ${result.status ?? 'unknown'}.`);
+
+  return {
+    launched: result.status === 0,
+    status: result.status,
+    signal: result.signal,
+    error,
+    stdout: null,
     invocation,
   };
 }

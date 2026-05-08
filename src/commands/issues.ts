@@ -1,8 +1,9 @@
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
+import { resolveAllyIssueRepo } from '../lib/allies.js';
 import { listCampaignIssuesByStatus, setCampaignStatus, type CampaignStatusSetResult } from '../lib/campaign.js';
-import { getAdapterInvocation, runAdapter } from '../lib/env.js';
+import { getInteractiveAdapterInvocation, runInteractiveAdapter } from '../lib/env.js';
 import { getRepoHealth, loadRepoManifest } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
 
@@ -138,9 +139,23 @@ function buildTriagePrompt(workspaceRoot: string, ref: IssueRef) {
     '',
     buildSpecialistContext(workspaceRoot, ref.repo),
     '',
+    'Triage mode contract:',
+    '- This is planning and issue triage only. Do not implement code.',
+    '- Do not edit repository files, create branches, commit changes, open pull requests, run formatters, or create implementation artifacts.',
+    '- Use read-only inspection only: GitHub issue/PR context, docs, safe logs, and read-only provider/API checks when credentials are available.',
+    '- Treat client data, secrets, payment details, private URLs, and raw PII as confidential. Do not copy them into GitHub comments or local files.',
+    '- If Codex offers a Plan mode, stay in Plan mode for this session. Do not switch into implementation mode.',
+    '',
+    'Interactive triage workflow:',
+    '- Use @grill-me: ask blocking clarification questions one at a time and wait for the user answer before finalizing the plan.',
+    '- If a question can be answered safely by read-only investigation, do that investigation and summarize only non-sensitive facts.',
+    '- Stop when the issue has a clear owner repo, problem statement, acceptance criteria, risks, dependencies, and validation commands.',
+    '',
     'Goal:',
-    '- Clarify the problem (@grill-me), acceptance criteria, owner repo, risk, dependencies, and validation commands.',
-    '- Produce a compact implementation-ready battle plan.',
+    '- Produce a compact implementation-ready battle plan, but do not implement it.',
+    '- Post the final triage notes back to this GitHub issue using [@github](plugin://github@openai-curated) or `gh issue comment`.',
+    '- The GitHub issue comment must include: owner repo, diagnosis or remaining unknowns, acceptance criteria, implementation plan, validation commands, dependencies/blockers, and a concise safe client-facing summary when relevant.',
+    '- After posting the issue comment, tell the user whether the issue is ready to move to `ready-to-engage` or what blocker remains.',
     '- Keep context scoped; ask for more information if needed.',
     '',
     'Issue body:',
@@ -155,10 +170,13 @@ function repoEntryForGitHub(workspaceRoot: string, githubRepo: string) {
 
 function repoWorkspaceForGitHub(workspaceRoot: string, githubRepo: string) {
   const repo = repoEntryForGitHub(workspaceRoot, githubRepo);
-  if (!repo) return workspaceRoot;
+  if (repo) {
+    const health = getRepoHealth(workspaceRoot, repo);
+    return health.checkedOut ? health.resolvedPath : workspaceRoot;
+  }
 
-  const health = getRepoHealth(workspaceRoot, repo);
-  return health.checkedOut ? health.resolvedPath : workspaceRoot;
+  const allyIssueRepo = resolveAllyIssueRepo(workspaceRoot, githubRepo);
+  return allyIssueRepo?.issueRepoCheckedOut ? allyIssueRepo.issueRepoPath : workspaceRoot;
 }
 
 export function runIssueNext(workspaceRoot: string, options: IssueNextOptions | string = {}) {
@@ -200,7 +218,7 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
       })
     : null;
   const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
-  const adapterCommand = getAdapterInvocation(workspaceRoot, adapterCwd).display;
+  const adapterCommand = getInteractiveAdapterInvocation(workspaceRoot, adapterCwd).display;
   const campaignStatus = options.markReady
     ? setCampaignStatus(options.issue, 'ready-to-engage', { confirm: options.confirmStatus })
     : null;
@@ -210,6 +228,6 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
     return { prompt, artifact, launched: false, adapterCommand, campaignStatus, contextSummary };
   }
 
-  const launch = runAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
+  const launch = runInteractiveAdapter(workspaceRoot, prompt, { cwd: adapterCwd });
   return { prompt, artifact, launched: launch.launched, adapterCommand: launch.invocation.display, campaignStatus, contextSummary, launchError: launch.error };
 }
