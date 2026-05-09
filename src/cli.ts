@@ -269,7 +269,7 @@ function createE2EOutput(output: Output, customOutput: boolean): E2EOutput {
   };
 }
 
-function printIssueHandoff(output: Output, result: IssueHandoffResult) {
+function printIssueHandoff(output: Output, result: IssueHandoffResult, options: { suppressOutcome?: boolean } = {}) {
   output(`Adapter: ${result.adapterCommand}${result.launched ? ' (launched)' : ' (not launched)'}`);
   if (result.launchError) output(`Adapter error: ${result.launchError}`);
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
@@ -301,7 +301,7 @@ function printIssueHandoff(output: Output, result: IssueHandoffResult) {
   }
   if (result.closeoutError) output(`triage closeout error: ${result.closeoutError}`);
   output(result.prompt);
-  output(issueTriageOutcome(result));
+  if (!options.suppressOutcome) output(issueTriageOutcome(result));
 }
 
 function issueTriageOutcome(result: IssueHandoffResult) {
@@ -1236,7 +1236,32 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         return;
       }
       if (!('issues' in result)) {
-        printIssueHandoff(output, result);
+        const canLaunchAfterPreview =
+          Boolean(opts.issue) && interactive && opts.dryRun !== true && opts.launch !== true && !result.launched && !result.launchError;
+        printIssueHandoff(output, result, { suppressOutcome: canLaunchAfterPreview });
+        if (canLaunchAfterPreview && opts.issue) {
+          const launch = await promptConfirmation(
+            output,
+            input,
+            `Start issue triage handoff for ${opts.issue} now? This will run \`warroom issue triage --issue ${opts.issue} --launch --mark-ready --confirm-status\`. [y/N]`
+          );
+          if (!launch) {
+            output('Outcome: no issue triage handoff started.');
+            return;
+          }
+
+          output(`Triaging ${opts.issue}`);
+          const launched = runIssueTriage(workspaceRoot, {
+            issue: opts.issue,
+            label: opts.label,
+            markReady: true,
+            confirmStatus: true,
+            dryRun: false,
+            writeArtifact: opts.writeArtifact,
+          });
+          if ('issues' in launched) printIssueList(output, launched);
+          else printIssueHandoff(output, launched);
+        }
         return;
       }
 

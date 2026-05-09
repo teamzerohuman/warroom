@@ -449,6 +449,37 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('prompts from a direct issue triage dry run into a launched handoff', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const input = Readable.from(['yes\n']);
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      await program.parseAsync(['node', 'warroom', 'issue', 'triage', '--issue', 'TeamFloPay/sdk#4']);
+
+      expect(lines).toContain(
+        'Start issue triage handoff for TeamFloPay/sdk#4 now? This will run `warroom issue triage --issue TeamFloPay/sdk#4 --launch --mark-ready --confirm-status`. [y/N]'
+      );
+      expect(lines).not.toContain('Outcome: dry run only; no LLM handoff was launched.');
+      expect(lines).toContain('Triaging TeamFloPay/sdk#4');
+      expect(lines.some((line) => line.includes('Adapter: codex --model gpt-5.5 ') && line.endsWith(' <prompt> (launched)'))).toBe(true);
+      expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/sdk/issues/4#issuecomment-triage');
+      expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#4 -> ready-to-engage');
+      expect(lines.at(-1)).toBe('Outcome: interactive issue triage session completed. Campaign status updated to ready-to-engage.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
   it('does not move a triaged issue when no ready triage notes were posted', async () => {
     const root = makeDevFixture();
     const bin = path.join(root, 'bin');
