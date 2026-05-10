@@ -9,11 +9,13 @@ export type LlmUsageContext = {
   repo?: string | null;
   runDir?: string | null;
   commandRunId?: string | null;
+  taskTitle?: string | null;
 };
 
 export type LlmUsageEntry = {
   id: string;
   timestamp: string;
+  taskTitle: string | null;
   issue: string | null;
   command: string;
   stage: string;
@@ -116,6 +118,10 @@ export function issueUsagePaths(workspaceRoot: string, issue: string) {
     ledgerPath: path.join(dir, 'usage-ledger.json'),
     summaryPath: path.join(dir, 'usage-summary.md'),
   };
+}
+
+export function llmUsageTaskTitle(context: LlmUsageContext) {
+  return context.taskTitle ?? `[${context.issue ?? 'pending-issue'}] ${context.command}/${context.stage}`;
 }
 
 function readJson<T>(filePath: string, fallback: T): T {
@@ -273,6 +279,7 @@ function entryCost(workspaceRoot: string, entry: Omit<LlmUsageEntry, 'costUsd' |
 function entryWithCurrentCost(workspaceRoot: string, entry: LlmUsageEntry): LlmUsageEntry {
   return {
     ...entry,
+    taskTitle: entry.taskTitle ?? llmUsageTaskTitle(entry),
     ...entryCost(workspaceRoot, entry),
   };
 }
@@ -315,6 +322,7 @@ function buildEntry(
   const baseEntry: Omit<LlmUsageEntry, 'costUsd' | 'costUnavailableReason'> = {
     id: `${timestamp}-${context.command}-${context.stage}-${Math.random().toString(36).slice(2, 8)}`,
     timestamp,
+    taskTitle: llmUsageTaskTitle(context),
     issue: context.issue ?? null,
     command: context.command,
     stage: context.stage,
@@ -436,11 +444,18 @@ export function attachRunUsageToIssue(workspaceRoot: string, runDir: string | nu
   if (!runDir) return { attached: 0, warning: null as string | null };
   try {
     const runUsage = readRunUsage(runDir);
-    const migrated = runUsage.entries.map((entry) => ({
-      ...entry,
-      issue,
-      migratedFromRunDir: entry.migratedFromRunDir ?? runDir,
-    }));
+    const migrated = runUsage.entries.map((entry) => {
+      const taskTitle =
+        !entry.taskTitle || entry.taskTitle.startsWith('[pending-issue]')
+          ? llmUsageTaskTitle({ ...entry, issue, taskTitle: null })
+          : entry.taskTitle;
+      return {
+        ...entry,
+        taskTitle,
+        issue,
+        migratedFromRunDir: entry.migratedFromRunDir ?? runDir,
+      };
+    });
     writeRunUsage(runDir, migrated);
     appendEntriesToIssueLedger(workspaceRoot, issue, migrated);
     return { attached: migrated.length, warning: null };
@@ -460,7 +475,11 @@ export function refreshIssueUsageLedgerCosts(workspaceRoot: string, issue: strin
   const entries = entriesWithCurrentCosts(workspaceRoot, ledger.entries);
   const changed = entries.some((entry, index) => {
     const previous = ledger.entries[index];
-    return previous?.costUsd !== entry.costUsd || previous?.costUnavailableReason !== entry.costUnavailableReason;
+    return (
+      previous?.taskTitle !== entry.taskTitle ||
+      previous?.costUsd !== entry.costUsd ||
+      previous?.costUnavailableReason !== entry.costUnavailableReason
+    );
   });
   if (!changed) return false;
 

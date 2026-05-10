@@ -14,7 +14,13 @@ import { runCommitCreate } from '../src/commands/commit-create.js';
 import { runDoctor } from '../src/commands/doctor.js';
 import { runDevStatus } from '../src/commands/dev-link.js';
 import { getAdapterInvocation, getEnvStatus, getInteractiveAdapterInvocation, runAdapter, runInteractiveAdapter } from '../src/lib/env.js';
-import { formatLlmUsageSummary, recordLlmAdapterUsage, refreshIssueUsageLedgerCosts, summarizeIssueUsage } from '../src/lib/llm-usage.js';
+import {
+  attachRunUsageToIssue,
+  formatLlmUsageSummary,
+  recordLlmAdapterUsage,
+  refreshIssueUsageLedgerCosts,
+  summarizeIssueUsage,
+} from '../src/lib/llm-usage.js';
 import { runMapsAssign } from '../src/commands/maps-assign.js';
 import { runMapsStudy } from '../src/commands/maps-study.js';
 import { runSync } from '../src/commands/sync.js';
@@ -1688,6 +1694,75 @@ describe('phase-1 CLI', () => {
     expect(prompt).toContain('`SENTRY_AUTH_TOKEN`');
     expect(prompt).toContain('Sentry MCP/read-only inspection');
     expect(prompt).not.toContain('sentry_fixture');
+  });
+
+  it('prepends issue task labels to adapter prompts and usage entries', () => {
+    const root = makeDevFixture();
+    const promptCapturePath = path.join(root, 'labeled-prompt.txt');
+    const adapterPath = path.join(root, 'fake-codex');
+    writeFileSync(adapterPath, '#!/bin/sh\ncat > "$WARROOM_PROMPT_CAPTURE_PATH"\nexit 0\n');
+    chmodSync(adapterPath, 0o755);
+    writeFileSync(
+      path.join(root, '.env.local'),
+      `LLM_ADAPTER=codex\nCODEX_COMMAND=${adapterPath}\nWARROOM_PROMPT_CAPTURE_PATH=${promptCapturePath}\n`
+    );
+
+    const result = runAdapter(root, 'War Room issue triage handoff for TeamFloPay/backend#666', {
+      cwd: root,
+      usage: {
+        issue: 'TeamFloPay/backend#666',
+        command: 'issue-triage',
+        stage: 'interactive-triage',
+        repo: 'TeamFloPay/backend',
+        commandRunId: 'fixture-command-run',
+      },
+    });
+
+    expect(result.launched).toBe(true);
+    const prompt = readFileSync(promptCapturePath, 'utf8');
+    expect(prompt.startsWith('[TeamFloPay/backend#666] issue-triage/interactive-triage')).toBe(true);
+    expect(prompt).toContain('Task title: `[TeamFloPay/backend#666] issue-triage/interactive-triage`.');
+    expect(prompt).toContain('Command run id: `fixture-command-run`.');
+
+    const ledgerPath = path.join(root, '.warroom', 'runs', 'issues', 'TeamFloPay__backend__666', 'usage-ledger.json');
+    const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')) as { entries: Array<{ taskTitle: string | null }> };
+    expect(ledger.entries[0]?.taskTitle).toBe('[TeamFloPay/backend#666] issue-triage/interactive-triage');
+  });
+
+  it('relabels pending issue-create usage when attaching it to the created issue', () => {
+    const root = mkdtempSync(path.join(tmpdir(), 'warroom-usage-'));
+    const runDir = path.join(root, '.warroom', 'runs', 'issue-create-run');
+    mkdirSync(runDir, { recursive: true });
+    const invocation = {
+      command: 'codex',
+      args: ['exec', '--model', 'gpt-5.5', '-c', 'model_reasoning_effort="xhigh"', '--cd', root, '-'],
+      display: 'codex exec --model gpt-5.5 -c model_reasoning_effort="xhigh"',
+      cwd: root,
+      mode: 'foreground' as const,
+    };
+
+    recordLlmAdapterUsage(
+      root,
+      { issue: null, command: 'issue-create', stage: 'pm-session', runDir, commandRunId: 'fixture-run' },
+      invocation,
+      '[pending-issue] issue-create/pm-session\n\nWar Room issue creation PM session',
+      {
+        status: 0,
+        signal: null,
+        error: null,
+        stdout: null,
+        stderr: null,
+        outputText: null,
+      }
+    );
+
+    const migration = attachRunUsageToIssue(root, runDir, 'TeamFloPay/backend#666');
+
+    expect(migration.attached).toBe(1);
+    const ledgerPath = path.join(root, '.warroom', 'runs', 'issues', 'TeamFloPay__backend__666', 'usage-ledger.json');
+    const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')) as { entries: Array<{ taskTitle: string | null; issue: string | null }> };
+    expect(ledger.entries[0]?.issue).toBe('TeamFloPay/backend#666');
+    expect(ledger.entries[0]?.taskTitle).toBe('[TeamFloPay/backend#666] issue-create/pm-session');
   });
 
   it('reports SDK-to-demo link state from sibling checkouts', () => {

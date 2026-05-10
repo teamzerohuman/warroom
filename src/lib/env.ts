@@ -2,7 +2,7 @@ import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } fr
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { recordLlmAdapterUsage, type LlmUsageContext } from './llm-usage.js';
+import { llmUsageTaskTitle, recordLlmAdapterUsage, type LlmUsageContext } from './llm-usage.js';
 
 export type EnvStatus = {
   exampleExists: boolean;
@@ -91,9 +91,27 @@ function adapterRuntimePromptNote(workspaceRoot: string) {
   return lines.join('\n');
 }
 
-function promptWithAdapterRuntimeNote(workspaceRoot: string, prompt: string) {
+function adapterTaskPromptHeader(context: LlmUsageContext | undefined) {
+  if (!context) return null;
+  const title = llmUsageTaskTitle(context);
+  return [
+    title,
+    '',
+    'War Room task metadata:',
+    `- Task title: \`${title}\`.`,
+    context.issue ? `- Linked issue: \`${context.issue}\`.` : '- Linked issue: pending or not yet known.',
+    context.repo ? `- Repo: \`${context.repo}\`.` : null,
+    context.commandRunId ? `- Command run id: \`${context.commandRunId}\`.` : null,
+    '- Keep this task title visible in session history, logs, and any audit trail.',
+  ]
+    .filter((line): line is string => Boolean(line))
+    .join('\n');
+}
+
+function promptWithAdapterRuntimeNote(workspaceRoot: string, prompt: string, context: LlmUsageContext | undefined) {
+  const header = adapterTaskPromptHeader(context);
   const note = adapterRuntimePromptNote(workspaceRoot);
-  return note ? `${prompt}\n\n${note}` : prompt;
+  return [header, prompt, note].filter((section): section is string => Boolean(section)).join('\n\n');
 }
 
 function codexModelArgs(local: Map<string, string>, example: Map<string, string>, prefix = 'CODEX') {
@@ -185,7 +203,7 @@ export function getInteractiveAdapterInvocation(workspaceRoot: string, cwd = wor
 }
 
 export function runAdapter(workspaceRoot: string, prompt: string, options: AdapterRunOptions = {}): AdapterRunResult {
-  const adapterPrompt = promptWithAdapterRuntimeNote(workspaceRoot, prompt);
+  const adapterPrompt = promptWithAdapterRuntimeNote(workspaceRoot, prompt, options.usage);
   const invocation = withLastMessageOutput(
     getAdapterInvocation(workspaceRoot, options.cwd ?? workspaceRoot),
     options.outputLastMessagePath
@@ -349,7 +367,7 @@ function runInteractiveAdapterProcess(invocation: AdapterInvocation, env: NodeJS
 }
 
 export function runInteractiveAdapter(workspaceRoot: string, prompt: string, options: AdapterRunOptions = {}): AdapterRunResult {
-  const adapterPrompt = promptWithAdapterRuntimeNote(workspaceRoot, prompt);
+  const adapterPrompt = promptWithAdapterRuntimeNote(workspaceRoot, prompt, options.usage);
   const invocation = getInteractiveAdapterInvocation(workspaceRoot, options.cwd ?? workspaceRoot, adapterPrompt);
   process.stderr.write(`Launching interactive adapter: ${invocation.display}\n`);
   const result = runInteractiveAdapterProcess(invocation, {
