@@ -1206,7 +1206,7 @@ describe('phase-1 CLI', () => {
       const input = new PassThrough();
       const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line), input, interactive: true });
 
-      const answers = ['yes\n', 'yes\n'];
+      const answers = ['yes\n', 'yes\n', 'no\n'];
       const promptAnswers = setInterval(() => {
         const answer = answers.shift();
         if (answer) input.write(answer);
@@ -1227,7 +1227,8 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('PR review: complete');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> skirmish');
       expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#7 +skirmish; removed battlefield-active');
-      expectFinalOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expectBoxedOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expect(lines.at(-1)).toBe('Run `warroom pr merge --pr TeamFloPay/sdk#12` now? [y/N]');
       expect(Number(readFileSync(`${stateFile}.polls`, 'utf8'))).toBeGreaterThanOrEqual(4);
     } finally {
       restorePrReviewEnv();
@@ -1310,10 +1311,21 @@ describe('phase-1 CLI', () => {
 
     try {
       const lines: string[] = [];
-      const input = Readable.from(['1\n']);
+      const input = new PassThrough();
       const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
 
-      await program.parseAsync(['node', 'warroom', 'pr', 'review']);
+      const answers = ['1\n', 'no\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync(['node', 'warroom', 'pr', 'review']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
 
       expect(lines[0]).toBe('Open PRs for Campaign statuses battlefield-active, skirmish: 2');
       expect(lines[1]).toContain('1. TeamFloPay/sdk#12 Review active SDK work');
@@ -1331,7 +1343,8 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('must post one final reply on every listed thread'))).toBe(true);
       expect(lines.some((line) => line.includes('Do not stop before code changes only because the reaction could not be added.'))).toBe(true);
       expect(lines).toContain('PR review loop iterations: 2');
-      expectFinalOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expectBoxedOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expect(lines.at(-1)).toBe('Run `warroom pr merge --pr TeamFloPay/sdk#12` now? [y/N]');
     } finally {
       restorePrReviewEnv();
       process.env.PATH = originalPath;
@@ -1386,6 +1399,60 @@ describe('phase-1 CLI', () => {
         { encoding: 'utf8' }
       );
       expect(lastCommit.stdout.trim()).toBe('fix: address CodeRabbit review feedback');
+    } finally {
+      restorePrReviewEnv();
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('prompts from completed PR review into PR merge preflight', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    const stateFile = path.join(root, 'review-state.txt');
+    mkdirSync(bin, { recursive: true });
+    writePrReviewLoopGhFixture(bin, stateFile, { queue: 'empty', outstandingFirst: false });
+    writePrReviewLoopCodexFixture(bin, stateFile);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    const restorePrReviewEnv = setFastPrReviewPolling();
+
+    try {
+      const lines: string[] = [];
+      const input = new PassThrough();
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
+
+      const answers = ['yes\n', 'no\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync([
+          'node',
+          'warroom',
+          'pr',
+          'review',
+          '--pr',
+          'TeamFloPay/sdk#12',
+          '--issue',
+          'TeamFloPay/sdk#8',
+          '--launch',
+        ]);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
+
+      expectBoxedOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expect(lines).toContain('Run `warroom pr merge --pr TeamFloPay/sdk#12` now? [y/N]');
+      expect(lines).toContain('Starting PR merge for TeamFloPay/sdk#12');
+      expect(lines).toContain('PR merge: preflight only');
+      expect(lines).toContain('Merge readiness: clear');
+      expect(lines).toContain(
+        'Continue to run the demo Playwright e2e gate and merge this PR now? Type "skip" to merge without the Playwright gate. [y/N/skip]'
+      );
     } finally {
       restorePrReviewEnv();
       process.env.PATH = originalPath;
@@ -1537,10 +1604,21 @@ describe('phase-1 CLI', () => {
 
     try {
       const lines: string[] = [];
-      const input = Readable.from(['y\n']);
+      const input = new PassThrough();
       const program = buildProgram({ cwd: root, output: (line) => lines.push(line), input, interactive: true });
 
-      await program.parseAsync(['node', 'warroom', 'pr', 'review']);
+      const answers = ['y\n', 'no\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync(['node', 'warroom', 'pr', 'review']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
 
       expect(lines[0]).toBe('Open PRs for Campaign statuses battlefield-active, skirmish: 1');
       expect(lines[1]).toContain('TeamFloPay/backend#657 Remove Recurly & Chargebee Support');
@@ -1553,7 +1631,8 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Issue labels: updated TeamFloPay/backend#632 +skirmish; removed battlefield-active');
       expect(lines).toContain('PR review loop 1: no outstanding CodeRabbit feedback remains.');
       expect(lines.some((line) => line.includes('PR https://github.com/TeamFloPay/backend/pull/657'))).toBe(true);
-      expectFinalOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expectBoxedOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
+      expect(lines.at(-1)).toBe('Run `warroom pr merge --pr TeamFloPay/backend#657` now? [y/N]');
     } finally {
       restorePrReviewEnv();
       process.env.PATH = originalPath;

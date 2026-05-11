@@ -696,6 +696,98 @@ async function promptPrMergeFollowUps(
   }
 }
 
+type PrMergeLiveOutput = {
+  e2eStatus?: (message: string) => void;
+  e2eOutput?: E2EOutput;
+  mergeStatus?: (message: string) => void;
+};
+
+async function runInteractivePrMergeFlow(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  options: {
+    pr: string;
+    issue?: string;
+    summary?: string;
+    postSummary?: boolean;
+    confirmSummary?: boolean;
+    issueComment?: boolean;
+    cleanupLocal?: boolean;
+    confirmCleanup?: boolean;
+    writeArtifact?: boolean;
+    liveOutput?: PrMergeLiveOutput;
+  }
+) {
+  const baseOptions = {
+    pr: options.pr,
+    issue: options.issue,
+    summary: options.summary,
+    postSummary: options.postSummary || options.confirmSummary,
+    confirmSummary: options.confirmSummary,
+    issueComment: options.issueComment,
+    cleanupLocal: options.cleanupLocal || options.confirmCleanup,
+    confirmCleanup: options.confirmCleanup,
+    writeArtifact: options.writeArtifact,
+    ...(options.liveOutput ?? {}),
+  };
+
+  let confirmedResult = await runPrMerge(workspaceRoot, baseOptions);
+  printPrPlan(output, confirmedResult);
+  if (confirmedResult.mergeChangelog?.required && confirmedResult.mergeChangelog.status === 'failed') process.exitCode = 1;
+
+  if (!confirmedResult.merged) {
+    const blocked = (confirmedResult.mergeReadiness?.blocked.length ?? 0) > 0;
+    let allowUnresolvedReviewThreads = false;
+    let skipMergeE2E = false;
+    let mergeChoice: 'confirm' | 'skip' | 'cancel';
+    if (blocked) {
+      mergeChoice = await promptBlockedMergeConfirmation(
+        output,
+        input,
+        'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to allow unresolved review threads if no other blockers remain. [y/N/skip]'
+      );
+      allowUnresolvedReviewThreads = mergeChoice === 'skip';
+    } else {
+      mergeChoice = await promptMergeConfirmation(
+        output,
+        input,
+        'Continue to run the demo Playwright e2e gate and merge this PR now? Type "skip" to merge without the Playwright gate. [y/N/skip]'
+      );
+      skipMergeE2E = mergeChoice === 'skip';
+    }
+
+    if (mergeChoice !== 'cancel') {
+      output(
+        allowUnresolvedReviewThreads
+          ? 'Running confirmed PR merge while allowing unresolved review threads...'
+          : skipMergeE2E
+            ? 'Running confirmed PR merge without demo Playwright e2e...'
+            : 'Running confirmed PR merge...'
+      );
+      confirmedResult = await runPrMerge(workspaceRoot, {
+        ...baseOptions,
+        confirm: true,
+        skipMergeE2E,
+        allowUnresolvedReviewThreads,
+      });
+      printPrPlan(output, confirmedResult);
+      if (confirmedResult.mergeChangelog?.required && confirmedResult.mergeChangelog.status === 'failed') process.exitCode = 1;
+    }
+  }
+
+  if (!confirmedResult.merged) return;
+  if (confirmedResult.mergeChangelog?.required && confirmedResult.mergeChangelog.status === 'failed') return;
+
+  await promptPrMergeFollowUps(workspaceRoot, output, input, {
+    pr: options.pr,
+    issue: confirmedResult.issue ?? options.issue,
+    summary: options.summary,
+    confirmSummary: options.confirmSummary,
+    confirmCleanup: options.confirmCleanup,
+  });
+}
+
 function printPrReviewQueue(output: Output, result: PrReviewQueueResult, options: { numbered?: boolean; suppressOutcome?: boolean } = {}) {
   output(`Open PRs for Campaign statuses ${result.statuses.join(', ')}: ${result.prs.length}`);
   result.prs.forEach((pr, index) => {
@@ -968,7 +1060,7 @@ async function promptPrReviewAfterPrCreate(
   output: Output,
   input: Input,
   result: PrCreateResult,
-  options: { writeArtifact?: boolean }
+  options: { writeArtifact?: boolean; liveMergeOutput?: PrMergeLiveOutput }
 ) {
   if (!result.created) return;
   const prRef = prRefFromCreateResult(result);
@@ -989,6 +1081,37 @@ async function promptPrReviewAfterPrCreate(
   });
   printPrPlan(output, review);
   if (review.launchError) process.exitCode = 1;
+  await promptPrMergeAfterPrReview(workspaceRoot, output, input, review, {
+    pr: prRef,
+    writeArtifact: options.writeArtifact,
+    liveOutput: options.liveMergeOutput,
+  });
+}
+
+async function promptPrMergeAfterPrReview(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  result: PrPlanResult,
+  options: { pr: string; writeArtifact?: boolean; liveOutput?: PrMergeLiveOutput }
+) {
+  if (result.action !== 'review' || result.launchError || !result.prReviewLoop?.completed) return;
+
+  const mergePr = await promptConfirmation(output, input, `Run \`warroom pr merge --pr ${options.pr}\` now? [y/N]`);
+  if (!mergePr) return;
+
+  output(`Starting PR merge for ${options.pr}`);
+  try {
+    await runInteractivePrMergeFlow(workspaceRoot, output, input, {
+      pr: options.pr,
+      issue: result.issue ?? undefined,
+      writeArtifact: options.writeArtifact,
+      liveOutput: options.liveOutput ?? { e2eStatus: output, mergeStatus: output },
+    });
+  } catch (error) {
+    output(`PR merge failed: ${error instanceof Error ? error.message : String(error)}`);
+    process.exitCode = 1;
+  }
 }
 
 async function promptIssueTriageAfterCreate(
@@ -1116,6 +1239,11 @@ export function buildProgram(options: BuildProgramOptions = {}) {
   const customOutput = options.output !== undefined;
   const input = options.input ?? process.stdin;
   const interactive = options.interactive ?? Boolean(input.isTTY);
+  const liveMergeOutput = (): PrMergeLiveOutput => ({
+    e2eStatus: output,
+    e2eOutput: createE2EOutput(output, customOutput),
+    mergeStatus: output,
+  });
   const program = new Command();
 
   program
@@ -1620,6 +1748,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       if (interactive && result.created) {
         await promptPrReviewAfterPrCreate(workspaceRoot, output, input, result, {
           writeArtifact: opts.writeArtifact,
+          liveMergeOutput: liveMergeOutput(),
         });
         return;
       }
@@ -1652,6 +1781,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         printPrCreate(output, created);
         await promptPrReviewAfterPrCreate(workspaceRoot, output, input, created, {
           writeArtifact: opts.writeArtifact,
+          liveMergeOutput: liveMergeOutput(),
         });
       } catch (error) {
         output(`PR create failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -1719,6 +1849,13 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           });
           printPrPlan(output, review);
           if (review.launchError) process.exitCode = 1;
+          if (interactive) {
+            await promptPrMergeAfterPrReview(workspaceRoot, output, input, review, {
+              pr: inferredPr,
+              writeArtifact: opts.writeArtifact,
+              liveOutput: liveMergeOutput(),
+            });
+          }
           return;
         }
 
@@ -1741,6 +1878,11 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         });
         printPrPlan(output, review);
         if (review.launchError) process.exitCode = 1;
+        await promptPrMergeAfterPrReview(workspaceRoot, output, input, review, {
+          pr: selectedPr,
+          writeArtifact: opts.writeArtifact,
+          liveOutput: liveMergeOutput(),
+        });
         return;
       }
 
@@ -1760,6 +1902,13 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       }
       printPrPlan(output, result);
       if (result.launchError) process.exitCode = 1;
+      if (interactive) {
+        await promptPrMergeAfterPrReview(workspaceRoot, output, input, result, {
+          pr: opts.pr,
+          writeArtifact: opts.writeArtifact,
+          liveOutput: liveMergeOutput(),
+        });
+      }
     });
   pr
     .command('merge')
