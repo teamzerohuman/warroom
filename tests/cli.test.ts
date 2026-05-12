@@ -2457,6 +2457,106 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('creates an OpenChangelog release note after SDK merge actions pass', async () => {
+    const { root, sdk, sdkRemote } = makeChangelogMergeFixture({ openchangelog: true });
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeChangelogMergeGhFixture(bin, sdkRemote);
+    writeOpenChangelogCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    const envKeys = [
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS',
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS',
+    ] as const;
+    const originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS = '0';
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS = '0';
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'merge', '--pr', 'TeamFloPay/sdk#655', '--confirm']);
+
+      const output = lines.join('\n');
+      expect(output).toContain('Merge changelog: passed');
+      expect(output).toContain('Changelog: ');
+      expect(output).toContain('(openchangelog, base main)');
+      expect(output).toContain('Changelog file: release-notes/v1.0.1.ready-sdk-pr.md');
+      expect(output).toContain('Changelog version: 1.0.1');
+
+      const remoteNote = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/main:release-notes/v1.0.1.ready-sdk-pr.md'], {
+        encoding: 'utf8',
+      });
+      expect(remoteNote.status).toBe(0);
+      expect(remoteNote.stdout).toContain('title: Ready SDK PR');
+      expect(remoteNote.stdout).toContain('publishedAt:');
+      expect(remoteNote.stdout).toContain('- SDK');
+      expect(remoteNote.stdout).toContain('Ready SDK PR updates the SDK behavior.');
+
+      const remoteChangelog = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/main:CHANGELOG.md'], {
+        encoding: 'utf8',
+      });
+      expect(remoteChangelog.status).not.toBe(0);
+
+      const remoteSubject = spawnSync('git', ['--git-dir', sdkRemote, 'log', '-1', '--pretty=%s', 'refs/heads/main'], {
+        encoding: 'utf8',
+      });
+      expect(remoteSubject.stdout.trim()).toBe('docs(changelog): add release notes for 1.0.1 [skip-ci]');
+    } finally {
+      process.env.PATH = originalPath;
+      for (const key of envKeys) {
+        const value = originalEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it('rejects OpenChangelog adapters that modify existing release notes', async () => {
+    const { root, sdk, sdkRemote } = makeChangelogMergeFixture({ openchangelog: true });
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeChangelogMergeGhFixture(bin, sdkRemote);
+    writeOpenChangelogModifyExistingCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    const envKeys = [
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS',
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS',
+    ] as const;
+    const originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS = '0';
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS = '0';
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'pr', 'merge', '--pr', 'TeamFloPay/sdk#655', '--confirm']);
+
+      const output = lines.join('\n');
+      expect(output).toContain('Merge changelog: failed');
+      expect(output).toContain('LLM adapter must create a new OpenChangelog release-note file');
+
+      const remoteNote = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/main:release-notes/v1.0.0.initial-release.md'], {
+        encoding: 'utf8',
+      });
+      expect(remoteNote.stdout).toContain('The first SDK release is available.');
+      expect(remoteNote.stdout).not.toContain('Rewritten existing note.');
+    } finally {
+      process.env.PATH = originalPath;
+      for (const key of envKeys) {
+        const value = originalEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it('adds a targeted diagnostic when backend startup fails on Sentry profiling native addon load', async () => {
     const { root } = makeMergeFixture();
     const bin = path.join(root, 'bin');
@@ -3087,7 +3187,7 @@ console.log('demo e2e passed');
   return { root, backend, demo, backendRemote };
 }
 
-function makeChangelogMergeFixture() {
+function makeChangelogMergeFixture(options: { openchangelog?: boolean } = {}) {
   const base = mkdtempSync(path.join(tmpdir(), 'warroom-changelog-'));
   const root = path.join(base, 'warroom');
   const sdk = path.join(base, 'sdk');
@@ -3098,6 +3198,13 @@ function makeChangelogMergeFixture() {
   initGitRepo(sdk);
   initBareRemote(sdkRemote);
   spawnSync('git', ['remote', 'add', 'origin', sdkRemote], { cwd: sdk });
+
+  const changelogConfig = options.openchangelog
+    ? `changelog:
+        enabled: true
+        format: openchangelog
+        path: release-notes`
+    : 'changelog: true';
 
   writeFileSync(
     path.join(root, 'repos.yaml'),
@@ -3116,7 +3223,7 @@ repos:
     status: active
     merge:
       playwright: false
-      changelog: true
+      ${changelogConfig}
     owner: sdk
     description: SDK packages.
     specialist:
@@ -3129,7 +3236,26 @@ repos:
   );
   writeResourcesFixture(root);
   writeFileSync(path.join(sdk, 'package.json'), JSON.stringify({ name: '@flopay/sdk', version: '1.0.0' }, null, 2));
-  writeFileSync(path.join(sdk, 'CHANGELOG.md'), '# Changelog\n\n## 1.0.0\n- Initial release.\n');
+  if (options.openchangelog) {
+    mkdirSync(path.join(sdk, 'release-notes'), { recursive: true });
+    writeFileSync(
+      path.join(sdk, 'release-notes', 'v1.0.0.initial-release.md'),
+      [
+        '---',
+        'title: Initial release',
+        'description: The first SDK release is available.',
+        'publishedAt: "2026-01-01T00:00:00.000Z"',
+        'tags:',
+        '  - SDK',
+        '---',
+        '',
+        'The first SDK release is available.',
+        '',
+      ].join('\n')
+    );
+  } else {
+    writeFileSync(path.join(sdk, 'CHANGELOG.md'), '# Changelog\n\n## 1.0.0\n- Initial release.\n');
+  }
   commitAll(sdk, 'fixture sdk release');
   const pushMain = spawnSync('git', ['push', '-u', 'origin', 'main'], { cwd: sdk, encoding: 'utf8' });
   if (pushMain.status !== 0) throw new Error(pushMain.stderr);
@@ -4743,6 +4869,57 @@ fs.writeFileSync(
   path.join(cwd, 'CHANGELOG.md'),
   '# Changelog\\n\\n## 1.0.1\\n- Ready SDK PR updates the SDK behavior.\\n\\n## 1.0.0\\n- Initial release.\\n'
 );
+process.exit(0);
+`
+  );
+  chmodSync(codexPath, 0o755);
+}
+
+function writeOpenChangelogCodexFixture(bin: string) {
+  const codexPath = path.join(bin, 'codex');
+  writeFileSync(
+    codexPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const fs = require('node:fs');
+const path = require('node:path');
+const cdIndex = args.indexOf('--cd');
+const cwd = cdIndex === -1 ? process.cwd() : args[cdIndex + 1];
+const releaseNotes = path.join(cwd, 'release-notes');
+fs.mkdirSync(releaseNotes, { recursive: true });
+fs.writeFileSync(
+  path.join(releaseNotes, 'v1.0.1.ready-sdk-pr.md'),
+  [
+    '---',
+    'title: Ready SDK PR',
+    'description: Ready SDK PR updates the SDK behavior.',
+    'publishedAt: "2026-05-12T09:00:00.000Z"',
+    'tags:',
+    '  - SDK',
+    '  - Improvement',
+    '---',
+    '',
+    'Ready SDK PR updates the SDK behavior.',
+    ''
+  ].join('\\n')
+);
+process.exit(0);
+`
+  );
+  chmodSync(codexPath, 0o755);
+}
+
+function writeOpenChangelogModifyExistingCodexFixture(bin: string) {
+  const codexPath = path.join(bin, 'codex');
+  writeFileSync(
+    codexPath,
+    `#!/usr/bin/env node
+const args = process.argv.slice(2);
+const fs = require('node:fs');
+const path = require('node:path');
+const cdIndex = args.indexOf('--cd');
+const cwd = cdIndex === -1 ? process.cwd() : args[cdIndex + 1];
+fs.appendFileSync(path.join(cwd, 'release-notes', 'v1.0.0.initial-release.md'), '\\nRewritten existing note.\\n');
 process.exit(0);
 `
   );

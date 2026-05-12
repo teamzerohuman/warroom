@@ -1,5 +1,5 @@
 import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
 import * as http from 'node:http';
 import * as https from 'node:https';
 import { isIP } from 'node:net';
@@ -94,6 +94,8 @@ export type MergeChangelogResult = {
   base: string;
   currentBranch: string | null;
   changelogPath: string | null;
+  changelogFormat: 'keep-a-changelog' | 'openchangelog';
+  changelogFile: string | null;
   version: string | null;
   actionsHeadSha: string | null;
   actionsRuns: Array<{
@@ -359,18 +361,28 @@ function mergePlaywrightSkipRequirement() {
   };
 }
 
-function mergeChangelogRequirement(workspaceRoot: string, githubRepo: string) {
+type ChangelogRequirement = {
+  required: boolean;
+  skipReason: string | null;
+  config: {
+    format: 'keep-a-changelog' | 'openchangelog';
+    path: string;
+  } | null;
+};
+
+function mergeChangelogRequirement(workspaceRoot: string, githubRepo: string): ChangelogRequirement {
   const repo = repoEntryForGitHub(workspaceRoot, githubRepo);
   if (!repo) {
     return {
       required: false,
-      skipReason: `No mapped repo entry with merge.changelog: true for ${githubRepo}.`,
+      skipReason: `No mapped repo entry with merge.changelog enabled for ${githubRepo}.`,
+      config: null,
     };
   }
 
-  return repo.merge.changelog
-    ? { required: true, skipReason: null }
-    : { required: false, skipReason: `repos.yaml has merge.changelog: false for ${githubRepo}.` };
+  return repo.merge.changelog.enabled
+    ? { required: true, skipReason: null, config: repo.merge.changelog }
+    : { required: false, skipReason: `repos.yaml has merge.changelog disabled for ${githubRepo}.`, config: repo.merge.changelog };
 }
 
 function parsePrRef(value: string) {
@@ -2902,11 +2914,12 @@ function createMergeChangelogPlan(
   workspaceRoot: string,
   githubRepo: string,
   base: string,
-  requirement: { required: boolean; skipReason: string | null }
+  requirement: ChangelogRequirement
 ): MergeChangelogResult {
   const repoEntry = repoEntryForGitHub(workspaceRoot, githubRepo);
   const repo = repoEntry ? getRepoHealth(workspaceRoot, repoEntry) : null;
-  const changelogPath = repo?.checkedOut ? path.join(repo.resolvedPath, 'CHANGELOG.md') : null;
+  const changelogConfig = requirement.config ?? { format: 'keep-a-changelog' as const, path: 'CHANGELOG.md' };
+  const changelogPath = repo?.checkedOut ? path.join(repo.resolvedPath, changelogConfig.path) : null;
   const blocked: string[] = [];
 
   if (!requirement.required) {
@@ -2919,6 +2932,8 @@ function createMergeChangelogPlan(
       base,
       currentBranch: repo?.branch ?? null,
       changelogPath: null,
+      changelogFormat: changelogConfig.format,
+      changelogFile: null,
       version: null,
       actionsHeadSha: null,
       actionsRuns: [],
@@ -2934,7 +2949,12 @@ function createMergeChangelogPlan(
   if (!repoEntry) blocked.push(`repos.yaml does not define a mapped checkout for ${githubRepo}.`);
   if (repo && !repo.checkedOut) blocked.push(`Mapped checkout is missing: ${repo.resolvedPath}`);
   if (repo?.clean === false) blocked.push(`Mapped checkout has local changes: ${repo.resolvedPath}`);
-  if (changelogPath && !existsSync(changelogPath)) blocked.push(`CHANGELOG.md is missing: ${changelogPath}`);
+  if (changelogPath && changelogConfig.format === 'keep-a-changelog' && !existsSync(changelogPath)) {
+    blocked.push(`${changelogConfig.path} is missing: ${changelogPath}`);
+  }
+  if (changelogPath && changelogConfig.format === 'openchangelog' && existsSync(changelogPath) && !statSync(changelogPath).isDirectory()) {
+    blocked.push(`OpenChangelog release notes path must be a directory: ${changelogPath}`);
+  }
 
   return {
     status: 'planned',
@@ -2945,6 +2965,8 @@ function createMergeChangelogPlan(
     base,
     currentBranch: repo?.branch ?? null,
     changelogPath,
+    changelogFormat: changelogConfig.format,
+    changelogFile: null,
     version: null,
     actionsHeadSha: null,
     actionsRuns: [],
@@ -3106,6 +3128,32 @@ function readPackageVersions(repoPath: string) {
   return versions;
 }
 
+function readOpenChangelogNotes(changelogPath: string) {
+  if (!existsSync(changelogPath)) return [];
+  return readdirSync(changelogPath, { withFileTypes: true })
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.md'))
+    .map((entry) => {
+      const absolutePath = path.join(changelogPath, entry.name);
+      return {
+        file: entry.name,
+        content: readFileSync(absolutePath, 'utf8'),
+      };
+    })
+    .sort((a, b) => b.file.localeCompare(a.file))
+    .slice(0, 3);
+}
+
+function publicChangelogGuardrails() {
+  return [
+    '- This is a public, client-facing changelog. Write for merchants, developers, and operators who need to understand customer impact.',
+    '- Lead with customer-visible value and behavior changes. Translate implementation details into clear product outcomes.',
+    '- Do not mention War Room, internal workflow labels, local paths, CI logs, validation commands, private incidents, Sentry IDs, secrets, raw stack traces, customer PII, or private endpoints.',
+    '- Do not paste commit lists. Consolidate changes into a small number of meaningful bullets.',
+    '- Call out breaking changes, removed public APIs, migration work, or operational action required by merchants explicitly and calmly.',
+    '- Keep the tone factual and polished; avoid hype, blame, vague claims, and unsupported promises.',
+  ];
+}
+
 function buildChangelogPrompt(options: {
   prRef: string;
   issueRef: string | undefined;
@@ -3116,7 +3164,11 @@ function buildChangelogPrompt(options: {
     files?: Array<{ path?: string; additions?: number; deletions?: number }>;
   };
   versions: Array<{ file: string; name: string; version: string }>;
+  changelogFormat: 'keep-a-changelog' | 'openchangelog';
+  changelogPath: string;
   changelog: string;
+  existingOpenChangelogNotes?: Array<{ file: string; content: string }>;
+  nowIso: string;
 }) {
   const versions = options.versions.length
     ? options.versions.map((version) => `- ${version.name}@${version.version} (${version.file})`).join('\n')
@@ -3124,15 +3176,87 @@ function buildChangelogPrompt(options: {
   const files = options.pr.files?.length
     ? options.pr.files.map((file) => `- ${file.path ?? 'unknown'} (+${file.additions ?? 0}/-${file.deletions ?? 0})`).join('\n')
     : '- No PR files were returned by GitHub.';
+  const latestVersion = options.versions[0]?.version ?? null;
+  const releaseDate = options.nowIso.slice(0, 10);
+
+  if (options.changelogFormat === 'openchangelog') {
+    const examples = [
+      'Example OpenChangelog release note:',
+      '---',
+      'title: Checkout fallback improvements',
+      'description: Buyers now see only the payment methods that can complete successfully in their browser.',
+      `publishedAt: "${options.nowIso}"`,
+      'tags:',
+      '  - Improvement',
+      '  - Checkout',
+      '---',
+      '',
+      'Unsupported wallet options are now hidden automatically when the buyer browser cannot complete those flows. Card checkout remains available so shoppers can continue without extra warning screens.',
+      '',
+      '### What changed',
+      '',
+      '- PayPal and wallet options are shown only when the active browser and payment provider report them as available.',
+      '- Checkout falls back to card entry instead of displaying an in-app browser warning.',
+      '',
+      '### Developer notes',
+      '',
+      '- The legacy `InAppBrowserNotice` React export has been removed. Remove direct imports before upgrading.',
+    ].join('\n');
+    const existingNotes = options.existingOpenChangelogNotes?.length
+      ? options.existingOpenChangelogNotes
+          .map((note) => [`### ${note.file}`, truncateText(note.content, 1800)].join('\n'))
+          .join('\n\n')
+      : '(no existing OpenChangelog release notes found)';
+
+    return [
+      `Create an OpenChangelog release note for ${options.prRef}.`,
+      '',
+      'Target:',
+      `- Folder: ${options.changelogPath}`,
+      '- Create exactly one new Markdown file in that folder.',
+      `- Filename: use \`${latestVersion ? `v${latestVersion}` : releaseDate}.short-kebab-title.md\`. Keep it lowercase and stable.`,
+      '',
+      'OpenChangelog format:',
+      '- Use YAML frontmatter between `---` separators.',
+      '- Required frontmatter fields: `title`, `description`, `publishedAt`, and `tags`.',
+      '- `publishedAt` must be an ISO 8601 datetime. Use the current timestamp supplied below unless the release notes already imply a better release timestamp.',
+      '- The body is normal Markdown. Prefer short sections like `### What changed`, `### Why it matters`, and `### Developer notes` when useful.',
+      '',
+      'Rules:',
+      ...publicChangelogGuardrails(),
+      '- Edit only the new OpenChangelog Markdown file. Do not modify package files, source code, existing release notes, or legacy changelog files.',
+      '- Do not commit or push; War Room will do that after verifying the release-note file change.',
+      '',
+      examples,
+      '',
+      `Current UTC timestamp: ${options.nowIso}`,
+      `PR title: ${options.pr.title ?? 'unknown'}`,
+      `PR URL: ${options.pr.url ?? 'unknown'}`,
+      options.issueRef ? `Linked issue: ${options.issueRef}` : 'Linked issue: none supplied',
+      '',
+      'Detected package versions after release actions:',
+      versions,
+      '',
+      'Changed files:',
+      files,
+      '',
+      'PR body:',
+      truncateText(options.pr.body, 4000),
+      '',
+      'Existing OpenChangelog release notes for style reference:',
+      existingNotes,
+    ].join('\n');
+  }
 
   return [
     `Update CHANGELOG.md for ${options.prRef}.`,
     '',
     'Rules:',
+    ...publicChangelogGuardrails(),
     '- Edit CHANGELOG.md only.',
     '- Add one new top entry for the latest released version detected below.',
     '- Match the existing changelog style and keep the entry concise.',
-    '- Mention the PR and linked issue when useful, but do not include operational War Room details.',
+    '- Mention the PR and linked issue only when they add useful public context.',
     '- Do not commit or push; War Room will do that after verifying the file change.',
     '',
     `PR title: ${options.pr.title ?? 'unknown'}`,
@@ -3153,7 +3277,12 @@ function buildChangelogPrompt(options: {
   ].join('\n');
 }
 
-function gitStatusPaths(repoPath: string) {
+type GitStatusEntry = {
+  status: string;
+  path: string;
+};
+
+function gitStatusEntries(repoPath: string): GitStatusEntry[] {
   const status = spawnSync('git', ['status', '--short', '--untracked-files=all'], { cwd: repoPath, encoding: 'utf8' });
   if (status.status !== 0) {
     throw new Error(status.stderr.trim() || `git status failed with exit ${status.status ?? 'unknown'}.`);
@@ -3161,7 +3290,14 @@ function gitStatusPaths(repoPath: string) {
   return status.stdout
     .split(/\r?\n/)
     .filter(Boolean)
-    .map((line) => line.slice(3).trim().replace(/^"|"$/g, ''));
+    .map((line) => ({
+      status: line.slice(0, 2),
+      path: line.slice(3).trim().replace(/^"|"$/g, ''),
+    }));
+}
+
+function gitStatusPaths(repoPath: string) {
+  return gitStatusEntries(repoPath).map((entry) => entry.path);
 }
 
 function gitHeadSha(repoPath: string) {
@@ -3264,14 +3400,27 @@ async function runMergeChangelog(
 
     const versions = readPackageVersions(plan.path);
     const version = versions[0]?.version ?? null;
+    const changelogRelativePath = path.relative(plan.path, plan.changelogPath);
     const prompt = buildChangelogPrompt({
       prRef: options.pr ?? plan.repo,
       issueRef: options.issue,
       pr,
       versions,
-      changelog: readFileSync(plan.changelogPath, 'utf8'),
+      changelogFormat: plan.changelogFormat,
+      changelogPath: changelogRelativePath,
+      changelog:
+        plan.changelogFormat === 'keep-a-changelog' && existsSync(plan.changelogPath)
+          ? readFileSync(plan.changelogPath, 'utf8')
+          : '',
+      existingOpenChangelogNotes:
+        plan.changelogFormat === 'openchangelog' ? readOpenChangelogNotes(plan.changelogPath) : undefined,
+      nowIso: new Date().toISOString(),
     });
-    options.mergeStatus?.('Changelog: asking the LLM to update CHANGELOG.md');
+    options.mergeStatus?.(
+      plan.changelogFormat === 'openchangelog'
+        ? `Changelog: asking the LLM to create an OpenChangelog release note in ${changelogRelativePath}`
+        : `Changelog: asking the LLM to update ${changelogRelativePath}`
+    );
     const adapter = runAdapter(workspaceRoot, prompt, {
       cwd: plan.path,
       usage: {
@@ -3282,23 +3431,47 @@ async function runMergeChangelog(
         commandRunId: usage.commandRunId,
       },
     });
-    if (!adapter.launched) throw new Error(adapter.error ?? 'LLM adapter failed to update CHANGELOG.md.');
+    if (!adapter.launched) throw new Error(adapter.error ?? 'LLM adapter failed to update changelog.');
 
-    const changed = gitStatusPaths(plan.path);
-    if (!changed.includes('CHANGELOG.md')) {
-      throw new Error('LLM adapter completed but did not modify CHANGELOG.md.');
+    const statusEntries = gitStatusEntries(plan.path);
+    const changed = statusEntries.map((entry) => entry.path);
+    let changelogFile = changelogRelativePath;
+    if (plan.changelogFormat === 'openchangelog') {
+      const prefix = `${changelogRelativePath.replace(/\/$/, '')}/`;
+      const releaseNotes = statusEntries.filter(
+        (entry) => entry.path.startsWith(prefix) && entry.path.endsWith('.md')
+      );
+      if (releaseNotes.length !== 1) {
+        throw new Error(
+          `LLM adapter must create exactly one OpenChangelog Markdown file under ${changelogRelativePath}; changed files: ${changed.join(', ') || 'none'}.`
+        );
+      }
+      const releaseNote = releaseNotes[0]!;
+      if (releaseNote.status !== '??' && !releaseNote.status.includes('A')) {
+        throw new Error(
+          `LLM adapter must create a new OpenChangelog release-note file, not modify an existing one: ${releaseNote.path}.`
+        );
+      }
+      changelogFile = releaseNote.path;
+    } else if (!changed.includes(changelogRelativePath)) {
+      throw new Error(`LLM adapter completed but did not modify ${changelogRelativePath}.`);
     }
-    const unexpected = changed.filter((file) => file !== 'CHANGELOG.md');
+    const expectedFiles = new Set([changelogFile]);
+    const unexpected = changed.filter((file) => !expectedFiles.has(file));
     if (unexpected.length > 0) {
-      throw new Error(`LLM adapter modified files outside CHANGELOG.md: ${unexpected.join(', ')}.`);
+      throw new Error(`LLM adapter modified files outside the changelog target: ${unexpected.join(', ')}.`);
     }
 
-    const add = runGit(plan.path, ['add', 'CHANGELOG.md']);
-    if (add.status !== 0) throw new Error(add.stderr || `git add CHANGELOG.md failed with exit ${add.status ?? 'unknown'}.`);
+    const add = runGit(plan.path, ['add', changelogFile]);
+    if (add.status !== 0) throw new Error(add.stderr || `git add ${changelogFile} failed with exit ${add.status ?? 'unknown'}.`);
 
     const message = version
-      ? `docs(changelog): update for ${version} [skip-ci]`
-      : 'docs(changelog): update changelog [skip-ci]';
+      ? plan.changelogFormat === 'openchangelog'
+        ? `docs(changelog): add release notes for ${version} [skip-ci]`
+        : `docs(changelog): update for ${version} [skip-ci]`
+      : plan.changelogFormat === 'openchangelog'
+        ? 'docs(changelog): add release notes [skip-ci]'
+        : 'docs(changelog): update changelog [skip-ci]';
     const commit = runGit(plan.path, ['commit', '-m', message]);
     if (commit.status !== 0) throw new Error(commit.stderr || `git commit failed with exit ${commit.status ?? 'unknown'}.`);
 
@@ -3313,6 +3486,7 @@ async function runMergeChangelog(
       ...plan,
       status: 'passed',
       version,
+      changelogFile,
       actionsHeadSha,
       actionsRuns,
       durationMs: Date.now() - startedAt,
@@ -4252,8 +4426,10 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
       ? '- All demo Playwright e2e tests must pass before merging.'
       : '- Merge may proceed without the demo Playwright e2e gate for this repo.',
     mergeChangelog.required
-      ? `- After merge, wait for GitHub Actions on ${targetBase}, pull the latest ${targetBase}, update CHANGELOG.md with the LLM, and push a [skip-ci] changelog commit.`
-      : `- CHANGELOG.md update skipped: ${mergeChangelog.skipReason ?? 'merge.changelog is not enabled for this repo.'}`,
+      ? mergeChangelog.changelogFormat === 'openchangelog'
+        ? `- After merge, wait for GitHub Actions on ${targetBase}, pull the latest ${targetBase}, create one public OpenChangelog release-note file under ${mergeChangelog.changelogPath ?? 'the configured release-notes folder'} with the LLM, and push a [skip-ci] changelog commit.`
+        : `- After merge, wait for GitHub Actions on ${targetBase}, pull the latest ${targetBase}, update ${mergeChangelog.changelogPath ?? 'CHANGELOG.md'} with the LLM, and push a [skip-ci] changelog commit.`
+      : `- Changelog update skipped: ${mergeChangelog.skipReason ?? 'merge.changelog is not enabled for this repo.'}`,
     '- Merge only after explicit confirmation.',
     '- Post issue/PR summary and return local checkout to the default branch safely.',
   ];
@@ -4313,7 +4489,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
 
   const completionReadiness =
     mergeChangelog.required && mergeChangelog.status === 'failed'
-      ? { ...readiness, blocked: [...readiness.blocked, 'Required CHANGELOG.md update failed.'] }
+      ? { ...readiness, blocked: [...readiness.blocked, 'Required changelog update failed.'] }
       : readiness;
   const summaryPosts = buildSummaryPostPlan(resolvedOptions, summary, completionReadiness);
   const finalIssueComment = buildFinalIssueCommentPlan(

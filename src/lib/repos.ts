@@ -13,9 +13,18 @@ const SpecialistSchema = z.object({
   }),
 });
 
+const ChangelogSchema = z.union([
+  z.boolean(),
+  z.object({
+    enabled: z.boolean().default(true),
+    format: z.enum(['keep-a-changelog', 'openchangelog']).default('keep-a-changelog'),
+    path: z.string().optional(),
+  }),
+]);
+
 const MergeSchema = z.object({
   playwright: z.boolean().default(false),
-  changelog: z.boolean().default(false),
+  changelog: ChangelogSchema.default(false),
 });
 
 const RawRepoSchema = z.object({
@@ -37,7 +46,7 @@ const RepoSchema = RawRepoSchema.transform(({ merge, merge_playwright, ...repo }
   ...repo,
   merge: {
     playwright: merge.playwright ?? merge_playwright ?? false,
-    changelog: merge.changelog ?? false,
+    changelog: normalizeChangelogConfig(merge.changelog ?? false),
   },
 }));
 
@@ -71,6 +80,22 @@ export type RepoHealth = RepoEntry & {
   packageManager: string | null;
   nodeModules: boolean;
 };
+
+function normalizeChangelogConfig(changelog: z.infer<typeof ChangelogSchema>) {
+  if (typeof changelog === 'boolean') {
+    return {
+      enabled: changelog,
+      format: 'keep-a-changelog' as const,
+      path: 'CHANGELOG.md',
+    };
+  }
+
+  return {
+    enabled: changelog.enabled,
+    format: changelog.format,
+    path: changelog.path ?? (changelog.format === 'openchangelog' ? 'release-notes' : 'CHANGELOG.md'),
+  };
+}
 
 export function loadRepoManifest(workspaceRoot: string): RepoManifest {
   const manifestPath = path.join(workspaceRoot, 'repos.yaml');

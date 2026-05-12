@@ -13,7 +13,10 @@ repos:
     status: active
     merge:
       playwright: true
-      changelog: true
+      changelog:
+        enabled: true
+        format: openchangelog
+        path: release-notes
     owner: sdk
     description: SDK packages published as @flopay/*.
     specialist:
@@ -40,7 +43,10 @@ repos:
     status: active
     merge:
       playwright: true
-      changelog: false
+      changelog:
+        enabled: true
+        format: openchangelog
+        path: release-notes
     owner: backend
     description: Central API and server-side application.
     specialist:
