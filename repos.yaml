@@ -13,6 +13,9 @@ repos:
     status: active
     merge:
       playwright: true
+      bump:
+        enabled: true
+        command: pnpm bump:version
       changelog:
         enabled: true
         format: openchangelog
@@ -43,6 +46,9 @@ repos:
     status: active
     merge:
       playwright: true
+      bump:
+        enabled: true
+        command: npm run bump:version --
       changelog:
         enabled: true
         format: openchangelog
@@ -74,6 +80,7 @@ repos:
     status: active
     merge:
       playwright: false
+      bump: false
       changelog: false
     owner: infra
     description: Live infrastructure and operational configuration.
@@ -100,6 +107,7 @@ repos:
     status: active
     merge:
       playwright: true
+      bump: false
       changelog: false
     owner: app-demo
     description: Standalone SDK demo app after extraction from sdk/apps/demo.
@@ -130,6 +138,9 @@ repos:
     status: active
     merge:
       playwright: false
+      bump:
+        enabled: true
+        command: pnpm bump:version
       changelog: false
     owner: app-docs
     description: Standalone SDK documentation site after extraction from sdk/apps/docs.
@@ -156,6 +167,7 @@ repos:
     status: active
     merge:
       playwright: false
+      bump: false
       changelog: false
     owner: app-dashboard
     description: Standalone dashboard app after extraction from sdk/apps/dashboard.
@@ -182,6 +194,7 @@ repos:
     status: active
     merge:
       playwright: false
+      bump: false
       changelog: false
     owner: app-landing
     description: Standalone marketing site after extraction from sdk/apps/landing.

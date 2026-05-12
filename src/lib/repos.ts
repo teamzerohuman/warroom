@@ -22,8 +22,18 @@ const ChangelogSchema = z.union([
   }),
 ]);
 
+const BumpSchema = z.union([
+  z.boolean(),
+  z.string(),
+  z.object({
+    enabled: z.boolean().default(true),
+    command: z.string().optional(),
+  }),
+]);
+
 const MergeSchema = z.object({
   playwright: z.boolean().default(false),
+  bump: BumpSchema.default(false),
   changelog: ChangelogSchema.default(false),
 });
 
@@ -46,6 +56,7 @@ const RepoSchema = RawRepoSchema.transform(({ merge, merge_playwright, ...repo }
   ...repo,
   merge: {
     playwright: merge.playwright ?? merge_playwright ?? false,
+    bump: normalizeBumpConfig(merge.bump ?? false),
     changelog: normalizeChangelogConfig(merge.changelog ?? false),
   },
 }));
@@ -94,6 +105,27 @@ function normalizeChangelogConfig(changelog: z.infer<typeof ChangelogSchema>) {
     enabled: changelog.enabled,
     format: changelog.format,
     path: changelog.path ?? (changelog.format === 'openchangelog' ? 'release-notes' : 'CHANGELOG.md'),
+  };
+}
+
+function normalizeBumpConfig(bump: z.infer<typeof BumpSchema>) {
+  if (typeof bump === 'boolean') {
+    return {
+      enabled: bump,
+      command: null as string | null,
+    };
+  }
+
+  if (typeof bump === 'string') {
+    return {
+      enabled: true,
+      command: bump,
+    };
+  }
+
+  return {
+    enabled: bump.enabled,
+    command: bump.command ?? null,
   };
 }
 

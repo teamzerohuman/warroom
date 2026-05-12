@@ -16,6 +16,8 @@ Legacy `merge.changelog: true` still means "update `CHANGELOG.md`". New client-f
 
 Because these notes are public, `warroom pr merge` asks for explicit changelog approval before launching the adapter in interactive terminals. Non-interactive merges must pass `--confirm-changelog`; otherwise War Room skips the changelog closeout after the PR merge.
 
+When `merge.bump` is enabled, War Room asks whether to run the configured package version bump before PR merge. Approved changelog updates read package versions from the merged bump, so the public release note filename and commit message can use the released version.
+
 ## File Format
 
 Create one Markdown file per release under the configured folder, usually `release-notes/`.

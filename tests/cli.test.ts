@@ -2566,6 +2566,71 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('prompts for a version bump and defaults to patch before PR merge', async () => {
+    const { root, sdk, sdkRemote } = makeChangelogMergeFixture({ bump: true });
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeChangelogMergeGhFixture(bin, sdkRemote, { releaseBump: false });
+
+    const originalPath = process.env.PATH;
+    const envKeys = [
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS',
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS',
+    ] as const;
+    const originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS = '0';
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS = '0';
+
+    try {
+      const lines: string[] = [];
+      const input = new PassThrough();
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line), input, interactive: true });
+
+      const answers = ['\n', 'no\n', 'no\n', 'no\n'];
+      const promptAnswers = setInterval(() => {
+        const answer = answers.shift();
+        if (answer) input.write(answer);
+        else clearInterval(promptAnswers);
+      }, 100);
+      try {
+        await program.parseAsync(['node', 'warroom', 'pr', 'merge', '--pr', 'TeamFloPay/sdk#655', '--confirm']);
+      } finally {
+        clearInterval(promptAnswers);
+        input.end();
+      }
+
+      expect(lines).toContain('Should we bump the version number? [PATCH|minor|major|skip]');
+      expect(lines).toContain('Merge bump: passed');
+      expect(lines).toContain('Bump level: patch');
+      expect(lines).toContain('Bump version: 1.0.0 -> 1.0.1');
+      expect(lines.some((line) => line.startsWith('Bump commit: pushed '))).toBe(true);
+      expect(lines).toContain('Merge changelog: skipped (Skipped by user during interactive changelog confirmation.)');
+
+      const remotePackage = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/main:package.json'], {
+        encoding: 'utf8',
+      });
+      expect(JSON.parse(remotePackage.stdout).version).toBe('1.0.1');
+
+      const remoteFeaturePackage = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/feature/sdk:package.json'], {
+        encoding: 'utf8',
+      });
+      expect(JSON.parse(remoteFeaturePackage.stdout).version).toBe('1.0.1');
+
+      const remoteFeatureSubject = spawnSync('git', ['--git-dir', sdkRemote, 'log', '-1', '--pretty=%s', 'refs/heads/feature/sdk'], {
+        encoding: 'utf8',
+      });
+      expect(remoteFeatureSubject.stdout.trim()).toBe('chore(release): bump patch version');
+    } finally {
+      process.env.PATH = originalPath;
+      for (const key of envKeys) {
+        const value = originalEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
   it('creates an OpenChangelog release note after SDK merge actions pass', async () => {
     const { root, sdk, sdkRemote } = makeChangelogMergeFixture({ openchangelog: true });
     const bin = path.join(root, 'bin');
@@ -3314,7 +3379,7 @@ console.log('demo e2e passed');
   return { root, backend, demo, backendRemote };
 }
 
-function makeChangelogMergeFixture(options: { openchangelog?: boolean } = {}) {
+function makeChangelogMergeFixture(options: { openchangelog?: boolean; bump?: boolean } = {}) {
   const base = mkdtempSync(path.join(tmpdir(), 'warroom-changelog-'));
   const root = path.join(base, 'warroom');
   const sdk = path.join(base, 'sdk');
@@ -3332,6 +3397,11 @@ function makeChangelogMergeFixture(options: { openchangelog?: boolean } = {}) {
         format: openchangelog
         path: release-notes`
     : 'changelog: true';
+  const bumpConfig = options.bump
+    ? `bump:
+        enabled: true
+        command: npm run bump:version --`
+    : 'bump: false';
 
   writeFileSync(
     path.join(root, 'repos.yaml'),
@@ -3350,6 +3420,7 @@ repos:
     status: active
     merge:
       playwright: false
+      ${bumpConfig}
       ${changelogConfig}
     owner: sdk
     description: SDK packages.
@@ -3362,7 +3433,33 @@ repos:
 `
   );
   writeResourcesFixture(root);
-  writeFileSync(path.join(sdk, 'package.json'), JSON.stringify({ name: '@flopay/sdk', version: '1.0.0' }, null, 2));
+  writeFileSync(
+    path.join(sdk, 'package.json'),
+    JSON.stringify(
+      {
+        name: '@flopay/sdk',
+        version: '1.0.0',
+        scripts: {
+          'bump:version': 'node scripts/bump-version.cjs',
+        },
+      },
+      null,
+      2
+    )
+  );
+  mkdirSync(path.join(sdk, 'scripts'), { recursive: true });
+  writeFileSync(
+    path.join(sdk, 'scripts', 'bump-version.cjs'),
+    `const fs = require('node:fs');
+const level = process.argv[2];
+if (!['patch', 'minor', 'major'].includes(level)) process.exit(2);
+const packagePath = 'package.json';
+const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
+const [major, minor, patch] = packageJson.version.split('.').map(Number);
+packageJson.version = level === 'major' ? \`\${major + 1}.0.0\` : level === 'minor' ? \`\${major}.\${minor + 1}.0\` : \`\${major}.\${minor}.\${patch + 1}\`;
+fs.writeFileSync(packagePath, JSON.stringify(packageJson, null, 2) + '\\n');
+`
+  );
   if (options.openchangelog) {
     mkdirSync(path.join(sdk, 'release-notes'), { recursive: true });
     writeFileSync(
@@ -3391,6 +3488,8 @@ repos:
   if (branch.status !== 0) throw new Error(branch.stderr);
   writeFileSync(path.join(sdk, 'index.ts'), 'export const changed = true;\n');
   commitAll(sdk, 'feat: ready sdk change');
+  const pushFeature = spawnSync('git', ['push', '-u', 'origin', 'feature/sdk'], { cwd: sdk, encoding: 'utf8' });
+  if (pushFeature.status !== 0) throw new Error(pushFeature.stderr);
 
   return { root, sdk, sdkRemote };
 }
@@ -4870,8 +4969,9 @@ process.stdin.on('end', () => process.exit(0));
   chmodSync(codexPath, 0o755);
 }
 
-function writeChangelogMergeGhFixture(bin: string, sdkRemote: string) {
+function writeChangelogMergeGhFixture(bin: string, sdkRemote: string, options: { releaseBump?: boolean } = {}) {
   const ghPath = path.join(bin, 'gh');
+  const releaseBump = options.releaseBump !== false;
   writeFileSync(
     ghPath,
     `#!/usr/bin/env node
@@ -4881,6 +4981,7 @@ const { tmpdir } = require('node:os');
 const path = require('node:path');
 const { spawnSync } = require('node:child_process');
 const sdkRemote = ${JSON.stringify(sdkRemote)};
+const releaseBump = ${JSON.stringify(releaseBump)};
 
 function json(value) {
   process.stdout.write(JSON.stringify(value));
@@ -4955,13 +5056,25 @@ if (args[0] === 'pr' && args[1] === 'merge') {
   }
   spawnSync('git', ['config', 'user.email', 'warroom@example.com'], { cwd: worktree });
   spawnSync('git', ['config', 'user.name', 'War Room'], { cwd: worktree });
-  const packagePath = path.join(worktree, 'package.json');
-  const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
-  packageJson.version = '1.0.1';
-  writeFileSync(packagePath, JSON.stringify(packageJson, null, 2) + '\\n');
-  result = spawnSync('git', ['add', 'package.json'], { cwd: worktree, encoding: 'utf8' });
+  result = spawnSync('git', ['fetch', 'origin', 'feature/sdk:refs/remotes/origin/feature/sdk'], { cwd: worktree, encoding: 'utf8' });
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr);
+    process.exit(result.status || 1);
+  }
+  result = spawnSync('git', ['merge', '--squash', 'origin/feature/sdk'], { cwd: worktree, encoding: 'utf8' });
+  if (result.status !== 0) {
+    process.stderr.write(result.stderr);
+    process.exit(result.status || 1);
+  }
+  if (releaseBump) {
+    const packagePath = path.join(worktree, 'package.json');
+    const packageJson = JSON.parse(readFileSync(packagePath, 'utf8'));
+    packageJson.version = '1.0.1';
+    writeFileSync(packagePath, JSON.stringify(packageJson, null, 2) + '\\n');
+  }
+  result = spawnSync('git', ['add', '-A'], { cwd: worktree, encoding: 'utf8' });
   if (result.status !== 0) process.exit(result.status || 1);
-  result = spawnSync('git', ['commit', '-m', 'chore(release): 1.0.1'], { cwd: worktree, encoding: 'utf8' });
+  result = spawnSync('git', ['commit', '-m', releaseBump ? 'chore(release): 1.0.1' : 'feat: ready sdk pr'], { cwd: worktree, encoding: 'utf8' });
   if (result.status !== 0) {
     process.stderr.write(result.stderr);
     process.exit(result.status || 1);

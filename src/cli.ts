@@ -38,11 +38,13 @@ import {
   runPrReview,
   runPrReviewQueue,
   type LocalCleanupResult,
+  type MergeBumpResult,
   type MergeChangelogResult,
   type PrCreateResult,
   type PrPlanResult,
   type PrReviewQueueResult,
   type SummaryPostResult,
+  type VersionBumpChoice,
 } from './commands/pr.js';
 import { runSync, type SyncResult } from './commands/sync.js';
 import { CAMPAIGN_STATUSES, type CampaignStatusName } from './lib/campaign.js';
@@ -275,6 +277,31 @@ async function promptMergeChangelogConfirmation(output: Output, input: Input, pl
       ? `create one public OpenChangelog release note under ${plan.changelogPath ?? 'the configured release-notes folder'}`
       : `update ${plan.changelogPath ?? 'the configured changelog file'}`;
   return promptConfirmation(output, input, `Run the public changelog update now (${target})? [y/N]`);
+}
+
+function parseVersionBumpChoice(value: string | undefined): VersionBumpChoice | undefined {
+  if (value === undefined) return undefined;
+  const normalized = value.trim().toLowerCase();
+  if (['patch', 'minor', 'major', 'skip'].includes(normalized)) return normalized as VersionBumpChoice;
+  throw new Error('Version bump must be one of: patch, minor, major, skip.');
+}
+
+async function promptMergeBumpChoice(output: Output, input: Input, _plan: MergeBumpResult): Promise<VersionBumpChoice> {
+  output('Should we bump the version number? [PATCH|minor|major|skip]');
+
+  const readline = createInterface({ input, crlfDelay: Infinity });
+  try {
+    for await (const line of readline) {
+      const answer = line.trim().toLowerCase();
+      if (!answer) return 'patch';
+      if (answer === 'patch' || answer === 'minor' || answer === 'major' || answer === 'skip') return answer;
+      output('Enter patch, minor, major, skip, or press Enter for patch.');
+    }
+  } finally {
+    readline.close();
+  }
+
+  return 'skip';
 }
 
 function createE2EOutput(output: Output, customOutput: boolean): E2EOutput {
@@ -546,6 +573,33 @@ function printPrPlan(output: Output, result: PrPlanResult) {
     for (const blocker of result.mergeE2E.blocked) output(`e2e blocked: ${blocker}`);
     if (result.mergeE2E.error) output(`e2e error: ${result.mergeE2E.error}`);
   }
+  if (result.mergeBump) {
+    output(`Merge bump: ${result.mergeBump.status}${result.mergeBump.skipReason ? ` (${result.mergeBump.skipReason})` : ''}`);
+    if (result.mergeBump.required) {
+      output(
+        `Bump: ${result.mergeBump.path ?? 'missing'} (${result.mergeBump.command ?? 'missing command'}, branch ${
+          result.mergeBump.headBranch ?? 'missing'
+        }, base ${result.mergeBump.base})`
+      );
+      if (result.mergeBump.level) output(`Bump level: ${result.mergeBump.level}`);
+      if (result.mergeBump.versionBefore || result.mergeBump.versionAfter) {
+        output(`Bump version: ${result.mergeBump.versionBefore ?? 'unknown'} -> ${result.mergeBump.versionAfter ?? 'unknown'}`);
+      }
+      if (result.mergeBump.changedFiles.length > 0) output(`Bump files: ${result.mergeBump.changedFiles.join(', ')}`);
+      output(
+        `Bump commit: ${
+          result.mergeBump.pushed
+            ? `pushed ${result.mergeBump.commitSha ?? 'unknown'}`
+            : result.mergeBump.committed
+              ? `committed ${result.mergeBump.commitSha ?? 'unknown'}`
+              : 'planned'
+        }`
+      );
+      if (result.mergeBump.durationMs !== null) output(`Bump duration: ${result.mergeBump.durationMs}ms`);
+    }
+    for (const blocker of result.mergeBump.blocked) output(`bump blocked: ${blocker}`);
+    if (result.mergeBump.error) output(`bump error: ${result.mergeBump.error}`);
+  }
   if (result.mergeChangelog) {
     output(`Merge changelog: ${result.mergeChangelog.status}${result.mergeChangelog.skipReason ? ` (${result.mergeChangelog.skipReason})` : ''}`);
     if (result.mergeChangelog.required) {
@@ -683,6 +737,13 @@ function printLocalCleanup(output: Output, cleanup: LocalCleanupResult | null | 
   for (const message of cleanup.messages) output(`cleanup: ${message}`);
 }
 
+function mergeCloseoutFailed(result: PrPlanResult) {
+  return (
+    (result.mergeBump?.required && result.mergeBump.status === 'failed') ||
+    (result.mergeChangelog?.required && result.mergeChangelog.status === 'failed')
+  );
+}
+
 async function promptPrMergeFollowUps(
   workspaceRoot: string,
   output: Output,
@@ -739,6 +800,7 @@ async function runInteractivePrMergeFlow(
     postSummary?: boolean;
     confirmSummary?: boolean;
     confirmChangelog?: boolean;
+    bumpVersion?: VersionBumpChoice;
     issueComment?: boolean;
     cleanupLocal?: boolean;
     confirmCleanup?: boolean;
@@ -753,6 +815,10 @@ async function runInteractivePrMergeFlow(
     postSummary: options.postSummary || options.confirmSummary,
     confirmSummary: options.confirmSummary,
     confirmChangelog: options.confirmChangelog,
+    bumpVersion: options.bumpVersion,
+    bumpConfirmation: options.bumpVersion
+      ? undefined
+      : (plan: MergeBumpResult) => promptMergeBumpChoice(output, input, plan),
     changelogConfirmation: options.confirmChangelog
       ? undefined
       : (plan: MergeChangelogResult) => promptMergeChangelogConfirmation(output, input, plan),
@@ -765,7 +831,7 @@ async function runInteractivePrMergeFlow(
 
   let confirmedResult = await runPrMerge(workspaceRoot, baseOptions);
   printPrPlan(output, confirmedResult);
-  if (confirmedResult.mergeChangelog?.required && confirmedResult.mergeChangelog.status === 'failed') process.exitCode = 1;
+  if (mergeCloseoutFailed(confirmedResult)) process.exitCode = 1;
 
   if (!confirmedResult.merged) {
     const blocked = (confirmedResult.mergeReadiness?.blocked.length ?? 0) > 0;
@@ -803,12 +869,12 @@ async function runInteractivePrMergeFlow(
         allowUnresolvedReviewThreads,
       });
       printPrPlan(output, confirmedResult);
-      if (confirmedResult.mergeChangelog?.required && confirmedResult.mergeChangelog.status === 'failed') process.exitCode = 1;
+      if (mergeCloseoutFailed(confirmedResult)) process.exitCode = 1;
     }
   }
 
   if (!confirmedResult.merged) return;
-  if (confirmedResult.mergeChangelog?.required && confirmedResult.mergeChangelog.status === 'failed') return;
+  if (mergeCloseoutFailed(confirmedResult)) return;
 
   await promptPrMergeFollowUps(workspaceRoot, output, input, {
     pr: options.pr,
@@ -1946,9 +2012,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .description('Preflight or confirm a GitHub PR merge gated by the demo Playwright e2e run.')
     .option('--pr <owner/repo#number>', 'PR to merge. Omit to infer from the current mapped repo branch.')
     .option('--issue <owner/repo#number>', 'Linked issue to move to victory.')
-    .option('--confirm', 'Run the demo e2e gate, then gh pr merge --squash --delete-branch.')
+    .option('--confirm', 'Run configured merge gates, then gh pr merge --squash --delete-branch.')
     .option('--confirm-status', 'Move the linked issue to victory on the Campaign Map.')
     .option('--confirm-changelog', 'Run the guarded post-merge changelog update without asking.')
+    .option('--bump-version <level>', 'Run or skip the configured pre-merge version bump: patch, minor, major, or skip.')
     .option('--summary <text>', 'Victory summary to include in local artifacts and optional comments.')
     .option('--post-summary', 'Plan or post victory summary comments to the PR and linked issue.')
     .option('--confirm-summary', 'Actually post victory summary comments. Implies --post-summary.')
@@ -1963,6 +2030,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       confirm?: boolean;
       confirmStatus?: boolean;
       confirmChangelog?: boolean;
+      bumpVersion?: string;
       summary?: string;
       postSummary?: boolean;
       confirmSummary?: boolean;
@@ -1972,6 +2040,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       writeArtifact?: boolean;
       json?: boolean;
     }) => {
+      const bumpVersion = parseVersionBumpChoice(opts.bumpVersion);
       const resolvedPr = opts.pr ?? inferPrRefForCurrentBranch(workspaceRoot, invocationCwd);
       const resolvedIssue = opts.issue ?? inferIssueRefForCurrentBranch(workspaceRoot, invocationCwd) ?? undefined;
       if (!opts.pr && !opts.json) output(`Resolved current branch PR: ${resolvedPr}`);
@@ -1989,6 +2058,11 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         confirm: opts.confirm,
         confirmStatus: opts.confirmStatus,
         confirmChangelog: opts.confirmChangelog,
+        bumpVersion,
+        bumpConfirmation:
+          interactive && !bumpVersion
+            ? (plan: MergeBumpResult) => promptMergeBumpChoice(output, input, plan)
+            : undefined,
         changelogConfirmation:
           interactive && !opts.confirmChangelog
             ? (plan: MergeChangelogResult) => promptMergeChangelogConfirmation(output, input, plan)
@@ -2007,7 +2081,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         return;
       }
       printPrPlan(output, result);
-      if (result.mergeChangelog?.required && result.mergeChangelog.status === 'failed') process.exitCode = 1;
+      if (mergeCloseoutFailed(result)) process.exitCode = 1;
 
       let confirmedResult = result;
       if (interactive && !opts.confirm && !result.merged) {
@@ -2046,6 +2120,8 @@ export function buildProgram(options: BuildProgramOptions = {}) {
             allowUnresolvedReviewThreads,
             confirmStatus: opts.confirmStatus,
             confirmChangelog: opts.confirmChangelog,
+            bumpVersion,
+            bumpConfirmation: bumpVersion ? undefined : (plan: MergeBumpResult) => promptMergeBumpChoice(output, input, plan),
             changelogConfirmation: opts.confirmChangelog
               ? undefined
               : (plan: MergeChangelogResult) => promptMergeChangelogConfirmation(output, input, plan),
@@ -2059,12 +2135,12 @@ export function buildProgram(options: BuildProgramOptions = {}) {
             ...liveE2EOutput,
           });
           printPrPlan(output, confirmedResult);
-          if (confirmedResult.mergeChangelog?.required && confirmedResult.mergeChangelog.status === 'failed') process.exitCode = 1;
+          if (mergeCloseoutFailed(confirmedResult)) process.exitCode = 1;
         }
       }
 
       if (!interactive || !confirmedResult.merged) return;
-      if (confirmedResult.mergeChangelog?.required && confirmedResult.mergeChangelog.status === 'failed') return;
+      if (mergeCloseoutFailed(confirmedResult)) return;
 
       await promptPrMergeFollowUps(workspaceRoot, output, input, {
         pr: resolvedPr,
