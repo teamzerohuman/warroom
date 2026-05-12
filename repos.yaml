@@ -50,6 +50,7 @@ repos:
       bump:
         enabled: true
         command: npm run bump:version --
+      post_merge: npm run sentry:upload-sourcemaps
       changelog:
         enabled: true
         format: openchangelog

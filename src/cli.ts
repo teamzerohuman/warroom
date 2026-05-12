@@ -40,6 +40,7 @@ import {
   type LocalCleanupResult,
   type MergeBumpResult,
   type MergeChangelogResult,
+  type MergePostMergeResult,
   type PrCreateResult,
   type PrPlanResult,
   type PrReviewQueueResult,
@@ -599,6 +600,17 @@ function printPrPlan(output: Output, result: PrPlanResult) {
     }
     for (const blocker of result.mergeBump.blocked) output(`bump blocked: ${blocker}`);
     if (result.mergeBump.error) output(`bump error: ${result.mergeBump.error}`);
+  }
+  if (result.mergePostMerge) {
+    output(`Merge post-merge: ${result.mergePostMerge.status}${result.mergePostMerge.skipReason ? ` (${result.mergePostMerge.skipReason})` : ''}`);
+    if (result.mergePostMerge.required) {
+      output(
+        `Post-merge: ${result.mergePostMerge.path ?? 'missing'} (${result.mergePostMerge.command ?? 'missing command'}, base ${result.mergePostMerge.base})`
+      );
+      if (result.mergePostMerge.durationMs !== null) output(`Post-merge duration: ${result.mergePostMerge.durationMs}ms`);
+    }
+    for (const blocker of result.mergePostMerge.blocked) output(`post-merge blocked: ${blocker}`);
+    if (result.mergePostMerge.error) output(`post-merge error: ${result.mergePostMerge.error}`);
   }
   if (result.mergeChangelog) {
     output(`Merge changelog: ${result.mergeChangelog.status}${result.mergeChangelog.skipReason ? ` (${result.mergeChangelog.skipReason})` : ''}`);

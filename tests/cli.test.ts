@@ -2430,8 +2430,8 @@ describe('phase-1 CLI', () => {
     }
   });
 
-  it('updates and pushes CHANGELOG.md after SDK merge actions pass', async () => {
-    const { root, sdk, sdkRemote } = makeChangelogMergeFixture();
+  it('runs the post-merge command after a successful merge before updating CHANGELOG.md', async () => {
+    const { root, sdk, sdkRemote } = makeChangelogMergeFixture({ postMergeCommand: 'node scripts/post-merge.cjs' });
     const bin = path.join(root, 'bin');
     mkdirSync(bin, { recursive: true });
     writeChangelogMergeGhFixture(bin, sdkRemote);
@@ -2464,10 +2464,13 @@ describe('phase-1 CLI', () => {
 
       const output = lines.join('\n');
       expect(output).toContain('Merge e2e: skipped (repos.yaml has merge.playwright: false for TeamFloPay/sdk.)');
+      expect(output).toContain('Merge post-merge: passed');
       expect(output).toContain('Merge changelog: passed');
       expect(output).toContain('Changelog version: 1.0.1');
       expect(lines.some((line) => line.startsWith('Changelog commit: pushed '))).toBe(true);
       expect(lines).toContain('Merged: yes');
+
+      expect(readFileSync(path.join(path.dirname(sdk), 'post-merge.log'), 'utf8')).toContain('post-merge ran on main');
 
       const remoteChangelog = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/main:CHANGELOG.md'], {
         encoding: 'utf8',
@@ -3408,7 +3411,7 @@ console.log('demo e2e passed');
   return { root, backend, demo, backendRemote };
 }
 
-function makeChangelogMergeFixture(options: { openchangelog?: boolean; bump?: boolean } = {}) {
+function makeChangelogMergeFixture(options: { openchangelog?: boolean; bump?: boolean; postMergeCommand?: string } = {}) {
   const base = mkdtempSync(path.join(tmpdir(), 'warroom-changelog-'));
   const root = path.join(base, 'warroom');
   const sdk = path.join(base, 'sdk');
@@ -3432,6 +3435,7 @@ function makeChangelogMergeFixture(options: { openchangelog?: boolean; bump?: bo
         enabled: true
         command: npm run bump:version --`
     : 'bump: false';
+  const postMergeConfig = options.postMergeCommand ? `post_merge: ${options.postMergeCommand}` : 'post_merge: false';
 
   writeFileSync(
     path.join(root, 'repos.yaml'),
@@ -3451,6 +3455,7 @@ repos:
     merge:
       playwright: false
       ${bumpConfig}
+      ${postMergeConfig}
       ${changelogConfig}
     owner: sdk
     description: SDK packages.
@@ -3488,6 +3493,14 @@ const packageJson = JSON.parse(fs.readFileSync(packagePath, 'utf8'));
 const [major, minor, patch] = packageJson.version.split('.').map(Number);
 packageJson.version = level === 'major' ? \`\${major + 1}.0.0\` : level === 'minor' ? \`\${major}.\${minor + 1}.0\` : \`\${major}.\${minor}.\${patch + 1}\`;
 fs.writeFileSync(packagePath, JSON.stringify(packageJson, null, 2) + '\\n');
+`
+  );
+  writeFileSync(
+    path.join(sdk, 'scripts', 'post-merge.cjs'),
+    `const fs = require('node:fs');
+const path = require('node:path');
+const packageJson = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+fs.writeFileSync(path.resolve(process.cwd(), '..', 'post-merge.log'), 'post-merge ran on main for version ' + packageJson.version + '\\n');
 `
   );
   if (options.openchangelog) {

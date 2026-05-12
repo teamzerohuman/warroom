@@ -144,6 +144,20 @@ export type MergeBumpResult = {
   error: string | null;
 };
 
+export type MergePostMergeResult = {
+  status: 'planned' | 'passed' | 'failed' | 'skipped';
+  required: boolean;
+  skipReason: string | null;
+  repo: string;
+  path: string | null;
+  base: string;
+  currentBranch: string | null;
+  command: string | null;
+  durationMs: number | null;
+  blocked: string[];
+  error: string | null;
+};
+
 export type MergeReadiness = {
   mergeStateStatus: string | null;
   mergeable: string | null;
@@ -232,6 +246,7 @@ export type PrPlanResult = {
   localCleanup?: LocalCleanupResult | null;
   mergeE2E?: MergeE2EResult;
   mergeBump?: MergeBumpResult;
+  mergePostMerge?: MergePostMergeResult;
   mergeChangelog?: MergeChangelogResult;
   prReviewLoop?: PrReviewLoopResult;
   usageSummary?: LlmUsageSummary | null;
@@ -425,6 +440,16 @@ function mergeBumpSkipResult(plan: MergeBumpResult, skipReason: string): MergeBu
   };
 }
 
+function mergePostMergeSkipResult(plan: MergePostMergeResult, skipReason: string): MergePostMergeResult {
+  return {
+    ...plan,
+    status: 'skipped',
+    skipReason,
+    durationMs: null,
+    error: null,
+  };
+}
+
 async function versionBumpChoice(options: PrOptions, plan: MergeBumpResult): Promise<VersionBumpChoice> {
   if (!plan.required) return 'skip';
   if (options.bumpVersion) return options.bumpVersion;
@@ -478,6 +503,33 @@ function mergeChangelogRequirement(workspaceRoot: string, githubRepo: string): C
   return repo.merge.changelog.enabled
     ? { required: true, skipReason: null, config: repo.merge.changelog }
     : { required: false, skipReason: `repos.yaml has merge.changelog disabled for ${githubRepo}.`, config: repo.merge.changelog };
+}
+
+type PostMergeRequirement = {
+  required: boolean;
+  skipReason: string | null;
+  config: {
+    command: string | null;
+  } | null;
+};
+
+function mergePostMergeRequirement(workspaceRoot: string, githubRepo: string): PostMergeRequirement {
+  const repo = repoEntryForGitHub(workspaceRoot, githubRepo);
+  if (!repo) {
+    return {
+      required: false,
+      skipReason: `No mapped repo entry with merge.post_merge enabled for ${githubRepo}.`,
+      config: null,
+    };
+  }
+
+  return repo.merge.postMerge.enabled
+    ? { required: true, skipReason: null, config: repo.merge.postMerge }
+    : {
+        required: false,
+        skipReason: `repos.yaml has merge.post_merge disabled for ${githubRepo}.`,
+        config: repo.merge.postMerge,
+      };
 }
 
 function parsePrRef(value: string) {
@@ -3058,6 +3110,53 @@ function createMergeBumpPlan(
   };
 }
 
+function createMergePostMergePlan(
+  workspaceRoot: string,
+  githubRepo: string,
+  base: string,
+  requirement: PostMergeRequirement
+): MergePostMergeResult {
+  const repoEntry = repoEntryForGitHub(workspaceRoot, githubRepo);
+  const repo = repoEntry ? getRepoHealth(workspaceRoot, repoEntry) : null;
+  const command = requirement.config?.command ?? null;
+  const blocked: string[] = [];
+
+  if (!requirement.required) {
+    return {
+      status: 'skipped',
+      required: false,
+      skipReason: requirement.skipReason,
+      repo: githubRepo,
+      path: repo?.resolvedPath ?? null,
+      base,
+      currentBranch: repo?.branch ?? null,
+      command,
+      durationMs: null,
+      blocked,
+      error: null,
+    };
+  }
+
+  if (!repoEntry) blocked.push(`repos.yaml does not define a mapped checkout for ${githubRepo}.`);
+  if (repo && !repo.checkedOut) blocked.push(`Mapped checkout is missing: ${repo.resolvedPath}`);
+  if (repo?.clean === false) blocked.push(`Mapped checkout has local changes: ${repo.resolvedPath}`);
+  if (!command?.trim()) blocked.push(`merge.post_merge is enabled for ${githubRepo}, but no command is configured.`);
+
+  return {
+    status: 'planned',
+    required: true,
+    skipReason: null,
+    repo: githubRepo,
+    path: repo?.resolvedPath ?? null,
+    base,
+    currentBranch: repo?.branch ?? null,
+    command,
+    durationMs: null,
+    blocked,
+    error: null,
+  };
+}
+
 function changelogActionsConfig() {
   const timeout = Number(envValue('WARROOM_MERGE_CHANGELOG_ACTIONS_TIMEOUT_MS', String(DEFAULT_CHANGELOG_ACTIONS_TIMEOUT_MS)));
   const poll = Number(envValue('WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS', String(DEFAULT_CHANGELOG_ACTIONS_POLL_MS)));
@@ -3568,6 +3667,46 @@ async function runMergeBump(
   }
 }
 
+async function runMergePostMerge(plan: MergePostMergeResult, options: PrOptions): Promise<MergePostMergeResult> {
+  if (!plan.required) return plan;
+  if (plan.blocked.length > 0) return { ...plan, status: 'failed', error: plan.blocked.join(' ') };
+  if (!plan.path || !plan.command) {
+    return { ...plan, status: 'failed', error: 'Post-merge checkout plan is incomplete.' };
+  }
+
+  const startedAt = Date.now();
+  try {
+    options.mergeStatus?.(`Post-merge: pulling latest ${plan.base} in ${plan.path}`);
+    prepareBranchCheckout(plan.path, plan.base);
+
+    options.mergeStatus?.(`Post-merge: running \`${plan.command}\` from ${plan.path}`);
+    const result = spawnSync(plan.command, {
+      cwd: plan.path,
+      shell: true,
+      encoding: 'utf8',
+      env: process.env,
+    });
+    if (result.status !== 0) {
+      const details = commandOutputDetails(result);
+      throw new Error(details || `Post-merge command failed with exit ${result.status ?? 'unknown'}.`);
+    }
+
+    return {
+      ...plan,
+      status: 'passed',
+      durationMs: Date.now() - startedAt,
+      error: null,
+    };
+  } catch (error) {
+    return {
+      ...plan,
+      status: 'failed',
+      durationMs: Date.now() - startedAt,
+      error: error instanceof Error ? error.message : String(error),
+    };
+  }
+}
+
 function publishAdapterReviewChanges(
   repoPath: string,
   branchName: string | null,
@@ -3866,6 +4005,7 @@ function buildFinalVictoryComment(
   pr: { title?: string; url?: string; headRefName?: string; baseRefName?: string },
   mergeE2E: MergeE2EResult,
   mergeBump: MergeBumpResult,
+  mergePostMerge: MergePostMergeResult,
   mergeChangelog: MergeChangelogResult
 ) {
   return [
@@ -3881,6 +4021,7 @@ function buildFinalVictoryComment(
     `- Merge gate: passed`,
     `- Demo e2e: ${mergeE2E.status}${mergeE2E.skipReason ? ` (${mergeE2E.skipReason})` : ''}`,
     `- Version bump: ${mergeBump.status}${mergeBump.skipReason ? ` (${mergeBump.skipReason})` : ''}`,
+    `- Post-merge script: ${mergePostMerge.status}${mergePostMerge.skipReason ? ` (${mergePostMerge.skipReason})` : ''}`,
     `- Changelog: ${formatFinalChangelogCheck(mergeChangelog)}`,
   ].join('\n');
 }
@@ -3898,6 +4039,7 @@ function buildFinalIssueCommentPlan(
   readiness: MergeReadiness,
   mergeE2E: MergeE2EResult,
   mergeBump: MergeBumpResult,
+  mergePostMerge: MergePostMergeResult,
   mergeChangelog: MergeChangelogResult,
   issueCommentEnabled: boolean | undefined
 ): SummaryPostResult | null {
@@ -3932,7 +4074,7 @@ function buildFinalIssueCommentPlan(
     '--repo',
     ref.repo,
     '--body',
-    buildFinalVictoryComment(prRef, pr, mergeE2E, mergeBump, mergeChangelog),
+    buildFinalVictoryComment(prRef, pr, mergeE2E, mergeBump, mergePostMerge, mergeChangelog),
   ]);
   return {
     target: 'issue',
@@ -4651,9 +4793,11 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
   const configuredMergePlaywright = mergePlaywrightRequirement(workspaceRoot, ref.repo);
   const mergePlaywright = options.skipMergeE2E ? mergePlaywrightSkipRequirement() : configuredMergePlaywright;
   const mergeBumpRequirementResult = mergeBumpRequirement(workspaceRoot, ref.repo);
+  const mergePostMergeRequirementResult = mergePostMergeRequirement(workspaceRoot, ref.repo);
   const mergeChangelogRequirementResult = mergeChangelogRequirement(workspaceRoot, ref.repo);
   let mergeE2E = createMergeE2EPlan(workspaceRoot, mergePlaywright);
   let mergeBump = createMergeBumpPlan(workspaceRoot, ref.repo, targetBase, pr.headRefName ?? null, mergeBumpRequirementResult);
+  let mergePostMerge = createMergePostMergePlan(workspaceRoot, ref.repo, targetBase, mergePostMergeRequirementResult);
   let mergeChangelog = createMergeChangelogPlan(workspaceRoot, ref.repo, targetBase, mergeChangelogRequirementResult);
   const summary = buildVictorySummary(options.pr, issueRef ?? undefined, pr, readiness, options.summary);
   const blockerDetails = readiness.details.length
@@ -4689,6 +4833,9 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     mergeBump.required
       ? `- After demo Playwright and before merge, ask whether to run \`${mergeBump.command ?? 'the configured bump command'}\` with patch, minor, or major, then commit and push the result to the PR branch.`
       : `- Version bump skipped: ${mergeBump.skipReason ?? 'merge.bump is not enabled for this repo.'}`,
+    mergePostMerge.required
+      ? `- After merge, pull the latest ${targetBase} in the mapped checkout and run \`${mergePostMerge.command ?? 'the configured post-merge command'}\`.`
+      : `- Post-merge script skipped: ${mergePostMerge.skipReason ?? 'merge.post_merge is not enabled for this repo.'}`,
     mergeChangelog.required
       ? mergeChangelog.changelogFormat === 'openchangelog'
         ? `- After merge, ask for changelog confirmation, then wait for GitHub Actions on ${targetBase}, pull the latest ${targetBase}, create one public OpenChangelog release-note file under ${mergeChangelog.changelogPath ?? 'the configured release-notes folder'} with the LLM, and push a [skip-ci] changelog commit.`
@@ -4770,6 +4917,9 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
       );
       if (result.status !== 0) throw new Error(`gh pr merge failed with exit ${result.status ?? 'unknown'}.`);
       merged = true;
+      if (mergePostMerge.required) {
+        mergePostMerge = await runMergePostMerge(mergePostMerge, resolvedOptions);
+      }
       if (mergeChangelog.required) {
         const confirmedChangelog = await shouldRunMergeChangelog(resolvedOptions, mergeChangelog);
         mergeChangelog = confirmedChangelog
@@ -4786,6 +4936,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
 
   const completionBlockers = [
     ...(mergeBump.required && mergeBump.status === 'failed' ? ['Required version bump failed.'] : []),
+    ...(mergePostMerge.required && mergePostMerge.status === 'failed' ? ['Required post-merge script failed.'] : []),
     ...(mergeChangelog.required && mergeChangelog.status === 'failed' ? ['Required changelog update failed.'] : []),
   ];
   const completionReadiness = completionBlockers.length
@@ -4800,6 +4951,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     completionReadiness,
     mergeE2E,
     mergeBump,
+    mergePostMerge,
     mergeChangelog,
     options.issueComment
   );
@@ -4820,12 +4972,13 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
         'readiness.json': JSON.stringify(readiness, null, 2),
         'merge-e2e.json': JSON.stringify(mergeE2E, null, 2),
         'merge-bump.json': JSON.stringify(mergeBump, null, 2),
+        'merge-post-merge.json': JSON.stringify(mergePostMerge, null, 2),
         'merge-changelog.json': JSON.stringify(mergeChangelog, null, 2),
         'summary.md': summary,
         'summary-posts.json': JSON.stringify(summaryPosts, null, 2),
         ...(finalIssueComment ? { 'final-issue-comment.json': JSON.stringify(finalIssueComment, null, 2) } : {}),
         ...(finalIssueComment
-          ? { 'final-issue-comment.md': buildFinalVictoryComment(options.pr, pr, mergeE2E, mergeBump, mergeChangelog) }
+          ? { 'final-issue-comment.md': buildFinalVictoryComment(options.pr, pr, mergeE2E, mergeBump, mergePostMerge, mergeChangelog) }
           : {}),
         ...(usageSummary ? { 'final-usage-summary.json': JSON.stringify(usageSummary, null, 2) } : {}),
         ...(issueRef ? { 'usage.json': JSON.stringify(usageEntriesForCommandRun(workspaceRoot, issueRef, commandRunId), null, 2) } : {}),
@@ -4845,6 +4998,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     mergeReadiness: readiness,
     mergeE2E,
     mergeBump,
+    mergePostMerge,
     mergeChangelog,
     usageSummary,
     summary,

@@ -32,10 +32,20 @@ const BumpSchema = z.union([
   }),
 ]);
 
+const PostMergeSchema = z.union([
+  z.boolean(),
+  z.string(),
+  z.object({
+    enabled: z.boolean().default(true),
+    command: z.string().optional(),
+  }),
+]);
+
 const MergeSchema = z.object({
   playwright: z.boolean().default(false),
   bump: BumpSchema.default(false),
   changelog: ChangelogSchema.default(false),
+  post_merge: PostMergeSchema.default(false),
 });
 
 const RawRepoSchema = z.object({
@@ -59,6 +69,7 @@ const RepoSchema = RawRepoSchema.transform(({ merge, merge_playwright, ...repo }
     playwright: merge.playwright ?? merge_playwright ?? false,
     bump: normalizeBumpConfig(merge.bump ?? false),
     changelog: normalizeChangelogConfig(merge.changelog ?? false),
+    postMerge: normalizePostMergeConfig(merge.post_merge ?? false),
   },
 }));
 
@@ -129,6 +140,27 @@ function normalizeBumpConfig(bump: z.infer<typeof BumpSchema>) {
   return {
     enabled: bump.enabled,
     command: bump.command ?? null,
+  };
+}
+
+function normalizePostMergeConfig(postMerge: z.infer<typeof PostMergeSchema>) {
+  if (typeof postMerge === 'boolean') {
+    return {
+      enabled: postMerge,
+      command: null as string | null,
+    };
+  }
+
+  if (typeof postMerge === 'string') {
+    return {
+      enabled: true,
+      command: postMerge,
+    };
+  }
+
+  return {
+    enabled: postMerge.enabled,
+    command: postMerge.command ?? null,
   };
 }
 
