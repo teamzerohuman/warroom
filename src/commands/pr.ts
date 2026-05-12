@@ -183,6 +183,9 @@ export type PrPlanResult = {
   prompt: string;
   artifact: RunArtifact | null;
   launched: boolean;
+  adapterStarted?: boolean;
+  adapterExitStatus?: number | null;
+  adapterSignal?: string | null;
   adapterCommand: string | null;
   action: 'issue-start' | 'review' | 'merge';
   issue?: string | null;
@@ -3696,6 +3699,9 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
       prompt,
       artifact,
       launched: false,
+      adapterStarted: false,
+      adapterExitStatus: null,
+      adapterSignal: null,
       adapterCommand,
       action: 'issue-start',
       issue: options.issue,
@@ -3712,13 +3718,31 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
 
   const contextSummary = { promptCharacters: prompt.length, comments: issue.comments?.length ?? 0 };
   if (options.dryRun !== false) {
-    return { prompt, artifact, launched: false, adapterCommand, action: 'issue-start', issue: options.issue, campaignStatus, labelUpdate, developmentBranch, contextSummary, adapterCwd };
+    return {
+      prompt,
+      artifact,
+      launched: false,
+      adapterStarted: false,
+      adapterExitStatus: null,
+      adapterSignal: null,
+      adapterCommand,
+      action: 'issue-start',
+      issue: options.issue,
+      campaignStatus,
+      labelUpdate,
+      developmentBranch,
+      contextSummary,
+      adapterCwd,
+    };
   }
   if (labelUpdate.error) {
     return {
       prompt,
       artifact,
       launched: false,
+      adapterStarted: false,
+      adapterExitStatus: null,
+      adapterSignal: null,
       adapterCommand,
       action: 'issue-start',
       issue: options.issue,
@@ -3745,6 +3769,9 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     prompt,
     artifact,
     launched: launch.launched,
+    adapterStarted: launch.status !== null || launch.signal !== null,
+    adapterExitStatus: launch.status,
+    adapterSignal: launch.signal,
     adapterCommand: launch.invocation.display,
     action: 'issue-start',
     issue: options.issue,

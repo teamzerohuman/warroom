@@ -928,6 +928,38 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('distinguishes an adapter process failure from a pre-handoff blocker', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeFailingImplementationCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line) });
+
+      await program.parseAsync(['node', 'warroom', 'issue', 'next', '--issue', 'TeamFloPay/sdk#7', '--confirm-status']);
+
+      expect(lines).toContain('Issue start: adapter failed');
+      expect(lines).toContain('Adapter run: failed with status 1 (foreground process; no background session remains)');
+      expect(lines).toContain('Adapter error: Adapter exited with status 1.');
+      expect(lines).toContain('Development checkout: checked out');
+      expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
+      expect(lines.some((line) => line.includes('Outcome: not handed off to LLM adapter'))).toBe(false);
+      expectFinalOutcome(
+        lines,
+        'Outcome: LLM adapter ran but exited with an error on warroom/7-build-the-selector; inspect the adapter output above, resolve the failure, then rerun the issue start command. Campaign status updated to battlefield-active.'
+      );
+    } finally {
+      process.env.PATH = originalPath;
+      process.exitCode = undefined;
+    }
+  });
+
   it('scopes issue next to the current mapped child repo', async () => {
     const root = makeDevFixture();
     const demo = path.resolve(root, '..', 'demo');
@@ -4968,6 +5000,21 @@ process.stdin.on('end', () => {
   }
   process.exit(0);
 });
+`
+  );
+  chmodSync(codexPath, 0o755);
+}
+
+function writeFailingImplementationCodexFixture(bin: string) {
+  const codexPath = path.join(bin, 'codex');
+  writeFileSync(
+    codexPath,
+    `#!/usr/bin/env node
+if (process.argv[2] !== 'exec') {
+  process.exit(0);
+}
+process.stdout.write('Implementation adapter reached the repo and then failed.\\n');
+process.exit(1);
 `
   );
   chmodSync(codexPath, 0o755);

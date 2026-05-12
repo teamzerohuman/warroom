@@ -422,6 +422,9 @@ function issueStartOutcome(result: PrPlanResult) {
   }
 
   if (result.launchError) {
+    if (result.adapterStarted) {
+      return `Outcome: LLM adapter ran but exited with an error${branch}; inspect the adapter output above, resolve the failure, then rerun the issue start command.${status}`;
+    }
     return `Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.`;
   }
 
@@ -453,8 +456,11 @@ function prReviewOutcome(result: PrPlanResult) {
 }
 
 function printPrPlan(output: Output, result: PrPlanResult) {
+  const issueAdapterFailed = result.action === 'issue-start' && Boolean(result.launchError) && result.adapterStarted === true;
   const state = result.launchError
-    ? 'blocked'
+    ? issueAdapterFailed
+      ? 'adapter failed'
+      : 'blocked'
     : result.action === 'review' && result.prReviewLoop?.completed && !result.launched
       ? 'complete'
       : result.launched
@@ -469,6 +475,14 @@ function printPrPlan(output: Output, result: PrPlanResult) {
   if (result.adapterCwd) output(`Adapter cwd: ${result.adapterCwd}`);
   if (result.action === 'issue-start' && result.launched) {
     output('Adapter run: completed (foreground process; no background session remains)');
+  } else if (issueAdapterFailed) {
+    const detail =
+      result.adapterExitStatus !== null && result.adapterExitStatus !== undefined
+        ? ` with status ${result.adapterExitStatus}`
+        : result.adapterSignal
+          ? ` with signal ${result.adapterSignal}`
+          : '';
+    output(`Adapter run: failed${detail} (foreground process; no background session remains)`);
   }
   if (result.launchError) output(`Adapter error: ${result.launchError}`);
   if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
