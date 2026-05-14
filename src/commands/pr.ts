@@ -4702,6 +4702,16 @@ async function runCodeRabbitPrReviewLoop(
           launchError: error,
         };
       }
+      // All threads were replied to without requiring code changes — review is satisfied.
+      options.reviewStatus?.(`PR review loop ${index}: all CodeRabbit feedback addressed with replies; no code changes needed.`);
+      iteration.endHeadSha = currentHeadSha;
+      iterations.push(iteration);
+      return {
+        loop: { status: 'passed', completed: true, iterations, blocked: [], error: null },
+        launched: true,
+        adapterCommand,
+        launchError: null,
+      };
     }
 
     options.reviewStatus?.(
