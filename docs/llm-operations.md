@@ -22,9 +22,16 @@ Interactive `issue triage` is a planning-only Codex TUI session. The adapter mus
 LLM_ADAPTER=codex
 CODEX_COMMAND=codex
 CLAUDE_COMMAND=claude
+CLAUDE_MODEL=claude-sonnet-4-6
+CLAUDE_PERMISSION_MODE=acceptEdits
+CLAUDE_INTERACTIVE_PERMISSION_MODE=acceptEdits
 ```
 
 For Codex, `CODEX_COMMAND` is the executable path only. If `codex` is not on `PATH`, set it to the bundled Codex Desktop executable, for example `/Applications/Codex.app/Contents/Resources/codex` on macOS. War Room launches implementation and review handoffs with `codex exec --model gpt-5.5 -c model_reasoning_effort="xhigh" --disable fast_mode --cd <owning-repo> -` so edits happen from the mapped child repository instead of the War Room workspace without enabling Fast Mode. Interactive issue create and issue triage launch the Codex TUI with `codex --model gpt-5.5 -c model_reasoning_effort="xhigh" --disable fast_mode --sandbox workspace-write -c sandbox_workspace_write.network_access=true --cd <workspace-or-owning-repo> <prompt>` so `@grill-me` questions can be answered in the terminal and read-only API checks can reach services like Stripe. Override with `CODEX_MODEL`, `CODEX_REASONING_EFFORT`, `CODEX_FAST_MODE`, `CODEX_INTERACTIVE_SANDBOX`, and `CODEX_INTERACTIVE_NETWORK_ACCESS` in `.env.local` when needed.
+
+For Claude (set `LLM_ADAPTER=claude`), War Room launches foreground handoffs as `claude --print --output-format json --model <CLAUDE_MODEL> --permission-mode <CLAUDE_PERMISSION_MODE>` with the full prompt piped to stdin, then parses the JSON envelope to extract the assistant `result`, the `usage` block (`input_tokens`, `output_tokens`, `cache_read_input_tokens`, `cache_creation_input_tokens`), and the authoritative `total_cost_usd`. Interactive issue create, issue triage, and review handoffs run as `claude --model <CLAUDE_MODEL> --permission-mode <CLAUDE_INTERACTIVE_PERMISSION_MODE> <prompt>`. Both invocations run from the owning child repo's working directory, so Claude reads and writes scoped to that repo. Defaults are `CLAUDE_MODEL=claude-sonnet-4-6` and `CLAUDE_PERMISSION_MODE=CLAUDE_INTERACTIVE_PERMISSION_MODE=acceptEdits`, which is the closest match to Codex's `--sandbox workspace-write` (Claude can edit and run tools without per-call prompts while still respecting allowed/disallowed tool lists). Use `bypassPermissions` for the Codex `--sandbox danger-full-access` equivalent. Claude's authenticated session is established once with `claude login`; War Room does not manage that login.
+
+Adapter-reported cost takes precedence over the local pricing table when it is present (Claude `--output-format json` always emits it). `config/llm-pricing.json` carries fallback Claude rates so cost is still computed when only token counts are known.
 
 `LLM_ADAPTER=codex-cloud` is a deprecated alias for `codex` to keep older local `.env.local` files working. War Room no longer submits durable Codex Cloud tasks or reads `CODEX_CLOUD_ENV*` values.
 

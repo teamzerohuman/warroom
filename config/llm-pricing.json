@@ -1,7 +1,7 @@
 {
   "currency": "USD",
-  "effectiveDate": "2026-05-10",
-  "notes": "Manual War Room pricing file. Set rates to numbers per 1,000,000 tokens before relying on cost totals.",
+  "effectiveDate": "2026-05-13",
+  "notes": "Manual War Room pricing file. Set rates to numbers per 1,000,000 tokens before relying on cost totals. Claude rows are a fallback; Claude --output-format json reports total_cost_usd directly and War Room prefers that when present.",
   "models": {
     "gpt-5.5": {
       "inputPerMillion": 5.00,
@@ -14,6 +14,24 @@
       "cachedInputPerMillion": 0.25,
       "outputPerMillion": 15.00,
       "notes": ""
+    },
+    "claude-opus-4-7": {
+      "inputPerMillion": 15.00,
+      "cachedInputPerMillion": 1.50,
+      "outputPerMillion": 75.00,
+      "notes": "Fallback only; adapter-reported total_cost_usd is preferred."
+    },
+    "claude-sonnet-4-6": {
+      "inputPerMillion": 3.00,
+      "cachedInputPerMillion": 0.30,
+      "outputPerMillion": 15.00,
+      "notes": "Fallback only; adapter-reported total_cost_usd is preferred."
+    },
+    "claude-haiku-4-5": {
+      "inputPerMillion": 0.80,
+      "cachedInputPerMillion": 0.08,
+      "outputPerMillion": 4.00,
+      "notes": "Fallback only; adapter-reported total_cost_usd is preferred."
     }
   }
 }

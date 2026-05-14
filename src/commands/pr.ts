@@ -3690,6 +3690,71 @@ async function runMergeBump(
   }
 }
 
+type PrMergeabilityState = {
+  mergeable: string | null;
+  mergeStateStatus: string | null;
+};
+
+function readPrMergeability(ref: { repo: string; number: number }): PrMergeabilityState {
+  const data = ghJson<{ mergeable?: string; mergeStateStatus?: string }>(
+    ['pr', 'view', String(ref.number), '--repo', ref.repo, '--json', 'mergeable,mergeStateStatus'],
+    {}
+  );
+  return {
+    mergeable: data.mergeable ?? null,
+    mergeStateStatus: data.mergeStateStatus ?? null,
+  };
+}
+
+function envIntOrDefault(name: string, fallback: number) {
+  const raw = process.env[name];
+  if (!raw) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+async function waitForPrMergeable(
+  ref: { repo: string; number: number },
+  options: PrOptions,
+  context: string
+): Promise<PrMergeabilityState> {
+  const timeoutMs = envIntOrDefault('WARROOM_MERGE_WAIT_TIMEOUT_MS', 300_000);
+  const pollMs = envIntOrDefault('WARROOM_MERGE_WAIT_POLL_MS', 5_000);
+  const deadline = Date.now() + timeoutMs;
+  let lastState: PrMergeabilityState = { mergeable: null, mergeStateStatus: null };
+  let attempt = 0;
+
+  while (Date.now() < deadline) {
+    attempt += 1;
+    lastState = readPrMergeability(ref);
+    const { mergeable, mergeStateStatus } = lastState;
+
+    if (mergeable === 'MERGEABLE' && (mergeStateStatus === 'CLEAN' || mergeStateStatus === 'UNSTABLE' || mergeStateStatus === 'HAS_HOOKS')) {
+      options.mergeStatus?.(`${context}: PR is mergeable (mergeStateStatus=${mergeStateStatus}).`);
+      return lastState;
+    }
+    if (mergeable === 'CONFLICTING' || mergeStateStatus === 'DIRTY') {
+      throw new Error(
+        `${context}: PR is no longer mergeable after the push (mergeable=${mergeable ?? 'unknown'}, mergeStateStatus=${mergeStateStatus ?? 'unknown'}). Resolve conflicts manually.`
+      );
+    }
+    if (mergeStateStatus === 'BEHIND') {
+      throw new Error(
+        `${context}: PR is behind its base branch (mergeStateStatus=BEHIND). Update the branch and rerun \`warroom pr merge\`.`
+      );
+    }
+
+    options.mergeStatus?.(
+      `${context}: waiting for GitHub to recompute mergeability (attempt ${attempt}, mergeable=${mergeable ?? 'unknown'}, mergeStateStatus=${mergeStateStatus ?? 'unknown'}).`
+    );
+    await new Promise((resolve) => setTimeout(resolve, pollMs));
+  }
+
+  throw new Error(
+    `${context}: timed out after ${Math.round(timeoutMs / 1000)}s waiting for GitHub mergeability (mergeable=${lastState.mergeable ?? 'unknown'}, mergeStateStatus=${lastState.mergeStateStatus ?? 'unknown'}). Retry \`warroom pr merge\` once GitHub finishes recomputing.`
+  );
+}
+
 async function runMergePostMerge(plan: MergePostMergeResult, options: PrOptions): Promise<MergePostMergeResult> {
   if (!plan.required) return plan;
   if (plan.blocked.length > 0) return { ...plan, status: 'failed', error: plan.blocked.join(' ') };
@@ -4977,6 +5042,9 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
           mergeChangelog = mergeChangelogSkipResult(mergeChangelog, 'Skipped because the required version bump failed before PR merge.');
         }
       } else {
+        if (mergeBump.required && mergeBump.committed && mergeBump.pushed) {
+          await waitForPrMergeable(ref, resolvedOptions, 'Version bump');
+        }
         const result = spawnSync(
           'gh',
           ['pr', 'merge', String(ref.number), '--repo', ref.repo, '--squash', '--delete-branch'],

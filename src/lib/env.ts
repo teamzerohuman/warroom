@@ -1,4 +1,4 @@
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } from 'node:fs';
+import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -19,6 +19,17 @@ export type AdapterInvocation = {
   display: string;
   cwd: string;
   mode: 'foreground' | 'interactive';
+  adapter: 'codex' | 'claude';
+};
+
+export type AdapterReportedUsage = {
+  inputTokens: number | null;
+  cachedInputTokens: number | null;
+  outputTokens: number | null;
+  totalTokens: number | null;
+  costUsd: number | null;
+  model: string | null;
+  sessionId: string | null;
 };
 
 export type AdapterRunResult = {
@@ -128,6 +139,27 @@ function codexModelArgs(local: Map<string, string>, example: Map<string, string>
   ];
 }
 
+function claudeEnvValue(
+  local: Map<string, string>,
+  example: Map<string, string>,
+  key: string,
+  fallback: string
+) {
+  return local.get(key) ?? example.get(key) ?? fallback;
+}
+
+function claudeModel(local: Map<string, string>, example: Map<string, string>) {
+  return claudeEnvValue(local, example, 'CLAUDE_MODEL', 'claude-sonnet-4-6');
+}
+
+function claudePermissionMode(
+  local: Map<string, string>,
+  example: Map<string, string>,
+  key: 'CLAUDE_PERMISSION_MODE' | 'CLAUDE_INTERACTIVE_PERMISSION_MODE'
+) {
+  return claudeEnvValue(local, example, key, 'acceptEdits');
+}
+
 export function getEnvStatus(workspaceRoot: string): EnvStatus {
   const examplePath = path.join(workspaceRoot, '.env.local.example');
   const localPath = path.join(workspaceRoot, '.env.local');
@@ -167,13 +199,31 @@ export function getAdapterInvocation(workspaceRoot: string, cwd = workspaceRoot)
   const adapter = local.get('LLM_ADAPTER') ?? example.get('LLM_ADAPTER') ?? 'codex';
   if (adapter === 'claude') {
     const command = local.get('CLAUDE_COMMAND') ?? example.get('CLAUDE_COMMAND') ?? 'claude';
-    return { command, args: [], display: command, cwd, mode: 'foreground' };
+    const model = claudeModel(local, example);
+    const permissionMode = claudePermissionMode(local, example, 'CLAUDE_PERMISSION_MODE');
+    const args = [
+      '--print',
+      '--output-format',
+      'json',
+      '--model',
+      model,
+      '--permission-mode',
+      permissionMode,
+    ];
+    return {
+      command,
+      args,
+      display: [command, ...args].join(' '),
+      cwd,
+      mode: 'foreground',
+      adapter: 'claude',
+    };
   }
 
   const command = local.get('CODEX_COMMAND') ?? example.get('CODEX_COMMAND') ?? 'codex';
   const modelArgs = codexModelArgs(local, example);
   const args = ['exec', ...modelArgs, '--cd', cwd, '-'];
-  return { command, args, display: [command, ...args].join(' '), cwd, mode: 'foreground' };
+  return { command, args, display: [command, ...args].join(' '), cwd, mode: 'foreground', adapter: 'codex' };
 }
 
 export function getInteractiveAdapterInvocation(workspaceRoot: string, cwd = workspaceRoot, prompt = '<prompt>'): AdapterInvocation {
@@ -184,7 +234,17 @@ export function getInteractiveAdapterInvocation(workspaceRoot: string, cwd = wor
   const adapter = local.get('LLM_ADAPTER') ?? example.get('LLM_ADAPTER') ?? 'codex';
   if (adapter === 'claude') {
     const command = local.get('CLAUDE_COMMAND') ?? example.get('CLAUDE_COMMAND') ?? 'claude';
-    return { command, args: [prompt], display: `${command} <prompt>`, cwd, mode: 'interactive' };
+    const model = claudeModel(local, example);
+    const permissionMode = claudePermissionMode(local, example, 'CLAUDE_INTERACTIVE_PERMISSION_MODE');
+    const args = ['--model', model, '--permission-mode', permissionMode, prompt];
+    return {
+      command,
+      args,
+      display: [command, '--model', model, '--permission-mode', permissionMode, '<prompt>'].join(' '),
+      cwd,
+      mode: 'interactive',
+      adapter: 'claude',
+    };
   }
 
   const command = local.get('CODEX_COMMAND') ?? example.get('CODEX_COMMAND') ?? 'codex';
@@ -199,16 +259,29 @@ export function getInteractiveAdapterInvocation(workspaceRoot: string, cwd = wor
     display: [command, ...modelArgs, '--sandbox', sandbox, ...networkArgs, '--cd', cwd, '<prompt>'].join(' '),
     cwd,
     mode: 'interactive',
+    adapter: 'codex',
   };
+}
+
+function withClaudeOutputFormat(invocation: AdapterInvocation, format: 'json' | 'stream-json'): AdapterInvocation {
+  if (invocation.adapter !== 'claude') return invocation;
+  const idx = invocation.args.indexOf('--output-format');
+  if (idx === -1 || idx + 1 >= invocation.args.length) return invocation;
+  const newArgs = [...invocation.args];
+  newArgs[idx + 1] = format;
+  // stream-json requires --verbose when used with --print
+  if (format === 'stream-json' && !newArgs.includes('--verbose')) {
+    newArgs.push('--verbose');
+  }
+  return { ...invocation, args: newArgs, display: [invocation.command, ...newArgs].join(' ') };
 }
 
 export function runAdapter(workspaceRoot: string, prompt: string, options: AdapterRunOptions = {}): AdapterRunResult {
   const adapterPrompt = promptWithAdapterRuntimeNote(workspaceRoot, prompt, options.usage);
-  const invocation = withLastMessageOutput(
-    getAdapterInvocation(workspaceRoot, options.cwd ?? workspaceRoot),
-    options.outputLastMessagePath
-  );
+  const baseInvocation = getAdapterInvocation(workspaceRoot, options.cwd ?? workspaceRoot);
   const captureStdout = options.captureStdout === true;
+  const formatInvocation = captureStdout ? baseInvocation : withClaudeOutputFormat(baseInvocation, 'stream-json');
+  const invocation = withLastMessageOutput(formatInvocation, options.outputLastMessagePath);
   process.stderr.write(`Launching adapter: ${invocation.display}\n`);
   const result = runForegroundAdapterProcess(invocation, adapterPrompt, {
     captureStdout,
@@ -220,6 +293,12 @@ export function runAdapter(workspaceRoot: string, prompt: string, options: Adapt
   const error =
     result.error?.message ??
     (result.status === 0 ? null : `Adapter exited with status ${result.status ?? 'unknown'}.`);
+
+  const claudeOutput = invocation.adapter === 'claude' ? extractClaudeJsonOutput(result.stdout) : null;
+  if (claudeOutput && options.outputLastMessagePath) {
+    writeFileSync(options.outputLastMessagePath, claudeOutput.result);
+  }
+
   const outputText =
     options.outputLastMessagePath && existsSync(options.outputLastMessagePath)
       ? readFileSync(options.outputLastMessagePath, 'utf8')
@@ -231,6 +310,7 @@ export function runAdapter(workspaceRoot: string, prompt: string, options: Adapt
     stdout: result.stdout,
     stderr: result.stderr,
     outputText,
+    adapterReportedUsage: claudeOutput?.usage ?? null,
   });
   if (usage.warning) process.stderr.write(`${usage.warning}\n`);
 
@@ -245,8 +325,84 @@ export function runAdapter(workspaceRoot: string, prompt: string, options: Adapt
   };
 }
 
+type ClaudeJsonEnvelope = {
+  result: string;
+  usage: AdapterReportedUsage;
+};
+
+function parseClaudeJsonObject(parsed: Record<string, unknown>): ClaudeJsonEnvelope {
+  const resultField = typeof parsed.result === 'string' ? parsed.result : '';
+  const rawUsage = (parsed.usage as Record<string, unknown> | undefined) ?? undefined;
+  const inputTokens = numberOrNull(rawUsage?.input_tokens);
+  const outputTokens = numberOrNull(rawUsage?.output_tokens);
+  const cacheRead = numberOrNull(rawUsage?.cache_read_input_tokens);
+  const cacheCreation = numberOrNull(rawUsage?.cache_creation_input_tokens);
+  const cachedInputTokens =
+    cacheRead !== null || cacheCreation !== null ? (cacheRead ?? 0) + (cacheCreation ?? 0) : null;
+  const totalTokens =
+    inputTokens !== null && outputTokens !== null
+      ? inputTokens + outputTokens + (cachedInputTokens ?? 0)
+      : null;
+  const costUsd = numberOrNull(parsed.total_cost_usd);
+  const model = typeof parsed.model === 'string' ? parsed.model : null;
+  const sessionId = typeof parsed.session_id === 'string' ? parsed.session_id : null;
+  return {
+    result: resultField,
+    usage: { inputTokens, cachedInputTokens, outputTokens, totalTokens, costUsd, model, sessionId },
+  };
+}
+
+function extractClaudeJsonOutput(stdout: string | null): ClaudeJsonEnvelope | null {
+  if (!stdout) return null;
+  const trimmed = stdout.trim();
+  if (!trimmed) return null;
+  // stream-json: JSONL lines — find the result line
+  const lines = trimmed.split('\n');
+  if (lines.length > 1) {
+    for (let i = lines.length - 1; i >= 0; i--) {
+      const line = lines[i].trim();
+      if (!line) continue;
+      try {
+        const parsed = JSON.parse(line) as Record<string, unknown>;
+        if (parsed.type === 'result') return parseClaudeJsonObject(parsed);
+      } catch {
+        continue;
+      }
+    }
+    return null;
+  }
+  // json: single JSON blob
+  try {
+    return parseClaudeJsonObject(JSON.parse(trimmed) as Record<string, unknown>);
+  } catch {
+    return null;
+  }
+}
+
+function numberOrNull(value: unknown): number | null {
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
 function shellQuote(value: string) {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+function resolveCommandPath(command: string, env: NodeJS.ProcessEnv): string | null {
+  if (command.includes('/')) return existsSync(command) ? command : null;
+  const pathValue = env.PATH ?? process.env.PATH ?? '';
+  for (const dir of pathValue.split(path.delimiter).filter(Boolean)) {
+    const candidate = path.join(dir, command);
+    if (existsSync(candidate)) return candidate;
+  }
+  return null;
+}
+
+function adapterCommandNotFoundError(command: string): NodeJS.ErrnoException {
+  const error = new Error(
+    `Adapter command not found on PATH: \`${command}\`. Install the binary or set the matching *_COMMAND in .env.local to an absolute path.`
+  ) as NodeJS.ErrnoException;
+  error.code = 'ENOENT';
+  return error;
 }
 
 function runForegroundAdapterProcess(
@@ -254,8 +410,15 @@ function runForegroundAdapterProcess(
   prompt: string,
   options: { captureStdout: boolean; env: NodeJS.ProcessEnv }
 ) {
+  const resolvedCommand = resolveCommandPath(invocation.command, options.env);
+  if (!resolvedCommand) {
+    const error = adapterCommandNotFoundError(invocation.command);
+    process.stderr.write(`${error.message}\n`);
+    return { status: 127, signal: null, error, stdout: '', stderr: error.message };
+  }
+
   if (options.captureStdout) {
-    const result = spawnSync(invocation.command, invocation.args, {
+    const result = spawnSync(resolvedCommand, invocation.args, {
       cwd: invocation.cwd,
       input: prompt,
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -275,14 +438,14 @@ function runForegroundAdapterProcess(
   const outputDir = mkdtempSync(path.join(tmpdir(), 'warroom-adapter-output-'));
   const stdoutPath = path.join(outputDir, 'stdout.log');
   const stderrPath = path.join(outputDir, 'stderr.log');
-  const command = [shellQuote(invocation.command), ...invocation.args.map(shellQuote)].join(' ');
+  const command = [shellQuote(resolvedCommand), ...invocation.args.map(shellQuote)].join(' ');
   const script = [
     'set -o pipefail',
     `${command} 2> >(tee ${shellQuote(stderrPath)} >&2) | tee ${shellQuote(stdoutPath)}`,
     'exit ${PIPESTATUS[0]}',
   ].join('\n');
   try {
-    const result = spawnSync('bash', ['-lc', script], {
+    const result = spawnSync('bash', ['-c', script], {
       cwd: invocation.cwd,
       input: prompt,
       stdio: ['pipe', 'inherit', 'inherit'],
@@ -302,7 +465,7 @@ function runForegroundAdapterProcess(
 }
 
 function withLastMessageOutput(invocation: AdapterInvocation, outputPath: string | undefined): AdapterInvocation {
-  if (!outputPath || invocation.args[0] !== 'exec') return invocation;
+  if (!outputPath || invocation.adapter !== 'codex' || invocation.args[0] !== 'exec') return invocation;
 
   const args = ['exec', '-o', outputPath, ...invocation.args.slice(1)];
   return {
@@ -330,9 +493,15 @@ function hasInteractiveTerminal() {
 }
 
 function runInteractiveAdapterProcess(invocation: AdapterInvocation, env: NodeJS.ProcessEnv) {
+  const resolvedCommand = resolveCommandPath(invocation.command, env);
+  if (!resolvedCommand) {
+    const error = adapterCommandNotFoundError(invocation.command);
+    process.stderr.write(`${error.message}\n`);
+    return { status: 127, signal: null, error, outputText: null as string | null };
+  }
   const scriptCommand = interactiveCaptureScriptCommand();
   if (!scriptCommand) {
-    const result = spawnSync(invocation.command, invocation.args, {
+    const result = spawnSync(resolvedCommand, invocation.args, {
       cwd: invocation.cwd,
       stdio: 'inherit',
       encoding: 'utf8',
@@ -349,7 +518,7 @@ function runInteractiveAdapterProcess(invocation: AdapterInvocation, env: NodeJS
   const outputDir = mkdtempSync(path.join(tmpdir(), 'warroom-interactive-adapter-output-'));
   const outputPath = path.join(outputDir, 'terminal.log');
   try {
-    const result = spawnSync(scriptCommand, ['-q', outputPath, invocation.command, ...invocation.args], {
+    const result = spawnSync(scriptCommand, ['-q', outputPath, resolvedCommand, ...invocation.args], {
       cwd: invocation.cwd,
       stdio: 'inherit',
       encoding: 'utf8',
@@ -384,6 +553,7 @@ export function runInteractiveAdapter(workspaceRoot: string, prompt: string, opt
     stdout: null,
     stderr: null,
     outputText: result.outputText,
+    adapterReportedUsage: null,
   });
   if (usage.warning) process.stderr.write(`${usage.warning}\n`);
 

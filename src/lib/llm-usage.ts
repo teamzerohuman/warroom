@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import type { AdapterInvocation } from './env.js';
+import type { AdapterInvocation, AdapterReportedUsage } from './env.js';
 
 export type LlmUsageContext = {
   issue?: string | null;
@@ -41,6 +41,8 @@ export type LlmUsageEntry = {
   estimated: boolean;
   usageSource: 'adapter' | 'estimated' | 'mixed';
   costUsd: number | null;
+  adapterReportedCostUsd: number | null;
+  sessionId: string | null;
   costUnavailableReason: string | null;
   migratedFromRunDir?: string | null;
 };
@@ -223,6 +225,9 @@ function readPricing(workspaceRoot: string): PricingFile {
 }
 
 function entryCost(workspaceRoot: string, entry: Omit<LlmUsageEntry, 'costUsd' | 'costUnavailableReason'>) {
+  if (entry.adapterReportedCostUsd != null) {
+    return { costUsd: Number(entry.adapterReportedCostUsd.toFixed(6)), costUnavailableReason: null };
+  }
   const pricing = readPricing(workspaceRoot);
   const model = entry.model;
   if (!model) return { costUsd: null, costUnavailableReason: 'model unknown' };
@@ -277,10 +282,15 @@ function entryCost(workspaceRoot: string, entry: Omit<LlmUsageEntry, 'costUsd' |
 }
 
 function entryWithCurrentCost(workspaceRoot: string, entry: LlmUsageEntry): LlmUsageEntry {
-  return {
+  const normalized: LlmUsageEntry = {
     ...entry,
     taskTitle: entry.taskTitle ?? llmUsageTaskTitle(entry),
-    ...entryCost(workspaceRoot, entry),
+    adapterReportedCostUsd: entry.adapterReportedCostUsd ?? null,
+    sessionId: entry.sessionId ?? null,
+  };
+  return {
+    ...normalized,
+    ...entryCost(workspaceRoot, normalized),
   };
 }
 
@@ -300,25 +310,38 @@ function buildEntry(
     stdout: string | null;
     stderr: string | null;
     outputText: string | null;
+    adapterReportedUsage: AdapterReportedUsage | null;
   }
 ): LlmUsageEntry {
   const timestamp = new Date().toISOString();
   const outputText = [result.stdout, result.stderr, result.outputText].filter((value): value is string => Boolean(value)).join('\n');
   const parsed = parseAdapterUsage(outputText);
+  const reported = result.adapterReportedUsage;
+  const reportedFound =
+    reported !== null &&
+    (reported.inputTokens !== null ||
+      reported.outputTokens !== null ||
+      reported.cachedInputTokens !== null ||
+      reported.totalTokens !== null ||
+      reported.costUsd !== null);
   const estimatedInputTokens = estimateTokensFromCharacters(prompt);
   const estimatedOutputTokens = estimateTokensFromCharacters(outputText || null);
-  const inputTokens = parsed.inputTokens ?? estimatedInputTokens;
-  const cachedInputTokens = parsed.cachedInputTokens;
-  const outputTokens = parsed.outputTokens ?? estimatedOutputTokens;
+  const inputTokens = reported?.inputTokens ?? parsed.inputTokens ?? estimatedInputTokens;
+  const cachedInputTokens = reported?.cachedInputTokens ?? parsed.cachedInputTokens;
+  const outputTokens = reported?.outputTokens ?? parsed.outputTokens ?? estimatedOutputTokens;
   const totalTokens =
+    reported?.totalTokens ??
     parsed.totalTokens ??
-    (inputTokens !== null && outputTokens !== null ? inputTokens + outputTokens : null);
+    (inputTokens !== null && outputTokens !== null
+      ? inputTokens + outputTokens + (cachedInputTokens ?? 0)
+      : null);
+  const adapterFound = parsed.found || reportedFound;
   const estimated =
-    !parsed.found ||
-    parsed.inputTokens === null ||
-    (parsed.outputTokens === null && outputTokens !== null) ||
-    (parsed.totalTokens === null && totalTokens !== null);
-  const usageSource: LlmUsageEntry['usageSource'] = !parsed.found ? 'estimated' : estimated ? 'mixed' : 'adapter';
+    !adapterFound ||
+    (reported?.inputTokens ?? parsed.inputTokens) === null ||
+    ((reported?.outputTokens ?? parsed.outputTokens) === null && outputTokens !== null) ||
+    ((reported?.totalTokens ?? parsed.totalTokens) === null && totalTokens !== null);
+  const usageSource: LlmUsageEntry['usageSource'] = !adapterFound ? 'estimated' : estimated ? 'mixed' : 'adapter';
   const baseEntry: Omit<LlmUsageEntry, 'costUsd' | 'costUnavailableReason'> = {
     id: `${timestamp}-${context.command}-${context.stage}-${Math.random().toString(36).slice(2, 8)}`,
     timestamp,
@@ -329,7 +352,7 @@ function buildEntry(
     repo: context.repo ?? null,
     cwd: invocation.cwd ?? null,
     adapter: adapterName(invocation),
-    model: adapterModel(invocation),
+    model: reported?.model ?? adapterModel(invocation),
     reasoningEffort: adapterReasoningEffort(invocation),
     mode: invocation.mode,
     commandDisplay: invocation.display,
@@ -347,6 +370,8 @@ function buildEntry(
     totalTokens,
     estimated,
     usageSource,
+    adapterReportedCostUsd: reported?.costUsd ?? null,
+    sessionId: reported?.sessionId ?? null,
   };
   return {
     ...baseEntry,
@@ -421,11 +446,15 @@ export function recordLlmAdapterUsage(
     stdout: string | null;
     stderr: string | null;
     outputText: string | null;
+    adapterReportedUsage?: AdapterReportedUsage | null;
   }
 ) {
   if (!context) return { entry: null as LlmUsageEntry | null, warning: null as string | null };
   try {
-    const entry = buildEntry(workspaceRoot, context, invocation, prompt, result);
+    const entry = buildEntry(workspaceRoot, context, invocation, prompt, {
+      ...result,
+      adapterReportedUsage: result.adapterReportedUsage ?? null,
+    });
     if (context.runDir) {
       const runUsage = readRunUsage(context.runDir);
       writeRunUsage(context.runDir, [...runUsage.entries, entry]);

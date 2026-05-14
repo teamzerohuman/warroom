@@ -7,6 +7,12 @@ import { checkGithubAuth, checkTool } from '../lib/tools.js';
 import { checkCampaignLabels, checkCampaignStatusOptions } from '../lib/campaign.js';
 import { runAlliesStatus } from './allies.js';
 
+function adapterToolChecks(adapter: string | null) {
+  if (adapter === 'claude') return [checkTool('claude', 'claude', ['--version'])];
+  if (adapter === 'codex' || adapter === 'codex-cloud') return [checkTool('codex', 'codex', ['--version'])];
+  return [];
+}
+
 const requiredFiles = [
   'AGENTS.md',
   'README.md',
@@ -35,6 +41,7 @@ export function runDoctor(workspaceRoot: string) {
     checkGithubAuth(),
     checkTool('node', 'node', ['--version']),
     checkTool('npm', 'npm', ['--version']),
+    ...adapterToolChecks(env.adapter),
   ];
   const campaignLabels = checkCampaignLabels(manifest);
   const campaignStatuses = checkCampaignStatusOptions();

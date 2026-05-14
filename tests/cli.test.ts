@@ -146,6 +146,7 @@ describe('phase-1 CLI', () => {
       display: 'codex exec --model gpt-5.5 -c model_reasoning_effort="xhigh"',
       cwd: root,
       mode: 'foreground' as const,
+      adapter: 'codex' as const,
     };
 
     const usage = recordLlmAdapterUsage(
@@ -196,6 +197,7 @@ describe('phase-1 CLI', () => {
       display: 'codex exec --model gpt-5.5 -c model_reasoning_effort="xhigh"',
       cwd: root,
       mode: 'foreground' as const,
+      adapter: 'codex' as const,
     };
 
     const usage = recordLlmAdapterUsage(
@@ -1828,6 +1830,154 @@ describe('phase-1 CLI', () => {
     expect(invocation.display).toBe(`codex --model gpt-5.4 -c model_reasoning_effort="high" --sandbox danger-full-access --cd ${root} <prompt>`);
   });
 
+  it('builds foreground Claude invocation with print/json/model/permission flags', () => {
+    const root = makeDevFixture();
+    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=claude\nCLAUDE_COMMAND=claude\n');
+
+    const invocation = getAdapterInvocation(root, root);
+
+    expect(invocation.adapter).toBe('claude');
+    expect(invocation.mode).toBe('foreground');
+    expect(invocation.args).toEqual([
+      '--print',
+      '--output-format',
+      'json',
+      '--model',
+      'claude-sonnet-4-6',
+      '--permission-mode',
+      'acceptEdits',
+    ]);
+    expect(invocation.display).toBe('claude --print --output-format json --model claude-sonnet-4-6 --permission-mode acceptEdits');
+  });
+
+  it('builds interactive Claude invocation with model/permission flags and prompt arg', () => {
+    const root = makeDevFixture();
+    writeFileSync(
+      path.join(root, '.env.local'),
+      'LLM_ADAPTER=claude\nCLAUDE_COMMAND=claude\nCLAUDE_MODEL=claude-opus-4-7\nCLAUDE_INTERACTIVE_PERMISSION_MODE=bypassPermissions\n'
+    );
+
+    const invocation = getInteractiveAdapterInvocation(root, root, 'prompt');
+
+    expect(invocation.adapter).toBe('claude');
+    expect(invocation.mode).toBe('interactive');
+    expect(invocation.args).toEqual([
+      '--model',
+      'claude-opus-4-7',
+      '--permission-mode',
+      'bypassPermissions',
+      'prompt',
+    ]);
+    expect(invocation.display).toBe('claude --model claude-opus-4-7 --permission-mode bypassPermissions <prompt>');
+  });
+
+  it('resolves a bare CLAUDE_COMMAND from inherited PATH without going through a login shell', () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'tools');
+    mkdirSync(bin, { recursive: true });
+    const adapterPath = path.join(bin, 'claude');
+    writeFileSync(
+      adapterPath,
+      `#!/bin/sh
+cat <<'EOF'
+{"type":"result","subtype":"success","is_error":false,"result":"reply","total_cost_usd":0.001,"usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":5},"model":"claude-sonnet-4-6"}
+EOF
+exit 0
+`
+    );
+    chmodSync(adapterPath, 0o755);
+    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=claude\nCLAUDE_COMMAND=claude\n');
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    try {
+      const result = runAdapter(root, 'prompt body', { cwd: root, captureStdout: false });
+      expect(result.launched).toBe(true);
+      expect(result.status).toBe(0);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('fails fast with a clear error when the configured adapter command is not on PATH', () => {
+    const root = makeDevFixture();
+    writeFileSync(path.join(root, '.env.local'), 'LLM_ADAPTER=claude\nCLAUDE_COMMAND=warroom-nonexistent-claude\n');
+
+    const result = runAdapter(root, 'prompt body', { cwd: root });
+
+    expect(result.launched).toBe(false);
+    expect(result.status).toBe(127);
+    expect(result.error ?? '').toContain('Adapter command not found on PATH: `warroom-nonexistent-claude`');
+  });
+
+  it('parses Claude --output-format json tokens, cost, and result for usage tracking', () => {
+    const root = makeDevFixture();
+    const promptCapturePath = path.join(root, 'claude-prompt.txt');
+    const outputPath = path.join(root, 'claude-last-message.txt');
+    const adapterPath = path.join(root, 'fake-claude');
+    writeFileSync(
+      adapterPath,
+      `#!/bin/sh
+cat > "$WARROOM_PROMPT_CAPTURE_PATH"
+cat <<'EOF'
+{"type":"result","subtype":"success","is_error":false,"result":"Claude reply body","session_id":"sess-123","total_cost_usd":0.0345,"usage":{"input_tokens":120,"cache_creation_input_tokens":40,"cache_read_input_tokens":60,"output_tokens":80},"model":"claude-sonnet-4-6"}
+EOF
+exit 0
+`
+    );
+    chmodSync(adapterPath, 0o755);
+    writeFileSync(
+      path.join(root, '.env.local'),
+      `LLM_ADAPTER=claude\nCLAUDE_COMMAND=${adapterPath}\nWARROOM_PROMPT_CAPTURE_PATH=${promptCapturePath}\n`
+    );
+
+    const result = runAdapter(root, 'prompt body', {
+      cwd: root,
+      outputLastMessagePath: outputPath,
+      captureStdout: true,
+      usage: {
+        issue: 'TeamFloPay/backend#777',
+        command: 'pr-create',
+        stage: 'pr-text-summary',
+        repo: 'TeamFloPay/backend',
+        commandRunId: 'claude-fixture-run',
+      },
+    });
+
+    expect(result.launched).toBe(true);
+    expect(result.invocation.adapter).toBe('claude');
+    expect(readFileSync(outputPath, 'utf8')).toBe('Claude reply body');
+    expect(readFileSync(promptCapturePath, 'utf8')).toContain('prompt body');
+
+    const ledgerPath = path.join(root, '.warroom', 'runs', 'issues', 'TeamFloPay__backend__777', 'usage-ledger.json');
+    const ledger = JSON.parse(readFileSync(ledgerPath, 'utf8')) as {
+      entries: Array<{
+        inputTokens: number | null;
+        cachedInputTokens: number | null;
+        outputTokens: number | null;
+        totalTokens: number | null;
+        costUsd: number | null;
+        adapterReportedCostUsd: number | null;
+        sessionId: string | null;
+        model: string | null;
+        adapter: string;
+        usageSource: string;
+      }>;
+    };
+    expect(ledger.entries[0]).toMatchObject({
+      adapter: 'fake-claude',
+      model: 'claude-sonnet-4-6',
+      inputTokens: 120,
+      cachedInputTokens: 100,
+      outputTokens: 80,
+      totalTokens: 300,
+      adapterReportedCostUsd: 0.0345,
+      costUsd: 0.0345,
+      sessionId: 'sess-123',
+      usageSource: 'adapter',
+    });
+  });
+
   it('passes .env.local values into local adapter launches', () => {
     const root = makeDevFixture();
     const capturePath = path.join(root, 'adapter-env.txt');
@@ -1925,6 +2075,7 @@ describe('phase-1 CLI', () => {
       display: 'codex exec --model gpt-5.5 -c model_reasoning_effort="xhigh"',
       cwd: root,
       mode: 'foreground' as const,
+      adapter: 'codex' as const,
     };
 
     recordLlmAdapterUsage(
@@ -2704,6 +2855,62 @@ describe('phase-1 CLI', () => {
         encoding: 'utf8',
       });
       expect(remoteFeatureSubject.stdout.trim()).toBe('chore(release): bump patch version');
+    } finally {
+      process.env.PATH = originalPath;
+      for (const key of envKeys) {
+        const value = originalEnv[key];
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
+      }
+    }
+  });
+
+  it('waits for GitHub to recompute mergeability after a version bump push', async () => {
+    const { root, sdk, sdkRemote } = makeChangelogMergeFixture({ bump: true });
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    const flapPath = path.join(root, 'bump-mergeability-flap.txt');
+    writeChangelogMergeGhFixture(bin, sdkRemote, { releaseBump: false, mergeabilityFlapPath: flapPath });
+
+    const originalPath = process.env.PATH;
+    const envKeys = [
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS',
+      'WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS',
+      'WARROOM_MERGE_WAIT_POLL_MS',
+      'WARROOM_MERGE_WAIT_TIMEOUT_MS',
+    ] as const;
+    const originalEnv = Object.fromEntries(envKeys.map((key) => [key, process.env[key]]));
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_POLL_MS = '0';
+    process.env.WARROOM_MERGE_CHANGELOG_ACTIONS_SETTLE_MS = '0';
+    process.env.WARROOM_MERGE_WAIT_POLL_MS = '1';
+    process.env.WARROOM_MERGE_WAIT_TIMEOUT_MS = '60000';
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: sdk, output: (line) => lines.push(line) });
+
+      await program.parseAsync([
+        'node',
+        'warroom',
+        'pr',
+        'merge',
+        '--pr',
+        'TeamFloPay/sdk#655',
+        '--confirm',
+        '--bump-version',
+        'patch',
+      ]);
+
+      expect(lines).toContain('Merge bump: passed');
+      expect(lines.some((line) => line.includes('Version bump: waiting for GitHub to recompute mergeability'))).toBe(true);
+      expect(lines.some((line) => line.includes('Version bump: PR is mergeable (mergeStateStatus=CLEAN).'))).toBe(true);
+      expect(Number(readFileSync(flapPath, 'utf8'))).toBeGreaterThanOrEqual(3);
+
+      const remoteFeaturePackage = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/feature/sdk:package.json'], {
+        encoding: 'utf8',
+      });
+      expect(JSON.parse(remoteFeaturePackage.stdout).version).toBe('1.0.1');
     } finally {
       process.env.PATH = originalPath;
       for (const key of envKeys) {
@@ -5243,12 +5450,13 @@ function seedMergedMainForChangelogFixture(sdkRemote: string, releaseBump: boole
 function writeChangelogMergeGhFixture(
   bin: string,
   sdkRemote: string,
-  options: { releaseBump?: boolean; dependabotFailure?: boolean; merged?: boolean } = {}
+  options: { releaseBump?: boolean; dependabotFailure?: boolean; merged?: boolean; mergeabilityFlapPath?: string } = {}
 ) {
   const ghPath = path.join(bin, 'gh');
   const releaseBump = options.releaseBump !== false;
   const dependabotFailure = options.dependabotFailure === true;
   const merged = options.merged === true;
+  const mergeabilityFlapPath = options.mergeabilityFlapPath ?? '';
   if (merged) seedMergedMainForChangelogFixture(sdkRemote, releaseBump);
   writeFileSync(
     ghPath,
@@ -5262,6 +5470,7 @@ const sdkRemote = ${JSON.stringify(sdkRemote)};
 const releaseBump = ${JSON.stringify(releaseBump)};
 const dependabotFailure = ${JSON.stringify(dependabotFailure)};
 const merged = ${JSON.stringify(merged)};
+const mergeabilityFlapPath = ${JSON.stringify(mergeabilityFlapPath)};
 
 function json(value) {
   process.stdout.write(JSON.stringify(value));
@@ -5282,6 +5491,18 @@ function remoteMainSha() {
 }
 
 if (args[0] === 'pr' && args[1] === 'view') {
+  const jsonFields = optionValue('--json') || '';
+  if (jsonFields === 'mergeable,mergeStateStatus' && mergeabilityFlapPath) {
+    let count = 0;
+    try { count = Number(readFileSync(mergeabilityFlapPath, 'utf8')) || 0; } catch (_) {}
+    writeFileSync(mergeabilityFlapPath, String(count + 1));
+    if (count < 2) {
+      json({ mergeable: 'UNKNOWN', mergeStateStatus: 'UNKNOWN' });
+    } else {
+      json({ mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' });
+    }
+    process.exit(0);
+  }
   json({
     title: 'Ready SDK PR',
     body: 'Adds the SDK behavior that should be reflected in the changelog.',
