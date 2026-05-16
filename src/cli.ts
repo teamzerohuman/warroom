@@ -30,6 +30,7 @@ import {
 import { runMapsAssign, type MapsAssignResult } from './commands/maps-assign.js';
 import { runMapsStudy } from './commands/maps-study.js';
 import {
+  findOpenPrForBranch,
   inferIssueRefForCurrentBranch,
   inferPrRefForCurrentBranch,
   runIssueStart,
@@ -984,6 +985,13 @@ async function promptPrCreateAfterCommit(
 ) {
   if (!result.committed) return;
 
+  const existingPr = result.branch ? findOpenPrForBranch(result.githubRepo, result.branch) : null;
+  if (existingPr) {
+    output(`Existing PR detected: ${existingPr.url}`);
+    await promptPrReviewForRef(workspaceRoot, output, input, existingPr.ref, result.issue, {});
+    return;
+  }
+
   const createPr = await promptConfirmation(output, input, 'Run `warroom pr create` next? [y/N]');
   if (!createPr) return;
 
@@ -1194,24 +1202,21 @@ function prRefFromCreateResult(result: PrCreateResult) {
   return match ? `${match[1]}#${match[2]}` : null;
 }
 
-async function promptPrReviewAfterPrCreate(
+async function promptPrReviewForRef(
   workspaceRoot: string,
   output: Output,
   input: Input,
-  result: PrCreateResult,
+  prRef: string,
+  issue: string | null | undefined,
   options: { writeArtifact?: boolean; liveMergeOutput?: PrMergeLiveOutput }
 ) {
-  if (!result.created && !result.existingPr) return;
-  const prRef = prRefFromCreateResult(result);
-  if (!prRef) return;
-
   const reviewPr = await promptConfirmation(output, input, 'Run `warroom pr review` next? [y/N]');
   if (!reviewPr) return;
 
   output(`Starting PR review for ${prRef}`);
   const review = await runPrReview(workspaceRoot, {
     pr: prRef,
-    issue: result.issue ?? undefined,
+    issue: issue ?? undefined,
     dryRun: false,
     confirmStatus: true,
     writeArtifact: options.writeArtifact,
@@ -1225,6 +1230,19 @@ async function promptPrReviewAfterPrCreate(
     writeArtifact: options.writeArtifact,
     liveOutput: options.liveMergeOutput,
   });
+}
+
+async function promptPrReviewAfterPrCreate(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  result: PrCreateResult,
+  options: { writeArtifact?: boolean; liveMergeOutput?: PrMergeLiveOutput }
+) {
+  if (!result.created && !result.existingPr) return;
+  const prRef = prRefFromCreateResult(result);
+  if (!prRef) return;
+  await promptPrReviewForRef(workspaceRoot, output, input, prRef, result.issue, options);
 }
 
 async function promptPrMergeAfterPrReview(

@@ -555,6 +555,19 @@ function shellQuote(value: string) {
   return /^[A-Za-z0-9_./:@+-]+$/.test(value) ? value : JSON.stringify(value);
 }
 
+export function findOpenPrForBranch(githubRepo: string, branch: string): { ref: string; url: string } | null {
+  const prs = ghJson<Array<{ number?: number; url?: string }>>(
+    ['pr', 'list', '--repo', githubRepo, '--state', 'open', '--head', branch, '--json', 'number,url', '--limit', '5'],
+    []
+  );
+  const first = prs.find((pr) => typeof pr.number === 'number');
+  if (!first?.number) return null;
+  return {
+    ref: `${githubRepo}#${first.number}`,
+    url: first.url ?? `https://github.com/${githubRepo}/pull/${first.number}`,
+  };
+}
+
 type LinkedBranchSetup = {
   ok: boolean;
   output: string | null;
