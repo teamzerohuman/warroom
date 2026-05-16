@@ -1,6 +1,6 @@
 export function ownerRepoFromText(value: string | undefined) {
   const ownerRepo = value?.match(
-    /^\s*(?:[-*]\s*)?(?:\*\*)?Owner repo\s*:?(?:\*\*)?\s*:?\s*`?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)`?/im
+    /(?:^|\n)\s*(?:#+\s*|[-*]\s*)?(?:\*\*)?Owner repo[\s\S]{0,60}?`?([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+)`?/i
   )?.[1];
   if (ownerRepo) return ownerRepo;
 

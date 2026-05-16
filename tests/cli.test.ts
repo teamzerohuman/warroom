@@ -916,7 +916,7 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('Campaign status: updated'))).toBe(false);
       expectFinalOutcome(
         lines,
-        'Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.'
+        'Outcome: not handed off to LLM adapter. Blocker: Mapped checkout has local changes. Commit, stash, or move them before creating warroom/7-build-the-selector. Resolve the blocker, then rerun the issue start command.'
       );
 
       const branch = spawnSync('git', ['branch', '--show-current'], { cwd: sdk, encoding: 'utf8' });
@@ -948,7 +948,7 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('branch blocked: Mapped checkout has local changes.'))).toBe(true);
       expectFinalOutcome(
         lines,
-        'Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.'
+        'Outcome: not handed off to LLM adapter. Blocker: Mapped checkout has local changes. Commit, stash, or move them before creating warroom/7-build-the-selector. Resolve the blocker, then rerun the issue start command.'
       );
     } finally {
       process.env.PATH = originalPath;
@@ -1615,7 +1615,8 @@ describe('phase-1 CLI', () => {
 
       expect(lines).toContain('PR review loop: failed');
       expect(lines.some((line) => line.includes('review loop blocked: LLM adapter did not post final replies to 1 CodeRabbit review thread'))).toBe(true);
-      expectFinalOutcome(lines, 'Outcome: PR review loop blocked. Resolve the blocker above, then rerun the PR review command.');
+      const finalOutcome = lines[lines.length - 2];
+      expect(finalOutcome).toMatch(/^Outcome: PR review loop blocked\. Blocker: LLM adapter did not post final replies to 1 CodeRabbit review thread.* Resolve the blocker, then rerun the PR review command\.$/);
     } finally {
       restorePrReviewEnv();
       process.env.PATH = originalPath;

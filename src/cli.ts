@@ -489,7 +489,7 @@ function issueStartOutcome(result: PrPlanResult) {
     if (result.adapterStarted) {
       return `Outcome: LLM adapter ran but exited with an error${branch}; inspect the adapter output above, resolve the failure, then rerun the issue start command.${status}`;
     }
-    return `Outcome: not handed off to LLM adapter. Resolve the blocker above, then rerun the issue start command.`;
+    return `Outcome: not handed off to LLM adapter. Blocker: ${result.launchError} Resolve the blocker, then rerun the issue start command.`;
   }
 
   return `Outcome: dry run only; no LLM handoff was launched, no development branch was created, and no Campaign status was updated.`;
@@ -505,7 +505,9 @@ function prReviewOutcome(result: PrPlanResult) {
     : '';
 
   if (result.launchError || result.prReviewLoop?.status === 'failed') {
-    return 'Outcome: PR review loop blocked. Resolve the blocker above, then rerun the PR review command.';
+    const blocker = result.launchError ?? result.prReviewLoop?.error ?? result.prReviewLoop?.blocked.join(' ');
+    const detail = blocker ? ` Blocker: ${blocker}` : '';
+    return `Outcome: PR review loop blocked.${detail} Resolve the blocker, then rerun the PR review command.`;
   }
 
   if (result.prReviewLoop?.completed) {
