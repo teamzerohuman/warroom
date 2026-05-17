@@ -110,7 +110,9 @@ repos:
     status: active
     merge:
       playwright: true
-      bump: false
+      bump:
+        enabled: true
+        command: pnpm bump:version
       changelog: false
     owner: app-demo
     description: Standalone SDK demo app after extraction from sdk/apps/demo.
