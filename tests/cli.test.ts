@@ -70,6 +70,7 @@ describe('phase-1 CLI', () => {
         changelogFormat: 'openchangelog',
         changelogUrl: 'https://changelog.sdk.flopay.com',
         changelogFile: 'release-notes/v1.0.1.ready-sdk-pr.md',
+        releaseNoteContent: null,
         version: '1.0.1',
         durationMs: 10,
         committed: true,
@@ -2781,7 +2782,7 @@ exit 0
       expect(lines.some((line) => line.startsWith('Run the public changelog update now (update '))).toBe(true);
       expect(lines).toContain('Merge changelog: skipped (Skipped by user during interactive changelog confirmation.)');
       expect(lines).toContain('Post victory summary comments now? [Y/n]');
-      expect(lines).toContain('Return the local checkout to the PR base branch now? [Y/n]');
+      expect(lines).toContain('Returning the local checkout to the PR base branch...');
 
       const remoteChangelog = spawnSync('git', ['--git-dir', sdkRemote, 'show', 'refs/heads/main:CHANGELOG.md'], {
         encoding: 'utf8',
@@ -3370,7 +3371,7 @@ exit 0
       expect(lines).toContain('Merge e2e: skipped (repos.yaml has merge.playwright: false for TeamFloPay/infra.)');
       expect(lines).toContain('Merged: yes');
       expect(lines).toContain('Post victory summary comments now? [Y/n]');
-      expect(lines).toContain('Return the local checkout to the PR base branch now? [Y/n]');
+      expect(lines).toContain('Returning the local checkout to the PR base branch...');
     } finally {
       process.env.PATH = originalPath;
     }
@@ -3434,7 +3435,7 @@ exit 0
       expect(lines).toContain('Backend process: reused existing');
       expect(lines).toContain('Merged: yes');
       expect(lines).toContain('Post victory summary comments now? [Y/n]');
-      expect(lines).toContain('Return the local checkout to the PR base branch now? [Y/n]');
+      expect(lines).toContain('Returning the local checkout to the PR base branch...');
       expect(existsSync(path.join(root, 'backend-started.txt'))).toBe(false);
     } finally {
       await stopChild(existingBackend);
@@ -3549,7 +3550,7 @@ exit 0
       expect(lines).toContain('Post victory summary comments now? [Y/n]');
       expect(lines).toContain('Summary pr: posted TeamFloPay/backend#655 https://github.com/TeamFloPay/backend/pull/655#issuecomment-1');
       expect(lines).toContain('Summary issue: posted TeamFloPay/backend#562 https://github.com/TeamFloPay/backend/issues/562#issuecomment-2');
-      expect(lines).toContain('Return the local checkout to the PR base branch now? [Y/n]');
+      expect(lines).toContain('Returning the local checkout to the PR base branch...');
       expect(lines).toContain('Local cleanup: applied TeamFloPay/backend');
       expect(lines).toContain('cleanup: Switched local checkout to main.');
       expect(lines).toContain('cleanup: Pulled latest main with git pull --ff-only.');

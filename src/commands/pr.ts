@@ -70,6 +70,7 @@ export type PrOptions = {
   e2eOutput?: (chunk: string, stream: 'stdout' | 'stderr') => void;
   mergeStatus?: (message: string) => void;
   changelogConfirmation?: (plan: MergeChangelogResult) => Promise<boolean>;
+  changelogPushConfirmation?: (plan: MergeChangelogResult) => Promise<boolean>;
   bumpConfirmation?: (plan: MergeBumpResult) => Promise<VersionBumpChoice>;
   reviewStatus?: (message: string) => void;
 };
@@ -107,6 +108,7 @@ export type MergeChangelogResult = {
   changelogFormat: 'keep-a-changelog' | 'openchangelog';
   changelogUrl: string | null;
   changelogFile: string | null;
+  releaseNoteContent: string | null;
   version: string | null;
   durationMs: number | null;
   committed: boolean;
@@ -3192,6 +3194,7 @@ function createMergeChangelogPlan(
       changelogFormat: changelogConfig.format,
       changelogUrl: changelogConfig.url,
       changelogFile: null,
+      releaseNoteContent: null,
       version: null,
       durationMs: null,
       committed: false,
@@ -3224,6 +3227,7 @@ function createMergeChangelogPlan(
     changelogFormat: changelogConfig.format,
     changelogUrl: changelogConfig.url,
     changelogFile: null,
+    releaseNoteContent: null,
     version: null,
     durationMs: null,
     committed: false,
@@ -3840,23 +3844,61 @@ async function runMergeChangelog(
     const commit = runGit(plan.path, ['commit', '-m', message]);
     if (commit.status !== 0) throw new Error(commit.stderr || `git commit failed with exit ${commit.status ?? 'unknown'}.`);
 
+    const committedPlan: MergeChangelogResult = {
+      ...plan,
+      version,
+      changelogFile,
+      committed: true,
+      currentBranch: plan.base,
+    };
+
+    if (options.changelogPushConfirmation) {
+      const proceed = await options.changelogPushConfirmation(committedPlan);
+      if (!proceed) {
+        return {
+          ...committedPlan,
+          status: 'skipped',
+          skipReason: `User declined to push. Commit is local at ${plan.path}; run \`git push origin ${plan.base}\` from there when ready.`,
+          durationMs: Date.now() - startedAt,
+          pushed: false,
+          commitSha: null,
+          error: null,
+        };
+      }
+    }
+
+    const stageAfterEdits = gitStatusEntries(plan.path).some((entry) => entry.path === changelogFile);
+    if (stageAfterEdits) {
+      const restage = runGit(plan.path, ['add', changelogFile]);
+      if (restage.status !== 0) throw new Error(restage.stderr || `git add ${changelogFile} failed with exit ${restage.status ?? 'unknown'}.`);
+      const amend = runGit(plan.path, ['commit', '--amend', '--no-edit']);
+      if (amend.status !== 0) throw new Error(amend.stderr || `git commit --amend failed with exit ${amend.status ?? 'unknown'}.`);
+      options.mergeStatus?.(`Changelog: amended commit with local edits to ${changelogFile}`);
+    }
+
     const commitSha = runGit(plan.path, ['rev-parse', '--short', 'HEAD']);
     if (commitSha.status !== 0) throw new Error(commitSha.stderr || 'Could not read changelog commit sha.');
+
+    let releaseNoteContent: string | null = null;
+    if (plan.changelogFormat === 'openchangelog') {
+      try {
+        releaseNoteContent = readFileSync(path.join(plan.path, changelogFile), 'utf8');
+      } catch {
+        releaseNoteContent = null;
+      }
+    }
 
     const push = runGit(plan.path, ['push', 'origin', plan.base]);
     if (push.status !== 0) throw new Error(push.stderr || `git push origin ${plan.base} failed with exit ${push.status ?? 'unknown'}.`);
 
     options.mergeStatus?.(`Changelog: pushed ${commitSha.stdout} to ${plan.repo}@${plan.base} with [skip-ci]`);
     return {
-      ...plan,
+      ...committedPlan,
       status: 'passed',
-      version,
-      changelogFile,
+      releaseNoteContent,
       durationMs: Date.now() - startedAt,
-      committed: true,
       pushed: true,
       commitSha: commitSha.stdout,
-      currentBranch: plan.base,
       error: null,
     };
   } catch (error) {
@@ -4011,15 +4053,19 @@ export function formatFinalE2ECheck(mergeE2E: MergeE2EResult) {
 function readFinalReleaseNote(mergeChangelog: MergeChangelogResult): { title: string | null; body: string } | null {
   if (mergeChangelog.changelogFormat !== 'openchangelog') return null;
   if (mergeChangelog.status !== 'passed') return null;
-  if (!mergeChangelog.path || !mergeChangelog.changelogFile) return null;
-  const filePath = path.join(mergeChangelog.path, mergeChangelog.changelogFile);
-  if (!existsSync(filePath)) return null;
-  let raw: string;
-  try {
-    raw = readFileSync(filePath, 'utf8');
-  } catch {
-    return null;
+
+  let raw: string | null = mergeChangelog.releaseNoteContent;
+  if (raw === null) {
+    if (!mergeChangelog.path || !mergeChangelog.changelogFile) return null;
+    const filePath = path.join(mergeChangelog.path, mergeChangelog.changelogFile);
+    if (!existsSync(filePath)) return null;
+    try {
+      raw = readFileSync(filePath, 'utf8');
+    } catch {
+      return null;
+    }
   }
+
   const title = markdownFrontmatterTitle(raw);
   const body = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n*/, '').trim();
   if (!body) return null;

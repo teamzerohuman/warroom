@@ -303,6 +303,12 @@ async function promptMergeChangelogConfirmation(output: Output, input: Input, pl
   return promptConfirmation(output, input, `Run the public changelog update now (${target})? [Y/n]`);
 }
 
+async function promptMergeChangelogPushConfirmation(output: Output, input: Input, plan: MergeChangelogResult) {
+  const filePath = plan.path && plan.changelogFile ? path.join(plan.path, plan.changelogFile) : plan.changelogPath ?? 'the changelog file';
+  output(`Changelog committed locally at ${filePath}. Edit the file now if you want to tweak it before publishing.`);
+  return promptConfirmation(output, input, 'Should we push the ChangeLog live? [Y/n]');
+}
+
 function parseVersionBumpChoice(value: string | undefined): VersionBumpChoice | undefined {
   if (value === undefined) return undefined;
   const normalized = value.trim().toLowerCase();
@@ -810,15 +816,13 @@ async function promptPrMergeFollowUps(
   }
 
   if (!options.confirmCleanup) {
-    const cleanup = await promptConfirmation(output, input, 'Return the local checkout to the PR base branch now? [Y/n]');
-    if (cleanup) {
-      const cleanupResult = await runPrMerge(workspaceRoot, {
-        pr: options.pr,
-        cleanupLocal: true,
-        confirmCleanup: true,
-      });
-      printLocalCleanup(output, cleanupResult.localCleanup);
-    }
+    output('Returning the local checkout to the PR base branch...');
+    const cleanupResult = await runPrMerge(workspaceRoot, {
+      pr: options.pr,
+      cleanupLocal: true,
+      confirmCleanup: true,
+    });
+    printLocalCleanup(output, cleanupResult.localCleanup);
   }
 }
 
@@ -861,6 +865,9 @@ async function runInteractivePrMergeFlow(
     changelogConfirmation: options.confirmChangelog
       ? undefined
       : (plan: MergeChangelogResult) => promptMergeChangelogConfirmation(output, input, plan),
+    changelogPushConfirmation: options.confirmChangelog
+      ? undefined
+      : (plan: MergeChangelogResult) => promptMergeChangelogPushConfirmation(output, input, plan),
     issueComment: options.issueComment,
     cleanupLocal: options.cleanupLocal || options.confirmCleanup,
     confirmCleanup: options.confirmCleanup,
@@ -2115,6 +2122,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           interactive && !opts.confirmChangelog
             ? (plan: MergeChangelogResult) => promptMergeChangelogConfirmation(output, input, plan)
             : undefined,
+        changelogPushConfirmation:
+          interactive && !opts.confirmChangelog
+            ? (plan: MergeChangelogResult) => promptMergeChangelogPushConfirmation(output, input, plan)
+            : undefined,
         summary: opts.summary,
         postSummary: opts.postSummary || opts.confirmSummary,
         confirmSummary: opts.confirmSummary,
@@ -2174,6 +2185,9 @@ export function buildProgram(options: BuildProgramOptions = {}) {
             changelogConfirmation: opts.confirmChangelog
               ? undefined
               : (plan: MergeChangelogResult) => promptMergeChangelogConfirmation(output, input, plan),
+            changelogPushConfirmation: opts.confirmChangelog
+              ? undefined
+              : (plan: MergeChangelogResult) => promptMergeChangelogPushConfirmation(output, input, plan),
             summary: opts.summary,
             postSummary: opts.postSummary || opts.confirmSummary,
             confirmSummary: opts.confirmSummary,
