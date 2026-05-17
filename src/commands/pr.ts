@@ -3313,9 +3313,12 @@ function markdownFrontmatterTitle(markdown: string) {
 
 function publicChangelogGuardrails() {
   return [
-    '- This is a public, client-facing changelog. Write for merchants, developers, and operators who need to understand customer impact.',
+    '- This is a public, client-facing changelog. Write for merchants, developers, and operators who consume our products from the outside.',
     '- Lead with customer-visible value and behavior changes. Translate implementation details into clear product outcomes.',
     '- Do not mention War Room, internal workflow labels, local paths, CI logs, validation commands, private incidents, Sentry IDs, secrets, raw stack traces, customer PII, or private endpoints.',
+    '- Do not expose internal implementation details: no database table or column names, no ORM/entity or migration names, no internal service or queue names, no internal class, file, or module paths, no feature-flag keys, no environment variable names.',
+    '- Only reference what an external consumer can already see: public API endpoints (with method + path), documented request/response DTO fields, public SDK exports, public CLI commands, and documented configuration keys.',
+    '- "Developer notes" are written for external developers integrating with our public surfaces. They must NOT describe how the change was implemented inside our systems; describe only what the external developer must do (e.g. update a request payload field, swap a deprecated SDK export, adopt a new endpoint).',
     '- Do not paste commit lists. Consolidate changes into a small number of meaningful bullets.',
     '- Call out breaking changes, removed public APIs, migration work, or operational action required by merchants explicitly and calmly.',
     '- Keep the tone factual and polished; avoid hype, blame, vague claims, and unsupported promises.',
@@ -3918,25 +3921,36 @@ function buildVictorySummary(
   operatorSummary?: string,
   mergeChangelog?: MergeChangelogResult
 ) {
+  const releaseNote = mergeChangelog ? readFinalReleaseNote(mergeChangelog) : null;
+  const heading = releaseNote?.title ?? `Victory: ${pr.title ?? prRef}`;
+  const prUrl = pr.url ?? githubPrUrl(prRef);
   const lines = [
+    `## ${heading}`,
+    '',
     `PR: ${prRef}`,
     `Title: ${pr.title ?? 'unknown'}`,
-    `URL: ${pr.url ?? prRef}`,
+    `URL: ${prUrl}`,
     `Branch: ${pr.headRefName ?? 'unknown'} -> ${pr.baseRefName ?? 'unknown'}`,
   ];
 
   if (issueRef) lines.push(`Linked issue: ${issueRef}`);
   if (operatorSummary) lines.push('', operatorSummary);
 
-  const releaseNote = mergeChangelog ? readFinalReleaseNote(mergeChangelog) : null;
   if (releaseNote) {
-    lines.push('', `## ${releaseNote.title ?? 'Public changelog'}`, '', releaseNote.body);
+    lines.push('', '## Public changelog', '', releaseNote.body);
     if (mergeChangelog?.changelogUrl) lines.push('', `[Read the full changelog](${mergeChangelog.changelogUrl})`);
-  } else if (mergeChangelog?.status === 'passed' && mergeChangelog.changelogUrl) {
+  } else if (mergeChangelog?.changelogUrl && (mergeChangelog.status === 'passed' || mergeChangelog.pushed)) {
     lines.push('', `[Read the full changelog](${mergeChangelog.changelogUrl})`);
   }
 
   return lines.join('\n');
+}
+
+function githubPrUrl(prRef: string): string {
+  if (prRef.startsWith('http')) return prRef;
+  const match = prRef.match(/^([^/]+\/[^#]+)#(\d+)$/);
+  if (match) return `https://github.com/${match[1]}/pull/${match[2]}`;
+  return prRef;
 }
 
 function buildSummaryPostPlan(options: PrOptions, summary: string, readiness: MergeReadiness): SummaryPostResult[] {
@@ -4052,13 +4066,11 @@ export function formatFinalE2ECheck(mergeE2E: MergeE2EResult) {
 
 function readFinalReleaseNote(mergeChangelog: MergeChangelogResult): { title: string | null; body: string } | null {
   if (mergeChangelog.changelogFormat !== 'openchangelog') return null;
-  if (mergeChangelog.status !== 'passed') return null;
 
   let raw: string | null = mergeChangelog.releaseNoteContent;
   if (raw === null) {
-    if (!mergeChangelog.path || !mergeChangelog.changelogFile) return null;
-    const filePath = path.join(mergeChangelog.path, mergeChangelog.changelogFile);
-    if (!existsSync(filePath)) return null;
+    const filePath = resolveReleaseNoteFilePath(mergeChangelog);
+    if (!filePath || !existsSync(filePath)) return null;
     try {
       raw = readFileSync(filePath, 'utf8');
     } catch {
@@ -4070,6 +4082,20 @@ function readFinalReleaseNote(mergeChangelog: MergeChangelogResult): { title: st
   const body = raw.replace(/^---\r?\n[\s\S]*?\r?\n---\r?\n*/, '').trim();
   if (!body) return null;
   return { title, body };
+}
+
+function resolveReleaseNoteFilePath(mergeChangelog: MergeChangelogResult): string | null {
+  if (!mergeChangelog.path) return null;
+  if (mergeChangelog.changelogFile) return path.join(mergeChangelog.path, mergeChangelog.changelogFile);
+  if (!mergeChangelog.changelogPath || !mergeChangelog.version) return null;
+  const folder = path.join(mergeChangelog.path, mergeChangelog.changelogPath);
+  if (!existsSync(folder) || !statSync(folder).isDirectory()) return null;
+  const prefix = `v${mergeChangelog.version}`;
+  const match = readdirSync(folder)
+    .filter((name) => name.endsWith('.md') && name.startsWith(prefix))
+    .sort()
+    .at(-1);
+  return match ? path.join(folder, match) : null;
 }
 
 function buildFinalIssueCommentPlan(

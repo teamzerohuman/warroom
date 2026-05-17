@@ -53,6 +53,10 @@ import {
   postToSlack,
   reviseChangelogContent,
   runChangelogShare,
+  loadChangelogDraft,
+  saveChangelogDraft,
+  clearChangelogDraft,
+  resumeChangelogShare,
   PERIOD_LABEL,
   type ChangelogPeriod,
   type ChangelogShareResult,
@@ -2324,27 +2328,50 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .action(async (opts: { period?: string }) => {
       const validPeriods: ChangelogPeriod[] = ['day', 'week', 'month'];
 
-      let period: ChangelogPeriod;
-      if (opts.period && (validPeriods as string[]).includes(opts.period)) {
-        period = opts.period as ChangelogPeriod;
-      } else if (opts.period) {
-        output(`Invalid period "${opts.period}". Must be day, week, or month.`);
-        process.exitCode = 1;
-        return;
-      } else if (interactive) {
-        const answer = await new Promise<string>((resolve) => {
-          output('Select reporting period (day/week/month) [week]: ');
-          const rl = createInterface({ input });
-          rl.once('line', (line) => { rl.close(); resolve(line.trim().toLowerCase()); });
-          rl.once('close', () => resolve(''));
-        });
-        period = (validPeriods as string[]).includes(answer) ? (answer as ChangelogPeriod) : 'week';
-      } else {
-        period = 'week';
+      let result: ChangelogShareResult | null = null;
+      let savedDraft = loadChangelogDraft(workspaceRoot);
+
+      if (savedDraft && interactive && !opts.period) {
+        const updated = new Date(savedDraft.updatedAt);
+        const ageMinutes = Math.max(1, Math.round((Date.now() - updated.getTime()) / 60_000));
+        const ageLabel = ageMinutes < 60 ? `${ageMinutes} min ago` : ageMinutes < 1440 ? `${Math.round(ageMinutes / 60)} hr ago` : `${Math.round(ageMinutes / 1440)} days ago`;
+        output(`Found a saved ${PERIOD_LABEL[savedDraft.period].toLowerCase()} draft from ${ageLabel} ("${savedDraft.content.title}").`);
+        const resume = await promptConfirmation(output, input, 'Resume the saved draft? [Y/n]');
+        if (resume) {
+          output(`Resuming ${PERIOD_LABEL[savedDraft.period].toLowerCase()} draft with ${savedDraft.entries.length} entr${savedDraft.entries.length === 1 ? 'y' : 'ies'}...`);
+          result = resumeChangelogShare(workspaceRoot, savedDraft);
+        } else {
+          clearChangelogDraft(workspaceRoot);
+          savedDraft = null;
+        }
+      } else if (savedDraft && !interactive) {
+        clearChangelogDraft(workspaceRoot);
+        savedDraft = null;
       }
 
-      output(`Loading ${PERIOD_LABEL[period].toLowerCase()} changelog entries...`);
-      const result = runChangelogShare(workspaceRoot, period);
+      if (!result) {
+        let period: ChangelogPeriod;
+        if (opts.period && (validPeriods as string[]).includes(opts.period)) {
+          period = opts.period as ChangelogPeriod;
+        } else if (opts.period) {
+          output(`Invalid period "${opts.period}". Must be day, week, or month.`);
+          process.exitCode = 1;
+          return;
+        } else if (interactive) {
+          const answer = await new Promise<string>((resolve) => {
+            output('Select reporting period (day/week/month) [week]: ');
+            const rl = createInterface({ input });
+            rl.once('line', (line) => { rl.close(); resolve(line.trim().toLowerCase()); });
+            rl.once('close', () => resolve(''));
+          });
+          period = (validPeriods as string[]).includes(answer) ? (answer as ChangelogPeriod) : 'week';
+        } else {
+          period = 'week';
+        }
+
+        output(`Loading ${PERIOD_LABEL[period].toLowerCase()} changelog entries...`);
+        result = runChangelogShare(workspaceRoot, period);
+      }
 
       if (result.error) {
         printOutcome(output, `Outcome: ${result.error}`);
@@ -2361,6 +2388,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         return;
       }
       if (result.adapterCommand) output(`Adapter: ${result.adapterCommand}`);
+
+      if (result.content && !savedDraft) {
+        saveChangelogDraft(workspaceRoot, result.period, result.periodLabel, result.entries, result.content);
+      }
 
       const slackToken = readWorkspaceEnvVar(workspaceRoot, 'SLACK_BOT_TOKEN') ?? process.env.SLACK_BOT_TOKEN ?? '';
       if (!slackToken) {
@@ -2420,6 +2451,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         currentBlocks = revision.blocks;
         currentFallbackText = revision.fallbackText!;
 
+        if (revision.content) {
+          saveChangelogDraft(workspaceRoot, currentResult.period, currentResult.periodLabel, currentResult.entries, revision.content, loadChangelogDraft(workspaceRoot));
+        }
+
         output('Posting revised draft to #changelog-review...');
         const repost = await postToSlack(slackToken, 'changelog-review', currentBlocks, currentFallbackText);
         if (!repost.ok) {
@@ -2431,12 +2466,13 @@ export function buildProgram(options: BuildProgramOptions = {}) {
 
       const finalConfirm = await promptConfirmation(output, input, 'Are you sure you\'re ready to share this changelog with your allies? [Y/n]');
       if (!finalConfirm) {
-        printOutcome(output, 'Outcome: draft posted to #changelog-review. Ally distribution cancelled at final confirmation.');
+        printOutcome(output, 'Outcome: draft posted to #changelog-review. Ally distribution cancelled at final confirmation. Saved draft kept — re-run `warroom changelog share` to resume.');
         return;
       }
 
       if (result.alliesWithComms.length === 0) {
         output('No allies with Slack comms configured in allies.yaml.');
+        clearChangelogDraft(workspaceRoot);
         printOutcome(output, 'Outcome: draft approved but no ally comms configured — nothing distributed.');
         return;
       }
@@ -2455,6 +2491,8 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           }
         }
       }
+
+      clearChangelogDraft(workspaceRoot);
 
       printOutcome(
         output,

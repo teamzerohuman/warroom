@@ -1,5 +1,5 @@
 import * as https from 'node:https';
-import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import YAML from 'yaml';
@@ -301,6 +301,92 @@ export function postToSlack(
     req.write(body);
     req.end();
   });
+}
+
+export type ChangelogDraft = {
+  period: ChangelogPeriod;
+  periodLabel: string;
+  entries: Array<{ title: string; publishedAt: string; repoName: string; entryUrl: string }>;
+  content: ChangelogShareContent;
+  createdAt: string;
+  updatedAt: string;
+};
+
+function draftFilePath(workspaceRoot: string): string {
+  return path.join(workspaceRoot, '.warroom', 'changelog-share-draft.json');
+}
+
+export function loadChangelogDraft(workspaceRoot: string): ChangelogDraft | null {
+  const file = draftFilePath(workspaceRoot);
+  if (!existsSync(file)) return null;
+  try {
+    const parsed = JSON.parse(readFileSync(file, 'utf8')) as ChangelogDraft;
+    if (!parsed.period || !parsed.content || !Array.isArray(parsed.entries)) return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+export function saveChangelogDraft(
+  workspaceRoot: string,
+  period: ChangelogPeriod,
+  periodLabel: string,
+  entries: ChangelogEntry[],
+  content: ChangelogShareContent,
+  existing?: ChangelogDraft | null
+): void {
+  const dir = path.join(workspaceRoot, '.warroom');
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const now = new Date().toISOString();
+  const draft: ChangelogDraft = {
+    period,
+    periodLabel,
+    entries: entries.map((e) => ({
+      title: e.title,
+      publishedAt: e.publishedAt.toISOString(),
+      repoName: e.repoName,
+      entryUrl: e.entryUrl,
+    })),
+    content,
+    createdAt: existing?.createdAt ?? now,
+    updatedAt: now,
+  };
+  writeFileSync(draftFilePath(workspaceRoot), JSON.stringify(draft, null, 2));
+}
+
+export function clearChangelogDraft(workspaceRoot: string): void {
+  const file = draftFilePath(workspaceRoot);
+  if (!existsSync(file)) return;
+  try {
+    unlinkSync(file);
+  } catch {
+    // ignore
+  }
+}
+
+export function resumeChangelogShare(workspaceRoot: string, draft: ChangelogDraft): ChangelogShareResult {
+  const entries: ChangelogEntry[] = draft.entries.map((e) => ({
+    title: e.title,
+    publishedAt: new Date(e.publishedAt),
+    repoName: e.repoName,
+    entryUrl: e.entryUrl,
+  }));
+  const alliesWithComms = loadAlliesWithComms(workspaceRoot);
+  const blocks = buildSlackBlocks(draft.content, entries, draft.periodLabel);
+  const fallbackText = `FloPay ChangeLog ${draft.periodLabel} — ${draft.content.title}`;
+  return {
+    period: draft.period,
+    periodLabel: draft.periodLabel,
+    entries,
+    content: draft.content,
+    blocks,
+    fallbackText,
+    alliesWithComms,
+    error: null,
+    adapterError: null,
+    adapterCommand: null,
+  };
 }
 
 export function runChangelogShare(workspaceRoot: string, period: ChangelogPeriod): ChangelogShareResult {
