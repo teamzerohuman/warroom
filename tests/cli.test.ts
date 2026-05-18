@@ -5027,6 +5027,22 @@ if (args[0] === 'api' && args[1] === 'graphql') {
     json({ data: { updateIssueIssueType: { issue: { number: 123, issueType: { name: 'Bug' } } } } });
     process.exit(0);
   }
+  if (query.includes('pullRequest') && query.includes('reviewThreads')) {
+    json({ data: { repository: { pullRequest: { reviewThreads: { nodes: [] } } } } });
+    process.exit(0);
+  }
+  if (query.includes('pullRequest') && query.includes('comments(first: 100)')) {
+    json({ data: { repository: { pullRequest: { comments: { nodes: [] } } } } });
+    process.exit(0);
+  }
+  if (query.includes('addReaction')) {
+    json({ data: { addReaction: { reaction: { id: 'REACTION_added_fixture' } } } });
+    process.exit(0);
+  }
+  if (query.includes('removeReaction')) {
+    json({ data: { removeReaction: { reaction: { id: 'REACTION_removed_fixture' } } } });
+    process.exit(0);
+  }
 }
 
 console.error('Unexpected gh fixture call: ' + args.join(' '));
@@ -5249,7 +5265,17 @@ if (args[0] === 'api' && args[1] === 'graphql') {
     process.exit(0);
   }
 
-  if (query.includes('pullRequest')) {
+  if (query.includes('addReaction')) {
+    json({ data: { addReaction: { reaction: { id: 'REACTION_added_fixture' } } } });
+    process.exit(0);
+  }
+
+  if (query.includes('removeReaction')) {
+    json({ data: { removeReaction: { reaction: { id: 'REACTION_removed_fixture' } } } });
+    process.exit(0);
+  }
+
+  if (query.includes('pullRequest') && query.includes('reviewThreads')) {
     const initialFeedbackPending = options.initialCodeRabbitPending && loopCount() === 0 && pollCount() < 4;
     const delayedFeedbackPending = options.delayedCodeRabbit && loopCount() === 1 && pollCount() < 4;
     const hasOutstanding =
@@ -5318,6 +5344,11 @@ if (args[0] === 'api' && args[1] === 'graphql') {
         }
       }
     });
+    process.exit(0);
+  }
+
+  if (query.includes('pullRequest') && query.includes('comments(first: 100)')) {
+    json({ data: { repository: { pullRequest: { comments: { nodes: [] } } } } });
     process.exit(0);
   }
 

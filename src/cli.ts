@@ -517,7 +517,14 @@ function prReviewOutcome(result: PrPlanResult) {
   }
 
   if (result.prReviewLoop?.completed) {
-    return 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.';
+    const sawHuman = result.prReviewLoop.iterations.some(
+      (iteration) =>
+        (iteration.outstandingHumanReviewThreads ?? 0) > 0 ||
+        (iteration.outstandingHumanPrComments ?? 0) > 0
+    );
+    return sawHuman
+      ? 'Outcome: PR review loop complete; no outstanding review feedback remains.'
+      : 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.';
   }
 
   if (result.launched) {
@@ -678,8 +685,14 @@ function printPrPlan(output: Output, result: PrPlanResult) {
         iteration.outstandingCodeRabbitComments === null
           ? 'unknown'
           : String(iteration.outstandingCodeRabbitComments);
+      const humanThreadCount = iteration.outstandingHumanReviewThreads;
+      const humanCommentCount = iteration.outstandingHumanPrComments;
+      const humanSuffix =
+        (humanThreadCount && humanThreadCount > 0) || (humanCommentCount && humanCommentCount > 0)
+          ? `; human review threads ${humanThreadCount ?? 0}; human PR comments ${humanCommentCount ?? 0}`
+          : '';
       output(
-        `review loop ${iteration.iteration}: ${iteration.startHeadSha ?? 'unknown'} -> ${iteration.endHeadSha ?? 'unknown'}; CodeRabbit comments ${comments}`
+        `review loop ${iteration.iteration}: ${iteration.startHeadSha ?? 'unknown'} -> ${iteration.endHeadSha ?? 'unknown'}; CodeRabbit comments ${comments}${humanSuffix}`
       );
       if (iteration.adapterError) output(`review loop ${iteration.iteration} adapter error: ${iteration.adapterError}`);
     }

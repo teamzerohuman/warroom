@@ -236,8 +236,13 @@ function commentKey(comment: IssueComment) {
 }
 
 function readinessFromTriageNotes(body: string | undefined) {
-  const match = body?.match(/^\s*Ready for ready-to-engage:\s*(yes|no)\s*$/im);
-  return match?.[1]?.toLowerCase() ?? null;
+  if (!body) return null;
+  for (const rawLine of body.split(/\r?\n/)) {
+    const stripped = rawLine.replace(/[*_`]/g, '').trim();
+    const match = stripped.match(/^Ready for ready-to-engage\s*:\s*(yes|no)\b/i);
+    if (match) return match[1].toLowerCase();
+  }
+  return null;
 }
 
 function safeTimestamp(date = new Date()) {
@@ -879,7 +884,7 @@ function buildTriagePrompt(workspaceRoot: string, ref: IssueRef) {
     '- Post the final triage notes back to this GitHub issue using [@github](plugin://github@openai-curated) or `gh issue comment`.',
     '- If a Sentry issue was referenced, include the Sentry issue URL or short ID and a `Sentry link:` line stating linked, already linked, or blocked with the specific blocker.',
     `- Start the GitHub issue comment with exactly: ${TRIAGE_NOTES_MARKER}`,
-    `- Include a standalone readiness line: \`${TRIAGE_READY_LINE}\` only when the issue has enough information to move forward, or \`Ready for ready-to-engage: no\` when a blocker remains.`,
+    `- Include a standalone readiness line on its own line, written exactly as: \`${TRIAGE_READY_LINE}\` (or \`Ready for ready-to-engage: no\` when a blocker remains). Write it as plain text — no bold, italics, backticks, blockquote, or list markers around the line, the label, or the value. A line like \`**Ready for ready-to-engage:** yes\` will not be detected.`,
     '- The GitHub issue comment must include: owner repo, diagnosis or remaining unknowns, acceptance criteria, implementation plan, validation commands, dependencies/blockers, and a concise safe client-facing summary when relevant.',
     '- After posting the issue comment, tell the user whether the issue is ready to move to `ready-to-engage` or what blocker remains.',
     '- Keep context scoped; ask for more information if needed.',

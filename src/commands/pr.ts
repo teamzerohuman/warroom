@@ -181,6 +181,7 @@ export type MergeReadiness = {
     url: string | null;
     isOutdated: boolean;
     excerpt: string;
+    body?: string;
   }>;
 };
 
@@ -214,6 +215,8 @@ export type PrReviewLoopResult = {
     adapterLaunched: boolean;
     adapterError: string | null;
     outstandingCodeRabbitComments: number | null;
+    outstandingHumanReviewThreads?: number | null;
+    outstandingHumanPrComments?: number | null;
     codeRabbitObserved: boolean | null;
     codeRabbitSettled: boolean | null;
   }>;
@@ -1083,21 +1086,27 @@ fragment PrFields on PullRequest {
 }
 `;
 
+type PullRequestActor = {
+  __typename?: string;
+  login?: string;
+};
+
+type PullRequestReviewThreadComment = {
+  id?: string;
+  path?: string;
+  line?: number | null;
+  url?: string;
+  body?: string;
+  createdAt?: string;
+  author?: PullRequestActor;
+};
+
 type PullRequestReviewThread = {
   id?: string;
   isResolved?: boolean;
   isOutdated?: boolean;
   comments?: {
-    nodes?: Array<{
-      id?: string;
-      path?: string;
-      line?: number | null;
-      url?: string;
-      body?: string;
-      author?: {
-        login?: string;
-      };
-    }>;
+    nodes?: PullRequestReviewThreadComment[];
   };
 };
 
@@ -1107,6 +1116,27 @@ type PullRequestReviewThreadsResponse = {
       pullRequest?: {
         reviewThreads?: {
           nodes?: PullRequestReviewThread[];
+        };
+      };
+    };
+  };
+};
+
+type PullRequestIssueComment = {
+  id?: string;
+  body?: string;
+  url?: string;
+  createdAt?: string;
+  author?: PullRequestActor;
+};
+
+type PullRequestIssueCommentsResponse = {
+  data?: {
+    repository?: {
+      pullRequest?: {
+        comments?: {
+          pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+          nodes?: PullRequestIssueComment[];
         };
       };
     };
@@ -1151,17 +1181,44 @@ query($owner: String!, $repo: String!, $number: Int!) {
           id
           isResolved
           isOutdated
-          comments(first: 20) {
+          comments(first: 50) {
             nodes {
               id
               path
               line
               url
               body
+              createdAt
               author {
+                __typename
                 login
               }
             }
+          }
+        }
+      }
+    }
+  }
+}
+`;
+
+const PULL_REQUEST_ISSUE_COMMENTS_QUERY = `
+query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      comments(first: 100, after: $cursor) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        nodes {
+          id
+          body
+          url
+          createdAt
+          author {
+            __typename
+            login
           }
         }
       }
@@ -1326,6 +1383,210 @@ function listPullRequestReviewThreads(ref: { repo: string; number: number }): Me
     });
 }
 
+const KNOWN_BOT_LOGIN_PATTERNS = [
+  'coderabbit',
+  'github-actions',
+  'dependabot',
+  'renovate',
+  'copilot',
+  'claude',
+];
+
+function isCodeRabbitAuthor(author: PullRequestActor | undefined) {
+  return (author?.login ?? '').toLowerCase().includes('coderabbit');
+}
+
+function isBotAuthor(author: PullRequestActor | undefined) {
+  if (!author) return false;
+  if ((author.__typename ?? '').toLowerCase() === 'bot') return true;
+  const login = (author.login ?? '').toLowerCase();
+  if (!login) return false;
+  return KNOWN_BOT_LOGIN_PATTERNS.some((pattern) => login.includes(pattern));
+}
+
+function isHumanAuthor(author: PullRequestActor | undefined) {
+  if (!author || !author.login) return false;
+  return !isBotAuthor(author);
+}
+
+type ReactionContent = 'EYES' | 'THUMBS_UP';
+
+function addReactionForCommentNode(commentNodeId: string, content: ReactionContent): { error: string | null } {
+  const query = `mutation($id: ID!) { addReaction(input: { subjectId: $id, content: ${content} }) { reaction { id } } }`;
+  const result = spawnSync('gh', ['api', 'graphql', '-f', `id=${commentNodeId}`, '-f', `query=${query}`], {
+    encoding: 'utf8',
+  });
+  if (result.status !== 0) {
+    const stderr = result.stderr ?? '';
+    // GitHub returns an error when the reaction already exists; treat that as success.
+    if (/already exists/i.test(stderr)) return { error: null };
+    return { error: stderr.trim() || `gh exited ${result.status ?? 'unknown'}` };
+  }
+  return { error: null };
+}
+
+type RemoveReactionOutcome = 'removed' | 'absent' | 'not-owned' | 'error';
+
+function removeReactionForCommentNode(
+  commentNodeId: string,
+  content: ReactionContent
+): { outcome: RemoveReactionOutcome; error: string | null } {
+  const query = `mutation($id: ID!) { removeReaction(input: { subjectId: $id, content: ${content} }) { reaction { id } } }`;
+  const result = spawnSync('gh', ['api', 'graphql', '-f', `id=${commentNodeId}`, '-f', `query=${query}`], {
+    encoding: 'utf8',
+  });
+  if (result.status !== 0) {
+    const stderr = (result.stderr ?? '') + (result.stdout ?? '');
+    // GitHub returns a variety of error messages when the user hasn't reacted with this content;
+    // treat any of them as "absent" since "the reaction is no longer there from us" is the desired state.
+    if (/not found|does not exist|no reaction|has not reacted|cannot find/i.test(stderr)) {
+      return { outcome: 'absent', error: null };
+    }
+    // "permissions to execute" / FORBIDDEN means the reaction exists but was added by a DIFFERENT user/app;
+    // GitHub only lets each identity remove its own reactions. Surface this as a distinct outcome so the
+    // caller can explain it instead of treating it as a generic failure.
+    if (/permissions to execute|FORBIDDEN/i.test(stderr)) {
+      return { outcome: 'not-owned', error: stderr.trim() };
+    }
+    return { outcome: 'error', error: stderr.trim() || `gh exited ${result.status ?? 'unknown'}` };
+  }
+  return { outcome: 'removed', error: null };
+}
+
+function postEyesReactionsForHumanItems(
+  humanThreads: MergeReadiness['unresolvedReviewThreads'],
+  humanComments: OutstandingHumanIssueComment[],
+  alreadyReacted: Set<string>,
+  commentLabels: Map<string, string>,
+  reviewStatus: ((message: string) => void) | undefined
+) {
+  const targets: Array<{ id: string; label: string }> = [];
+  for (const thread of humanThreads) {
+    if (!thread.commentId) continue;
+    const label = `@${thread.author} on ${thread.path}${thread.url ? ` (${thread.url})` : ''}`;
+    commentLabels.set(thread.commentId, label);
+    if (alreadyReacted.has(thread.commentId)) continue;
+    targets.push({ id: thread.commentId, label });
+  }
+  for (const comment of humanComments) {
+    if (!comment.commentId) continue;
+    const label = `@${comment.author} PR comment${comment.url ? ` (${comment.url})` : ''}`;
+    commentLabels.set(comment.commentId, label);
+    if (alreadyReacted.has(comment.commentId)) continue;
+    targets.push({ id: comment.commentId, label });
+  }
+  if (targets.length === 0) return;
+  for (const target of targets) {
+    const result = addReactionForCommentNode(target.id, 'EYES');
+    alreadyReacted.add(target.id);
+    if (result.error) {
+      reviewStatus?.(`PR review loop: could not add 👀 reaction to ${target.label}: ${result.error}`);
+    }
+  }
+  reviewStatus?.(
+    `PR review loop: marked ${targets.length} human review item${targets.length === 1 ? '' : 's'} with 👀 to signal work is starting.`
+  );
+}
+
+function collectCompletedHumanItemIds(ref: { repo: string; number: number }) {
+  const ids = new Map<string, string>();
+  // Human review threads where the latest comment is a completion reply
+  for (const thread of fetchPullRequestReviewThreads(ref)) {
+    const nodes = thread.comments?.nodes ?? [];
+    if (nodes.length === 0) continue;
+    const first = nodes[0];
+    if (!isHumanAuthor(first?.author)) continue;
+    const latest = nodes[nodes.length - 1];
+    if (!latest || !isCompletionReplyComment(latest)) continue;
+    if (!first?.id) continue;
+    ids.set(
+      first.id,
+      `@${first.author?.login ?? 'unknown'} on ${first.path ?? 'unknown'}${first.url ? ` (${first.url})` : ''}`
+    );
+  }
+  // Human PR conversation comments — use the chronological queue classifier (handles batch addressing too).
+  const issueComments = fetchPullRequestIssueComments(ref);
+  const { addressed } = classifyHumanIssueComments(issueComments);
+  for (const comment of addressed) {
+    if (!comment.id) continue;
+    ids.set(
+      comment.id,
+      `@${comment.author?.login ?? 'unknown'} PR comment${comment.url ? ` (${comment.url})` : ''}`
+    );
+  }
+  return ids;
+}
+
+function swapEyesForThumbsUp(
+  commentNodeIds: Iterable<string>,
+  commentLabels: Map<string, string>,
+  reviewStatus: ((message: string) => void) | undefined,
+  ref?: { repo: string; number: number }
+) {
+  const idLabels = new Map<string, string>();
+  for (const id of commentNodeIds) {
+    if (!id) continue;
+    idLabels.set(id, commentLabels.get(id) ?? id);
+  }
+  if (ref) {
+    // Also include any leftover human items now marked complete — cleans up 👀 from prior runs.
+    for (const [id, label] of collectCompletedHumanItemIds(ref)) {
+      if (!idLabels.has(id)) idLabels.set(id, label);
+    }
+  }
+  const ids = [...idLabels.keys()];
+  if (ids.length === 0) return;
+  reviewStatus?.(`PR review loop: swapping 👀 → 👍 on ${ids.length} review item${ids.length === 1 ? '' : 's'}.`);
+  let thumbsAdded = 0;
+  let cleanSwaps = 0;
+  let notOwned = 0;
+  for (const id of ids) {
+    const label = idLabels.get(id) ?? id;
+    const removed = removeReactionForCommentNode(id, 'EYES');
+    if (removed.outcome === 'not-owned') {
+      notOwned += 1;
+      reviewStatus?.(
+        `PR review loop: 👀 on ${label} was added by a different identity (likely a previous run with a different gh/GITHUB_TOKEN or the codex GitHub Connector); GitHub only lets each identity remove its own reactions. Adding 👍 alongside; remove the stale 👀 manually or re-run as the original identity if you want it gone.`
+      );
+    } else if (removed.outcome === 'error') {
+      reviewStatus?.(`PR review loop: 👀 removal failed for ${label}: ${removed.error}`);
+    }
+    const added = addReactionForCommentNode(id, 'THUMBS_UP');
+    if (added.error) {
+      reviewStatus?.(`PR review loop: 👍 add failed for ${label}: ${added.error}`);
+      continue;
+    }
+    thumbsAdded += 1;
+    if (removed.outcome === 'removed' || removed.outcome === 'absent') cleanSwaps += 1;
+  }
+  if (thumbsAdded > 0) {
+    const details: string[] = [];
+    const kept = thumbsAdded - cleanSwaps;
+    if (kept > 0) details.push(`${kept} kept the 👀 because removal was rejected`);
+    if (notOwned > 0 && notOwned !== kept) details.push(`${notOwned} 👀 owned by another identity`);
+    const detail = details.length > 0 ? ` (${details.join('; ')})` : '';
+    reviewStatus?.(
+      `PR review loop: marked ${thumbsAdded} review item${thumbsAdded === 1 ? '' : 's'} with 👍 to signal completion${detail}.`
+    );
+  } else {
+    reviewStatus?.(`PR review loop: no 👍 reactions added; check the warnings above to diagnose.`);
+  }
+}
+
+const COMPLETION_REPLY_PATTERN = /^(Change made|Skipped):/i;
+
+function isCompletionReplyComment(comment: { body?: string; author?: PullRequestActor }) {
+  if (isCodeRabbitAuthor(comment.author)) return false;
+  const body = comment.body ?? '';
+  for (const rawLine of body.split(/\r?\n/)) {
+    const trimmed = rawLine.trim();
+    if (!trimmed) continue;
+    if (trimmed.startsWith('>')) continue; // skip quoted lines from the reply's quote block
+    if (COMPLETION_REPLY_PATTERN.test(trimmed)) return true;
+  }
+  return false;
+}
+
 function listOutstandingCodeRabbitThreads(ref: { repo: string; number: number }) {
   return listPullRequestReviewThreads(ref).filter(
     (thread) => !thread.isOutdated && thread.author.toLowerCase().includes('coderabbit')
@@ -1333,14 +1594,45 @@ function listOutstandingCodeRabbitThreads(ref: { repo: string; number: number })
 }
 
 function hasCompletionReply(thread: PullRequestReviewThread) {
-  return (thread.comments?.nodes ?? []).some((comment) => {
-    const author = comment.author?.login?.toLowerCase() ?? '';
-    const body = comment.body?.trim() ?? '';
-    return !author.includes('coderabbit') && /^(Change made|Skipped):/i.test(body);
-  });
+  return (thread.comments?.nodes ?? []).some(isCompletionReplyComment);
 }
 
-function listCodeRabbitThreadsMissingReplies(
+function latestCommentInThread(thread: PullRequestReviewThread) {
+  const nodes = thread.comments?.nodes ?? [];
+  return nodes[nodes.length - 1];
+}
+
+function humanThreadOutstanding(thread: PullRequestReviewThread) {
+  if (thread.isResolved || thread.isOutdated) return false;
+  const nodes = thread.comments?.nodes ?? [];
+  if (nodes.length === 0) return false;
+  const first = nodes[0];
+  if (!isHumanAuthor(first?.author)) return false;
+  const latest = latestCommentInThread(thread);
+  if (!latest) return true;
+  return !isCompletionReplyComment(latest);
+}
+
+function listOutstandingHumanReviewThreads(ref: { repo: string; number: number }) {
+  return fetchPullRequestReviewThreads(ref)
+    .filter(humanThreadOutstanding)
+    .map((thread) => {
+      const first = thread.comments?.nodes?.[0];
+      return {
+        threadId: thread.id,
+        commentId: first?.id,
+        path: first?.path ?? 'unknown',
+        line: first?.line ?? null,
+        author: first?.author?.login ?? 'unknown',
+        url: first?.url ?? null,
+        isOutdated: thread.isOutdated === true,
+        excerpt: truncateText(first?.body?.replace(/\s+/g, ' ').trim(), 180),
+        body: first?.body ?? '',
+      };
+    });
+}
+
+function listReviewThreadsMissingReplies(
   ref: { repo: string; number: number },
   expectedThreads: MergeReadiness['unresolvedReviewThreads']
 ) {
@@ -1358,6 +1650,135 @@ function listCodeRabbitThreadsMissingReplies(
       return !thread || !hasCompletionReply(thread);
     })
     .map(([, thread]) => thread);
+}
+
+const listCodeRabbitThreadsMissingReplies = listReviewThreadsMissingReplies;
+
+function fetchPullRequestIssueComments(ref: { repo: string; number: number }) {
+  const parts = repoParts(ref.repo);
+  if (!parts) return [];
+
+  const all: PullRequestIssueComment[] = [];
+  let cursor: string | null = null;
+  for (let pageGuard = 0; pageGuard < 20; pageGuard += 1) {
+    const args: string[] = [
+      'api',
+      'graphql',
+      '-f',
+      `owner=${parts.owner}`,
+      '-f',
+      `repo=${parts.name}`,
+      '-F',
+      `number=${ref.number}`,
+      '-f',
+      `query=${PULL_REQUEST_ISSUE_COMMENTS_QUERY}`,
+    ];
+    if (cursor) args.push('-f', `cursor=${cursor}`);
+    const response = ghJson<PullRequestIssueCommentsResponse>(args, {});
+    const block = response.data?.repository?.pullRequest?.comments;
+    const nodes = block?.nodes ?? [];
+    all.push(...nodes);
+    if (!block?.pageInfo?.hasNextPage || !block.pageInfo.endCursor) break;
+    cursor = block.pageInfo.endCursor;
+  }
+  return all;
+}
+
+export type OutstandingHumanIssueComment = {
+  commentId: string | null;
+  url: string | null;
+  author: string;
+  createdAt: string | null;
+  excerpt: string;
+  body: string;
+};
+
+function commentBodyQuotesText(replyBody: string, originalBody: string): boolean {
+  if (!replyBody || !originalBody) return false;
+  const originalLines = originalBody
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length >= 12);
+  if (originalLines.length === 0) return false;
+  const sample = originalLines.slice(0, 3);
+  return sample.every((line) => replyBody.includes(`> ${line}`));
+}
+
+function extractCommentNumericId(url: string | null | undefined): string | null {
+  if (!url) return null;
+  const match = url.match(/issuecomment-(\d+)|discussion_r(\d+)/);
+  return match ? match[1] ?? match[2] ?? null : null;
+}
+
+function replyAddressesComment(
+  reply: { body?: string },
+  original: { url?: string | null; body?: string; id?: string | null }
+): boolean {
+  const body = reply.body ?? '';
+  if (!body) return false;
+  if (original.url && body.includes(original.url)) return true;
+  if (original.id && body.includes(original.id)) return true;
+  const numericId = extractCommentNumericId(original.url ?? undefined);
+  if (numericId && body.includes(numericId)) return true;
+  if (original.body && commentBodyQuotesText(body, original.body)) return true;
+  return false;
+}
+
+type IssueCommentClassification = {
+  outstanding: PullRequestIssueComment[];
+  addressed: PullRequestIssueComment[];
+};
+
+// Walk PR conversation comments in chronological order. Maintain a queue of pending human comments.
+// Each completion reply consumes either (a) a specific pending item it references (URL/ID/numeric/quote),
+// or (b) when no specific reference is found, the entire current pending queue — because a
+// "Change made:" / "Skipped:" reply with no anchor is most plausibly a batch response to everything open.
+function classifyHumanIssueComments(comments: PullRequestIssueComment[]): IssueCommentClassification {
+  const pending: PullRequestIssueComment[] = [];
+  const addressed: PullRequestIssueComment[] = [];
+  for (const comment of comments) {
+    if (isHumanAuthor(comment.author) && !isCompletionReplyComment(comment)) {
+      pending.push(comment);
+      continue;
+    }
+    if (!isCompletionReplyComment(comment)) continue;
+    const specificIdx = pending.findIndex((pendingComment) =>
+      replyAddressesComment(
+        { body: comment.body },
+        { url: pendingComment.url, body: pendingComment.body, id: pendingComment.id }
+      )
+    );
+    if (specificIdx >= 0) {
+      addressed.push(pending[specificIdx]);
+      pending.splice(specificIdx, 1);
+    } else if (pending.length > 0) {
+      addressed.push(...pending);
+      pending.length = 0;
+    }
+  }
+  return { outstanding: pending, addressed };
+}
+
+function listOutstandingHumanIssueComments(ref: { repo: string; number: number }): OutstandingHumanIssueComment[] {
+  const comments = fetchPullRequestIssueComments(ref);
+  if (comments.length === 0) return [];
+  return classifyHumanIssueComments(comments).outstanding.map((comment) => ({
+    commentId: comment.id ?? null,
+    url: comment.url ?? null,
+    author: comment.author?.login ?? 'unknown',
+    createdAt: comment.createdAt ?? null,
+    excerpt: truncateText(comment.body?.replace(/\s+/g, ' ').trim(), 240),
+    body: comment.body ?? '',
+  }));
+}
+
+function listOutstandingHumanIssueCommentsMissingReplies(
+  ref: { repo: string; number: number },
+  expected: OutstandingHumanIssueComment[]
+): OutstandingHumanIssueComment[] {
+  if (expected.length === 0) return [];
+  const currentOutstanding = new Set(listOutstandingHumanIssueComments(ref).map((entry) => entry.commentId ?? entry.url ?? entry.excerpt));
+  return expected.filter((entry) => currentOutstanding.has(entry.commentId ?? entry.url ?? entry.excerpt));
 }
 
 function postPullRequestReviewThreadReply(threadId: string, body: string): { url: string | null; error: string | null } {
@@ -1381,12 +1802,74 @@ function postPullRequestReviewThreadReply(threadId: string, body: string): { url
   }
 }
 
-function fallbackCodeRabbitReplyBody(thread: MergeReadiness['unresolvedReviewThreads'][number], commitSha: string) {
+const MAX_QUOTE_CHARS = 1500;
+
+function quoteOriginalBody(body: string | undefined, author: string): string {
+  const trimmed = (body ?? '').trim();
+  if (!trimmed) return '';
+  const limited = trimmed.length > MAX_QUOTE_CHARS ? `${trimmed.slice(0, MAX_QUOTE_CHARS)}…` : trimmed;
+  const quoted = limited
+    .split(/\r?\n/)
+    .map((line) => (line.length === 0 ? '>' : `> ${line}`))
+    .join('\n');
+  return `> _Original @${author}:_\n${quoted}\n\n`;
+}
+
+function fallbackReviewThreadReplyBody(
+  thread: MergeReadiness['unresolvedReviewThreads'][number],
+  commitSha: string,
+  source: 'coderabbit' | 'human'
+) {
   const line = thread.line === null ? '' : `:${thread.line}`;
-  return [
+  const label = source === 'coderabbit' ? 'CodeRabbit' : `@${thread.author}`;
+  const summary = [
     `Change made: War Room committed the PR review updates in ${commitSha}.`,
-    `This reply is attached to the CodeRabbit finding for ${thread.path}${line} so the review thread has an explicit audit trail.`,
+    `This reply is attached to the ${label} finding for ${thread.path}${line} so the review thread has an explicit audit trail.`,
   ].join(' ');
+  if (source !== 'human') return summary;
+  const quote = quoteOriginalBody(thread.body, thread.author);
+  return quote ? `${quote}${summary}` : summary;
+}
+
+function fallbackCodeRabbitReplyBody(thread: MergeReadiness['unresolvedReviewThreads'][number], commitSha: string) {
+  return fallbackReviewThreadReplyBody(thread, commitSha, 'coderabbit');
+}
+
+function postFallbackReviewThreadReplies(
+  threads: MergeReadiness['unresolvedReviewThreads'],
+  commitSha: string,
+  reviewStatus: ((message: string) => void) | undefined,
+  source: 'coderabbit' | 'human'
+) {
+  const posted: string[] = [];
+  const label = source === 'coderabbit' ? 'CodeRabbit' : 'human';
+  for (const thread of threads) {
+    if (!thread.threadId) {
+      return {
+        posted,
+        error: `Cannot post a fallback ${label} reply for ${thread.url ?? thread.path}; GitHub did not return a review thread ID.`,
+      };
+    }
+    const reply = postPullRequestReviewThreadReply(
+      thread.threadId,
+      fallbackReviewThreadReplyBody(thread, commitSha, source)
+    );
+    if (reply.error) {
+      return {
+        posted,
+        error: `Could not post fallback ${label} reply for ${thread.url ?? thread.threadId}: ${reply.error}`,
+      };
+    }
+    posted.push(reply.url ?? thread.threadId);
+  }
+  if (posted.length > 0) {
+    reviewStatus?.(
+      `PR review loop: posted fallback ${label} replies to ${posted.length} review thread${
+        posted.length === 1 ? '' : 's'
+      } after publishing the review commit.`
+    );
+  }
+  return { posted, error: null };
 }
 
 function postFallbackCodeRabbitReplies(
@@ -1394,26 +1877,55 @@ function postFallbackCodeRabbitReplies(
   commitSha: string,
   reviewStatus: ((message: string) => void) | undefined
 ) {
+  return postFallbackReviewThreadReplies(threads, commitSha, reviewStatus, 'coderabbit');
+}
+
+function postFallbackHumanThreadReplies(
+  threads: MergeReadiness['unresolvedReviewThreads'],
+  commitSha: string,
+  reviewStatus: ((message: string) => void) | undefined
+) {
+  return postFallbackReviewThreadReplies(threads, commitSha, reviewStatus, 'human');
+}
+
+function postPullRequestIssueComment(
+  ref: { repo: string; number: number },
+  body: string
+): { url: string | null; error: string | null } {
+  return ghComment(['pr', 'comment', String(ref.number), '--repo', ref.repo, '--body', body]);
+}
+
+function fallbackHumanIssueCommentBody(comment: OutstandingHumanIssueComment, commitSha: string | null) {
+  const original = comment.url ? ` (re: ${comment.url})` : '';
+  const sha = commitSha ? ` in ${commitSha}` : '';
+  const summary = [
+    `Change made: War Room committed the PR review updates${sha}.`,
+    `This reply addresses @${comment.author}'s PR comment${original} so the conversation has an explicit audit trail.`,
+  ].join(' ');
+  const quote = quoteOriginalBody(comment.body, comment.author);
+  return quote ? `${quote}${summary}` : summary;
+}
+
+function postFallbackHumanIssueCommentReplies(
+  ref: { repo: string; number: number },
+  comments: OutstandingHumanIssueComment[],
+  commitSha: string | null,
+  reviewStatus: ((message: string) => void) | undefined
+) {
   const posted: string[] = [];
-  for (const thread of threads) {
-    if (!thread.threadId) {
-      return {
-        posted,
-        error: `Cannot post a fallback CodeRabbit reply for ${thread.url ?? thread.path}; GitHub did not return a review thread ID.`,
-      };
-    }
-    const reply = postPullRequestReviewThreadReply(thread.threadId, fallbackCodeRabbitReplyBody(thread, commitSha));
+  for (const comment of comments) {
+    const reply = postPullRequestIssueComment(ref, fallbackHumanIssueCommentBody(comment, commitSha));
     if (reply.error) {
       return {
         posted,
-        error: `Could not post fallback CodeRabbit reply for ${thread.url ?? thread.threadId}: ${reply.error}`,
+        error: `Could not post fallback PR comment reply for ${comment.url ?? comment.commentId ?? 'unknown comment'}: ${reply.error}`,
       };
     }
-    posted.push(reply.url ?? thread.threadId);
+    posted.push(reply.url ?? comment.commentId ?? 'comment');
   }
   if (posted.length > 0) {
     reviewStatus?.(
-      `PR review loop: posted fallback CodeRabbit replies to ${posted.length} review thread${
+      `PR review loop: posted fallback PR comment replies to ${posted.length} human PR comment${
         posted.length === 1 ? '' : 's'
       } after publishing the review commit.`
     );
@@ -4426,16 +4938,17 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
   };
 }
 
-function buildCodeRabbitThreadContext(threads: MergeReadiness['unresolvedReviewThreads']) {
-  if (threads.length === 0) {
-    return 'No current unresolved CodeRabbit review threads were visible before launch. Inspect the latest PR review state directly, and if new CodeRabbit feedback appears, handle it with the same reply rules below.';
-  }
+function buildReviewThreadContext(
+  threads: MergeReadiness['unresolvedReviewThreads'],
+  emptyMessage: string
+) {
+  if (threads.length === 0) return emptyMessage;
 
   return threads
     .map((thread, index) => {
       const line = thread.line === null ? '' : `:${thread.line}`;
       return [
-        `${index + 1}. ${thread.path}${line}`,
+        `${index + 1}. ${thread.path}${line} (by @${thread.author})`,
         `   Thread ID: ${thread.threadId ?? '(not returned by GitHub)'}`,
         `   Review comment ID: ${thread.commentId ?? '(not returned by GitHub)'}`,
         `   URL: ${thread.url ?? '(not returned by GitHub)'}`,
@@ -4445,14 +4958,33 @@ function buildCodeRabbitThreadContext(threads: MergeReadiness['unresolvedReviewT
     .join('\n');
 }
 
+function buildHumanIssueCommentContext(comments: OutstandingHumanIssueComment[]) {
+  if (comments.length === 0) {
+    return 'No current outstanding human PR conversation comments were visible before launch. If a new comment appears, handle it with the PR-comment reply rules below.';
+  }
+  return comments
+    .map((comment, index) => {
+      const createdAt = comment.createdAt ? ` at ${comment.createdAt}` : '';
+      return [
+        `${index + 1}. @${comment.author}${createdAt}`,
+        `   Comment ID: ${comment.commentId ?? '(not returned by GitHub)'}`,
+        `   URL: ${comment.url ?? '(not returned by GitHub)'}`,
+        `   Excerpt: ${comment.excerpt}`,
+      ].join('\n');
+    })
+    .join('\n');
+}
+
 function buildCodeRabbitPrReviewPrompt(
   prUrl: string,
   ref: { repo: string; number: number },
-  threads: MergeReadiness['unresolvedReviewThreads'],
+  codeRabbitThreads: MergeReadiness['unresolvedReviewThreads'],
+  humanThreads: MergeReadiness['unresolvedReviewThreads'] = [],
+  humanComments: OutstandingHumanIssueComment[] = [],
   issueRef: string | null = null
 ) {
   return `Please analyze the latest [@coderabbit](plugin://coderabbit@openai-curated)
- feedback for the latest commit on the [@github](plugin://github@openai-curated)
+ and human reviewer feedback for the latest commit on the [@github](plugin://github@openai-curated)
  PR ${prUrl}
 
 Repository: ${ref.repo}
@@ -4460,33 +4992,63 @@ PR number: ${ref.number}
 Linked issue: ${issueRef ?? 'none inferred'}
 
 Outstanding CodeRabbit review threads captured by War Room:
-${buildCodeRabbitThreadContext(threads)}
+${buildReviewThreadContext(
+  codeRabbitThreads,
+  'No current unresolved CodeRabbit review threads were visible before launch. Inspect the latest PR review state directly, and if new CodeRabbit feedback appears, handle it with the same reply rules below.'
+)}
 
-Please loop over each CodeRabbit review thread one by one.
+Outstanding human review threads captured by War Room:
+${buildReviewThreadContext(
+  humanThreads,
+  'No current unresolved human review threads were visible before launch. If a new human review thread appears, treat it the same way as a CodeRabbit thread.'
+)}
 
-As an optional progress marker, add the eyes (👀) reaction to the original review comment when GitHub exposes a review comment ID:
+Outstanding human PR conversation comments captured by War Room:
+${buildHumanIssueCommentContext(humanComments)}
+
+Please loop over each outstanding review thread (CodeRabbit and human) and each outstanding human PR comment one by one.
+
+War Room has already added the eyes (👀) reaction to every listed human review thread and human PR conversation comment, so the human reviewer can see work has started. You do not need to add 👀 to those items. War Room will also swap the 👀 reaction for a 👍 once the loop completes successfully, so the reviewer can see at a glance which items are done — do not do that manually.
+
+For CodeRabbit threads, you may optionally add a 👀 reaction as a progress marker when GitHub exposes the review comment ID:
 
 \`gh api -X POST repos/${ref.repo}/pulls/comments/<COMMENT_ID>/reactions -f content=eyes -H "Accept: application/vnd.github+json"\`
 
-If adding the reaction is blocked, cancelled, unsupported, or unauthenticated, skip the reaction and continue. Do not stop before code changes only because the reaction could not be added.
+If adding the reaction is blocked, cancelled, unsupported, or unauthenticated, skip the reaction and continue. Do not stop before code changes only because the reaction could not be added. War Room will swap any 👀 on CodeRabbit threads for a 👍 on loop completion as well, so you do not need to add 👍 yourself.
 
 Next, review the feedback and grill-me for additional context to complete the work. If a code change is required, implement the update in the checked-out PR branch.
 
-For code changes, commit the changes before posting final thread replies so the reply can name the commit SHA. If no code change is required, do not create an empty commit; use a Skipped reply.
+For code changes, commit the changes before posting final replies so the reply can name the commit SHA. If no code change is required, do not create an empty commit; use a Skipped reply.
 
-Finally, you must post one final reply on every listed thread. Do not only commit code and do not rely on CodeRabbit auto-resolving the thread. Every listed Thread ID needs an explicit final reply even if CodeRabbit later resolves or outdates the thread.
+Finally, you must post one final reply on every listed thread (CodeRabbit and human) and one new top-level PR comment for every listed human PR conversation comment. Do not only commit code and do not rely on CodeRabbit (or the human reviewer) auto-resolving the thread. Every listed item needs an explicit final reply even if CodeRabbit later resolves or outdates the thread.
 
-Use this thread-reply mutation with each listed Thread ID:
+1. For each listed review Thread ID (CodeRabbit or human), post a reply with this mutation:
 
 \`gh api graphql -f threadId=<THREAD_ID> -f body='Change made: ...' -f query='mutation($threadId: ID!, $body: String!) { addPullRequestReviewThreadReply(input: { pullRequestReviewThreadId: $threadId, body: $body }) { comment { url } } }'\`
 
-Reply format:
+2. For each listed human PR conversation comment, post a new top-level PR comment that references the original comment's FULL URL from the context block above (the one starting with \`https://github.com/${ref.repo}/pull/${ref.number}#issuecomment-...\`). Do NOT shorten it to \`#${ref.number} (comment)\` or anything similar — War Room pairs replies to comments by matching the exact URL string in the reply body.
+
+\`gh pr comment ${ref.number} --repo ${ref.repo} --body 'Change made: ... (re: https://github.com/${ref.repo}/pull/${ref.number}#issuecomment-<NUMERIC_ID>)'\`
+
+Reply format (applies to every reply, review-thread or PR comment):
 - Change made: explain the code or test change and include the commit SHA after the commit exists.
 - Skipped: explain why the feedback is not valid or why no implementation is required.
 
-Before finishing, verify every listed Thread ID has a non-CodeRabbit reply starting with either "Change made:" or "Skipped:". If GitHub will not let you reply, stop and report the blocker instead of claiming the review loop is complete.
+For human review threads AND human PR conversation comments, prefix the reply body with a Markdown quote of the original message so the reviewer immediately sees which feedback you are answering. Use one \`> \` per line, capped at roughly 1500 characters (truncate with \`…\` if longer):
 
-Once all listed threads have explicit replies and any needed commit exists locally, finish and let War Room publish the branch if needed.`;
+\`\`\`
+> _Original @<reviewer>:_
+> <quoted line 1>
+> <quoted line 2>
+
+Change made: <your explanation> (commit <SHA>)
+\`\`\`
+
+CodeRabbit thread replies do not need the quote block — GitHub already renders the original CodeRabbit comment in the review-thread UI.
+
+Before finishing, verify every listed review Thread ID has a non-bot reply starting with "Change made:" or "Skipped:", AND that every listed human PR comment has a follow-up PR comment from us starting with "Change made:" or "Skipped:" that is newer than the original. If GitHub will not let you reply, stop and report the blocker instead of claiming the review loop is complete.
+
+Once all listed items have explicit replies and any needed commit exists locally, finish and let War Room publish the branch if needed.`;
 }
 
 async function runCodeRabbitPrReviewLoop(
@@ -4502,8 +5064,57 @@ async function runCodeRabbitPrReviewLoop(
   const iterations: PrReviewLoopResult['iterations'] = [];
   const blocked: string[] = [];
   const expectedReplyThreads = new Map<string, MergeReadiness['unresolvedReviewThreads'][number]>();
+  const reactedHumanCommentIds = new Set<string>();
+  const trackedReviewCommentIds = new Set<string>();
+  const trackedReviewCommentLabels = new Map<string, string>();
   let currentHeadSha = initialSnapshot.headRefOid ?? null;
   let adapterCommand: string | null = null;
+
+  const recordCommentIds = (
+    codeRabbitThreads: MergeReadiness['unresolvedReviewThreads'],
+    humanThreads: MergeReadiness['unresolvedReviewThreads'],
+    humanComments: OutstandingHumanIssueComment[]
+  ) => {
+    for (const thread of codeRabbitThreads) {
+      if (!thread.commentId) continue;
+      trackedReviewCommentIds.add(thread.commentId);
+      trackedReviewCommentLabels.set(
+        thread.commentId,
+        `CodeRabbit on ${thread.path}${thread.url ? ` (${thread.url})` : ''}`
+      );
+    }
+    for (const thread of humanThreads) {
+      if (!thread.commentId) continue;
+      trackedReviewCommentIds.add(thread.commentId);
+      trackedReviewCommentLabels.set(
+        thread.commentId,
+        `@${thread.author} on ${thread.path}${thread.url ? ` (${thread.url})` : ''}`
+      );
+    }
+    for (const comment of humanComments) {
+      if (!comment.commentId) continue;
+      trackedReviewCommentIds.add(comment.commentId);
+      trackedReviewCommentLabels.set(
+        comment.commentId,
+        `@${comment.author} PR comment${comment.url ? ` (${comment.url})` : ''}`
+      );
+    }
+  };
+
+  const completeWithSuccess = (
+    iteration: PrReviewLoopResult['iterations'][number] | null,
+    successMessage?: string
+  ) => {
+    if (iteration && !iterations.includes(iteration)) iterations.push(iteration);
+    if (successMessage) options.reviewStatus?.(successMessage);
+    swapEyesForThumbsUp(trackedReviewCommentIds, trackedReviewCommentLabels, options.reviewStatus, ref);
+    return {
+      loop: { status: 'passed' as const, completed: true, iterations, blocked: [], error: null },
+      launched: true,
+      adapterCommand,
+      launchError: null,
+    };
+  };
 
   if (!currentHeadSha) {
     blocked.push('Could not read the PR head commit before launching the review loop.');
@@ -4536,7 +5147,9 @@ async function runCodeRabbitPrReviewLoop(
       };
     }
 
-    if (feedback.threads.length === 0) {
+    const initialHumanThreads = listOutstandingHumanReviewThreads(ref);
+    const initialHumanComments = listOutstandingHumanIssueComments(ref);
+    if (feedback.threads.length === 0 && initialHumanThreads.length === 0 && initialHumanComments.length === 0) {
       options.reviewStatus?.('PR review loop: no outstanding CodeRabbit feedback remains on the initial PR commit.');
       return {
         loop: { status: 'passed', completed: true, iterations, blocked: [], error: null },
@@ -4546,19 +5159,55 @@ async function runCodeRabbitPrReviewLoop(
       };
     }
 
-    options.reviewStatus?.(
-      `PR review loop: ${feedback.threads.length} outstanding CodeRabbit comment${
-        feedback.threads.length === 1 ? ' is' : 's are'
-      } ready on the initial PR commit.`
-    );
+    if (feedback.threads.length > 0) {
+      options.reviewStatus?.(
+        `PR review loop: ${feedback.threads.length} outstanding CodeRabbit comment${
+          feedback.threads.length === 1 ? ' is' : 's are'
+        } ready on the initial PR commit.`
+      );
+    }
+    if (initialHumanThreads.length > 0) {
+      options.reviewStatus?.(
+        `PR review loop: ${initialHumanThreads.length} outstanding human review thread${
+          initialHumanThreads.length === 1 ? ' is' : 's are'
+        } ready on the initial PR commit.`
+      );
+    }
+    if (initialHumanComments.length > 0) {
+      options.reviewStatus?.(
+        `PR review loop: ${initialHumanComments.length} outstanding human PR comment${
+          initialHumanComments.length === 1 ? ' is' : 's are'
+        } ready on the initial PR commit.`
+      );
+    }
   }
 
   for (let index = 1; index <= config.maxLoops; index += 1) {
-    const threadsForPrompt = listOutstandingCodeRabbitThreads(ref);
-    for (const thread of threadsForPrompt) {
+    const codeRabbitThreads = listOutstandingCodeRabbitThreads(ref);
+    const humanThreads = listOutstandingHumanReviewThreads(ref);
+    const humanComments = listOutstandingHumanIssueComments(ref);
+    for (const thread of codeRabbitThreads) {
       if (thread.threadId) expectedReplyThreads.set(thread.threadId, thread);
     }
-    const prompt = buildCodeRabbitPrReviewPrompt(prUrl, ref, threadsForPrompt, options.issue ?? null);
+    for (const thread of humanThreads) {
+      if (thread.threadId) expectedReplyThreads.set(thread.threadId, thread);
+    }
+    recordCommentIds(codeRabbitThreads, humanThreads, humanComments);
+    postEyesReactionsForHumanItems(
+      humanThreads,
+      humanComments,
+      reactedHumanCommentIds,
+      trackedReviewCommentLabels,
+      options.reviewStatus
+    );
+    const prompt = buildCodeRabbitPrReviewPrompt(
+      prUrl,
+      ref,
+      codeRabbitThreads,
+      humanThreads,
+      humanComments,
+      options.issue ?? null
+    );
     options.reviewStatus?.(`PR review loop ${index}: launching adapter for ${ref.repo}#${ref.number}.`);
     const localHeadBeforeAdapter = gitHeadShaOrNull(adapterCwd);
     const launch = runAdapter(workspaceRoot, prompt, {
@@ -4580,6 +5229,8 @@ async function runCodeRabbitPrReviewLoop(
       adapterLaunched: launch.launched,
       adapterError: launch.error,
       outstandingCodeRabbitComments: null,
+      outstandingHumanReviewThreads: null,
+      outstandingHumanPrComments: null,
       codeRabbitObserved: null,
       codeRabbitSettled: null,
     };
@@ -4614,65 +5265,38 @@ async function runCodeRabbitPrReviewLoop(
       };
     }
 
-    let missingReplies = listCodeRabbitThreadsMissingReplies(ref, threadsForPrompt);
-    if (missingReplies.length > 0 && published.changed && published.headSha) {
-      const fallbackReplies = postFallbackCodeRabbitReplies(missingReplies, published.headSha, options.reviewStatus);
-      if (fallbackReplies.error) {
-        iteration.endHeadSha = published.headSha;
-        iterations.push(iteration);
-        return {
-          loop: {
-            status: 'failed',
-            completed: false,
-            iterations,
-            blocked: [fallbackReplies.error],
-            error: fallbackReplies.error,
-          },
-          launched: true,
-          adapterCommand,
-          launchError: fallbackReplies.error,
-        };
-      }
-      missingReplies = listCodeRabbitThreadsMissingReplies(ref, threadsForPrompt);
-      if (missingReplies.length > 0) {
-        const error = `War Room fallback replies were not visible on ${missingReplies.length} CodeRabbit review thread${
-          missingReplies.length === 1 ? '' : 's'
-        }: ${missingReplies.map((thread) => thread.url ?? thread.threadId ?? thread.path).join(', ')}`;
-        iteration.endHeadSha = published.headSha;
-        iterations.push(iteration);
-        return {
-          loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
-          launched: true,
-          adapterCommand,
-          launchError: error,
-        };
-      }
-    }
-
-    if (!published.changed && threadsForPrompt.length > 0) {
-      if (missingReplies.length > 0) {
-        const error = `LLM adapter did not post final replies to ${missingReplies.length} CodeRabbit review thread${
-          missingReplies.length === 1 ? '' : 's'
-        }: ${missingReplies.map((thread) => thread.url ?? thread.threadId ?? thread.path).join(', ')}`;
-        iteration.endHeadSha = currentHeadSha;
-        iterations.push(iteration);
-        return {
-          loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
-          launched: true,
-          adapterCommand,
-          launchError: error,
-        };
-      }
-      // All threads were replied to without requiring code changes — review is satisfied.
-      options.reviewStatus?.(`PR review loop ${index}: all CodeRabbit feedback addressed with replies; no code changes needed.`);
-      iteration.endHeadSha = currentHeadSha;
+    const hadInitialItems =
+      codeRabbitThreads.length > 0 || humanThreads.length > 0 || humanComments.length > 0;
+    const replyCheck = ensureRepliesPosted(
+      ref,
+      codeRabbitThreads,
+      humanThreads,
+      humanComments,
+      published.changed && published.headSha ? published.headSha : null,
+      options.reviewStatus
+    );
+    if (replyCheck.error) {
+      iteration.endHeadSha = published.headSha ?? currentHeadSha;
       iterations.push(iteration);
       return {
-        loop: { status: 'passed', completed: true, iterations, blocked: [], error: null },
+        loop: { status: 'failed', completed: false, iterations, blocked: [replyCheck.error], error: replyCheck.error },
         launched: true,
         adapterCommand,
-        launchError: null,
+        launchError: replyCheck.error,
       };
+    }
+
+    const codeRabbitConfigured = hasAnyCodeRabbitActivity(prReviewSnapshot(ref));
+
+    if (!published.changed && hadInitialItems) {
+      iteration.endHeadSha = currentHeadSha;
+      const message =
+        humanThreads.length === 0 && humanComments.length === 0
+          ? `PR review loop ${index}: all CodeRabbit feedback addressed with replies; no code changes needed.`
+          : codeRabbitThreads.length === 0
+            ? `PR review loop ${index}: all human review feedback addressed with replies; no code changes needed.`
+            : `PR review loop ${index}: all review feedback addressed with replies; no code changes needed.`;
+      return completeWithSuccess(iteration, message);
     }
 
     options.reviewStatus?.(
@@ -4690,42 +5314,33 @@ async function runCodeRabbitPrReviewLoop(
         launchError: error,
       };
     }
-
     currentHeadSha = commit.snapshot.headRefOid;
     iteration.endHeadSha = currentHeadSha;
     options.reviewStatus?.(`PR review loop ${index}: detected PR commit ${shortSha(currentHeadSha)}.`);
-    options.reviewStatus?.(`PR review loop ${index}: waiting for CodeRabbit feedback on the latest commit.`);
-    const feedback = await waitForCodeRabbitFeedback(
-      ref,
-      currentHeadSha,
-      config.codeRabbitTimeoutMs,
-      config.codeRabbitSettleMs,
-      config.pollMs
-    );
-    const outstanding = feedback.threads.length;
-    iteration.outstandingCodeRabbitComments = outstanding;
-    iteration.codeRabbitObserved = feedback.codeRabbitObserved;
-    iteration.codeRabbitSettled = feedback.codeRabbitSettled;
-    iterations.push(iteration);
 
-    if (!feedback.ready) {
-      const error = `CodeRabbit feedback did not settle within ${config.codeRabbitTimeoutMs}ms after commit ${shortSha(
-        currentHeadSha
-      )}: ${feedback.reason ?? 'unknown wait state'}`;
-      return {
-        loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
-        launched: true,
-        adapterCommand,
-        launchError: error,
-      };
-    }
+    let postCommitSnapshot: PrReviewSnapshot = commit.snapshot;
+    let postCommitCodeRabbitThreads = codeRabbitConfigured ? listOutstandingCodeRabbitThreads(ref) : [];
 
-    if (outstanding === 0) {
-      const missingReplies = listCodeRabbitThreadsMissingReplies(ref, [...expectedReplyThreads.values()]);
-      if (missingReplies.length > 0) {
-        const error = `LLM adapter did not post final replies to ${missingReplies.length} CodeRabbit review thread${
-          missingReplies.length === 1 ? '' : 's'
-        }: ${missingReplies.map((thread) => thread.url ?? thread.threadId ?? thread.path).join(', ')}`;
+    if (codeRabbitConfigured) {
+      options.reviewStatus?.(`PR review loop ${index}: waiting for CodeRabbit feedback on the latest commit.`);
+      const feedback = await waitForCodeRabbitFeedback(
+        ref,
+        currentHeadSha,
+        config.codeRabbitTimeoutMs,
+        config.codeRabbitSettleMs,
+        config.pollMs
+      );
+      postCommitSnapshot = feedback.snapshot;
+      postCommitCodeRabbitThreads = feedback.threads;
+      iteration.outstandingCodeRabbitComments = feedback.threads.length;
+      iteration.codeRabbitObserved = feedback.codeRabbitObserved;
+      iteration.codeRabbitSettled = feedback.codeRabbitSettled;
+
+      if (!feedback.ready) {
+        iterations.push(iteration);
+        const error = `CodeRabbit feedback did not settle within ${config.codeRabbitTimeoutMs}ms after commit ${shortSha(
+          currentHeadSha
+        )}: ${feedback.reason ?? 'unknown wait state'}`;
         return {
           loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
           launched: true,
@@ -4733,27 +5348,166 @@ async function runCodeRabbitPrReviewLoop(
           launchError: error,
         };
       }
-      options.reviewStatus?.(`PR review loop ${index}: no outstanding CodeRabbit feedback remains.`);
-      return {
-        loop: { status: 'passed', completed: true, iterations, blocked: [], error: null },
-        launched: true,
-        adapterCommand,
-        launchError: null,
-      };
+    } else {
+      iteration.outstandingCodeRabbitComments = 0;
+      iteration.codeRabbitObserved = false;
+      iteration.codeRabbitSettled = true;
     }
 
-    options.reviewStatus?.(
-      `PR review loop ${index}: ${outstanding} outstanding CodeRabbit comment${outstanding === 1 ? ' remains' : 's remain'}; starting another adapter loop.`
-    );
+    const postCommitHumanThreads = listOutstandingHumanReviewThreads(ref);
+    const postCommitHumanComments = listOutstandingHumanIssueComments(ref);
+    iteration.outstandingHumanReviewThreads = postCommitHumanThreads.length;
+    iteration.outstandingHumanPrComments = postCommitHumanComments.length;
+    iterations.push(iteration);
+
+    const outstandingTotal =
+      postCommitCodeRabbitThreads.length + postCommitHumanThreads.length + postCommitHumanComments.length;
+
+    if (outstandingTotal === 0) {
+      const missingThreadReplies = listReviewThreadsMissingReplies(ref, [...expectedReplyThreads.values()]);
+      if (missingThreadReplies.length > 0) {
+        const error = `LLM adapter did not post final replies to ${missingThreadReplies.length} review thread${
+          missingThreadReplies.length === 1 ? '' : 's'
+        }: ${missingThreadReplies.map((thread) => thread.url ?? thread.threadId ?? thread.path).join(', ')}`;
+        return {
+          loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
+          launched: true,
+          adapterCommand,
+          launchError: error,
+        };
+      }
+      const completionMessage =
+        codeRabbitConfigured && postCommitHumanThreads.length === 0 && postCommitHumanComments.length === 0
+          ? `PR review loop ${index}: no outstanding CodeRabbit feedback remains.`
+          : `PR review loop ${index}: no outstanding review feedback remains.`;
+      return completeWithSuccess(null, completionMessage);
+    }
+
+    const messages: string[] = [];
+    if (postCommitCodeRabbitThreads.length > 0) {
+      messages.push(
+        `${postCommitCodeRabbitThreads.length} outstanding CodeRabbit comment${postCommitCodeRabbitThreads.length === 1 ? '' : 's'}`
+      );
+    }
+    if (postCommitHumanThreads.length > 0) {
+      messages.push(
+        `${postCommitHumanThreads.length} outstanding human review thread${postCommitHumanThreads.length === 1 ? '' : 's'}`
+      );
+    }
+    if (postCommitHumanComments.length > 0) {
+      messages.push(
+        `${postCommitHumanComments.length} outstanding human PR comment${postCommitHumanComments.length === 1 ? '' : 's'}`
+      );
+    }
+    if (
+      messages.length === 1 &&
+      postCommitCodeRabbitThreads.length > 0 &&
+      postCommitHumanThreads.length === 0 &&
+      postCommitHumanComments.length === 0
+    ) {
+      const count = postCommitCodeRabbitThreads.length;
+      options.reviewStatus?.(
+        `PR review loop ${index}: ${count} outstanding CodeRabbit comment${count === 1 ? ' remains' : 's remain'}; starting another adapter loop.`
+      );
+    } else {
+      options.reviewStatus?.(`PR review loop ${index}: ${messages.join(', ')} remain; starting another adapter loop.`);
+    }
+    // suppress unused warning for postCommitSnapshot
+    void postCommitSnapshot;
   }
 
-  const error = `CodeRabbit feedback still requires work after ${config.maxLoops} adapter loop${config.maxLoops === 1 ? '' : 's'}.`;
+  const error = `Review feedback still requires work after ${config.maxLoops} adapter loop${config.maxLoops === 1 ? '' : 's'}.`;
   return {
     loop: { status: 'failed', completed: false, iterations, blocked: [error], error },
     launched: true,
     adapterCommand,
     launchError: error,
   };
+}
+
+function ensureRepliesPosted(
+  ref: { repo: string; number: number },
+  codeRabbitThreads: MergeReadiness['unresolvedReviewThreads'],
+  humanThreads: MergeReadiness['unresolvedReviewThreads'],
+  humanComments: OutstandingHumanIssueComment[],
+  commitSha: string | null,
+  reviewStatus: ((message: string) => void) | undefined
+): { error: string | null } {
+  // CodeRabbit threads
+  let missingCodeRabbit = listReviewThreadsMissingReplies(ref, codeRabbitThreads);
+  if (missingCodeRabbit.length > 0 && commitSha) {
+    const fallback = postFallbackCodeRabbitReplies(missingCodeRabbit, commitSha, reviewStatus);
+    if (fallback.error) return { error: fallback.error };
+    missingCodeRabbit = listReviewThreadsMissingReplies(ref, codeRabbitThreads);
+    if (missingCodeRabbit.length > 0) {
+      return {
+        error: `War Room fallback replies were not visible on ${missingCodeRabbit.length} CodeRabbit review thread${
+          missingCodeRabbit.length === 1 ? '' : 's'
+        }: ${missingCodeRabbit.map((thread) => thread.url ?? thread.threadId ?? thread.path).join(', ')}`,
+      };
+    }
+  }
+
+  // Human review threads
+  let missingHumanThreads = listReviewThreadsMissingReplies(ref, humanThreads);
+  if (missingHumanThreads.length > 0 && commitSha) {
+    const fallback = postFallbackHumanThreadReplies(missingHumanThreads, commitSha, reviewStatus);
+    if (fallback.error) return { error: fallback.error };
+    missingHumanThreads = listReviewThreadsMissingReplies(ref, humanThreads);
+    if (missingHumanThreads.length > 0) {
+      return {
+        error: `War Room fallback replies were not visible on ${missingHumanThreads.length} human review thread${
+          missingHumanThreads.length === 1 ? '' : 's'
+        }: ${missingHumanThreads.map((thread) => thread.url ?? thread.threadId ?? thread.path).join(', ')}`,
+      };
+    }
+  }
+
+  // Human PR conversation comments
+  let missingHumanComments = listOutstandingHumanIssueCommentsMissingReplies(ref, humanComments);
+  if (missingHumanComments.length > 0 && commitSha) {
+    const fallback = postFallbackHumanIssueCommentReplies(ref, missingHumanComments, commitSha, reviewStatus);
+    if (fallback.error) return { error: fallback.error };
+    missingHumanComments = listOutstandingHumanIssueCommentsMissingReplies(ref, humanComments);
+    if (missingHumanComments.length > 0) {
+      return {
+        error: `War Room fallback replies were not visible for ${missingHumanComments.length} human PR comment${
+          missingHumanComments.length === 1 ? '' : 's'
+        }: ${missingHumanComments.map((entry) => entry.url ?? entry.commentId ?? entry.author).join(', ')}`,
+      };
+    }
+  }
+
+  // If no commit was made but items remain unreplied, surface the blocker.
+  if (!commitSha) {
+    if (missingCodeRabbit.length > 0) {
+      return {
+        error: `LLM adapter did not post final replies to ${missingCodeRabbit.length} CodeRabbit review thread${
+          missingCodeRabbit.length === 1 ? '' : 's'
+        }: ${missingCodeRabbit.map((thread) => thread.url ?? thread.threadId ?? thread.path).join(', ')}`,
+      };
+    }
+    if (missingHumanThreads.length > 0) {
+      return {
+        error: `LLM adapter did not post final replies to ${missingHumanThreads.length} human review thread${
+          missingHumanThreads.length === 1 ? '' : 's'
+        }: ${missingHumanThreads.map((thread) => thread.url ?? thread.threadId ?? thread.path).join(', ')}`,
+      };
+    }
+    if (missingHumanComments.length > 0) {
+      return {
+        error: `LLM adapter did not post final replies to ${missingHumanComments.length} human PR comment${
+          missingHumanComments.length === 1 ? '' : 's'
+        }: ${missingHumanComments.map((entry) => entry.url ?? entry.commentId ?? entry.author).join(', ')}`,
+      };
+    }
+  }
+
+  return { error: null };
+}
+
+function hasAnyCodeRabbitActivity(snapshot: PrReviewSnapshot) {
+  return codeRabbitChecks(snapshot).length > 0 || codeRabbitReviews(snapshot).length > 0;
 }
 
 export async function runPrReview(workspaceRoot: string, options: PrOptions): Promise<PrPlanResult> {
@@ -4765,7 +5519,16 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
   const resolvedOptions = { ...options, issue: issueRef ?? undefined };
   const prUrl = pr.url ?? `https://github.com/${ref.repo}/pull/${ref.number}`;
   const initialCodeRabbitThreads = listOutstandingCodeRabbitThreads(ref);
-  const prompt = buildCodeRabbitPrReviewPrompt(prUrl, ref, initialCodeRabbitThreads, issueRef);
+  const initialHumanThreads = listOutstandingHumanReviewThreads(ref);
+  const initialHumanComments = listOutstandingHumanIssueComments(ref);
+  const prompt = buildCodeRabbitPrReviewPrompt(
+    prUrl,
+    ref,
+    initialCodeRabbitThreads,
+    initialHumanThreads,
+    initialHumanComments,
+    issueRef
+  );
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'pr-review', {
         'prompt.md': prompt,
@@ -4781,7 +5544,7 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
   const labelUpdate = issueRef ? setIssueWorkflowLabel(issueRef, 'skirmish', options.confirmStatus === true) : null;
   const contextSummary = {
     promptCharacters: prompt.length,
-    comments: initialCodeRabbitThreads.length,
+    comments: initialCodeRabbitThreads.length + initialHumanThreads.length + initialHumanComments.length,
     checks: pr.statusCheckRollup?.length ?? 0,
   };
 
