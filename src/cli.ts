@@ -713,6 +713,12 @@ function printPrPlan(output: Output, result: PrPlanResult) {
     );
     if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
   }
+  if (result.assigneeUpdate) {
+    output(
+      `Issue assignee: ${result.assigneeUpdate.applied ? 'updated' : 'planned'} ${result.assigneeUpdate.issue} +${result.assigneeUpdate.assignee}`
+    );
+    if (result.assigneeUpdate.error) output(`assignee update error: ${result.assigneeUpdate.error}`);
+  }
   output(result.prompt);
   printLlmUsage(output, result.usageSummary);
   const outcome = issueStartOutcome(result) ?? prReviewOutcome(result);
@@ -898,6 +904,7 @@ async function runInteractivePrMergeFlow(
 
   if (!confirmedResult.merged) {
     const blocked = (confirmedResult.mergeReadiness?.blocked.length ?? 0) > 0;
+    const e2eRequired = confirmedResult.mergeE2E?.required ?? true;
     let allowUnresolvedReviewThreads = false;
     let skipMergeE2E = false;
     let mergeChoice: 'confirm' | 'skip' | 'cancel';
@@ -908,13 +915,16 @@ async function runInteractivePrMergeFlow(
         'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to allow unresolved review threads if no other blockers remain. [Y/n/skip]'
       );
       allowUnresolvedReviewThreads = mergeChoice === 'skip';
-    } else {
+    } else if (e2eRequired) {
       mergeChoice = await promptMergeConfirmation(
         output,
         input,
         'Continue to run the demo Playwright e2e gate and merge this PR now? Type "skip" to merge without the Playwright gate. [Y/n/skip]'
       );
       skipMergeE2E = mergeChoice === 'skip';
+    } else {
+      const confirmed = await promptConfirmation(output, input, 'Merge this PR now? [Y/n]');
+      mergeChoice = confirmed ? 'confirm' : 'cancel';
     }
 
     if (mergeChoice !== 'cancel') {
@@ -2162,6 +2172,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       let confirmedResult = result;
       if (interactive && !opts.confirm && !result.merged) {
         const blocked = (result.mergeReadiness?.blocked.length ?? 0) > 0;
+        const e2eRequired = result.mergeE2E?.required ?? true;
         let allowUnresolvedReviewThreads = false;
         let skipMergeE2E = false;
         let mergeChoice: 'confirm' | 'skip' | 'cancel';
@@ -2172,13 +2183,16 @@ export function buildProgram(options: BuildProgramOptions = {}) {
             'Preflight is blocked. Recheck readiness and attempt the confirmed merge only if blockers are clear? Type "skip" to allow unresolved review threads if no other blockers remain. [Y/n/skip]'
           );
           allowUnresolvedReviewThreads = mergeChoice === 'skip';
-        } else {
+        } else if (e2eRequired) {
           mergeChoice = await promptMergeConfirmation(
             output,
             input,
             'Continue to run the demo Playwright e2e gate and merge this PR now? Type "skip" to merge without the Playwright gate. [Y/n/skip]'
           );
           skipMergeE2E = mergeChoice === 'skip';
+        } else {
+          const confirmed = await promptConfirmation(output, input, 'Merge this PR now? [Y/n]');
+          mergeChoice = confirmed ? 'confirm' : 'cancel';
         }
         if (mergeChoice !== 'cancel') {
           output(

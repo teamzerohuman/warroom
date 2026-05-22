@@ -61,6 +61,13 @@ export type IssueLabelUpdateResult = {
   error: string | null;
 };
 
+export type IssueAssigneeUpdateResult = {
+  issue: string;
+  assignee: string;
+  applied: boolean;
+  error: string | null;
+};
+
 export type TriageNotesResult = {
   marker: string;
   beforeComments: number | null;
@@ -980,6 +987,30 @@ export function setIssueWorkflowLabel(issue: string, status: CampaignStatusName,
     applied: confirm,
     error: null,
   };
+}
+
+export function assignSelfToIssue(issue: string, confirm: boolean): IssueAssigneeUpdateResult {
+  const ref = parseIssueRef(issue);
+  const assignee = '@me';
+  if (!confirm) {
+    return { issue, assignee, applied: false, error: null };
+  }
+  const result = spawnSync(
+    'gh',
+    ['issue', 'edit', String(ref.number), '--repo', ref.repo, '--add-assignee', assignee],
+    { encoding: 'utf8' }
+  );
+  if (result.status !== 0) {
+    return {
+      issue,
+      assignee,
+      applied: false,
+      error:
+        `${result.stderr || result.stdout}`.trim() ||
+        `gh issue edit failed with exit ${result.status ?? 'unknown'}.`,
+    };
+  }
+  return { issue, assignee, applied: true, error: null };
 }
 
 function emptyIssueCreateResult(

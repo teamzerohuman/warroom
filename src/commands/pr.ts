@@ -24,7 +24,14 @@ import {
 import { parseRepoRef } from '../lib/refs.js';
 import { getRepoHealth, loadRepoManifest, runGit } from '../lib/repos.js';
 import { buildSpecialistContext } from '../lib/specialist-context.js';
-import { parseIssueRef, setIssueWorkflowLabel, type IssueLabelUpdateResult, type IssueRef } from './issues.js';
+import {
+  assignSelfToIssue,
+  parseIssueRef,
+  setIssueWorkflowLabel,
+  type IssueAssigneeUpdateResult,
+  type IssueLabelUpdateResult,
+  type IssueRef,
+} from './issues.js';
 
 export type PrTextResult = {
   source: 'adapter' | 'fallback' | 'manual';
@@ -236,6 +243,7 @@ export type PrPlanResult = {
   issue?: string | null;
   campaignStatus: CampaignStatusSetResult | null;
   labelUpdate?: IssueLabelUpdateResult | null;
+  assigneeUpdate?: IssueAssigneeUpdateResult | null;
   developmentBranch?: DevelopmentBranchResult;
   mergeReadiness?: MergeReadiness;
   summary?: string;
@@ -1390,10 +1398,44 @@ const KNOWN_BOT_LOGIN_PATTERNS = [
   'renovate',
   'copilot',
   'claude',
+  'sonarcloud',
+  'sonarqube',
+  'codecov',
+  'snyk',
+  'sourcery',
+  'codacy',
+  'reviewpad',
+  'graphite',
+];
+
+// CodeRabbit branding strings that reliably identify a CodeRabbit-authored comment, even when the
+// posting identity isn't a recognisable bot login (custom GitHub Apps per org sometimes use
+// non-obvious names).
+const CODERABBIT_BODY_MARKERS = [
+  'coderabbit.ai',
+  'coderabbit.com',
+  'summary by coderabbit',
+  '<!-- this is an auto-generated comment by coderabbit',
+  '<!-- coderabbit',
+  '## walkthrough',
+  '_originally posted by @coderabbit',
+  '> [!tip]\n> codeerabbit',
 ];
 
 function isCodeRabbitAuthor(author: PullRequestActor | undefined) {
   return (author?.login ?? '').toLowerCase().includes('coderabbit');
+}
+
+function commentBodyMentionsCodeRabbit(body: string | undefined): boolean {
+  if (!body) return false;
+  const lower = body.toLowerCase();
+  return CODERABBIT_BODY_MARKERS.some((marker) => lower.includes(marker));
+}
+
+function isCodeRabbitComment(comment: { author?: PullRequestActor; body?: string } | undefined): boolean {
+  if (!comment) return false;
+  if (isCodeRabbitAuthor(comment.author)) return true;
+  return commentBodyMentionsCodeRabbit(comment.body);
 }
 
 function isBotAuthor(author: PullRequestActor | undefined) {
@@ -1401,12 +1443,24 @@ function isBotAuthor(author: PullRequestActor | undefined) {
   if ((author.__typename ?? '').toLowerCase() === 'bot') return true;
   const login = (author.login ?? '').toLowerCase();
   if (!login) return false;
+  // GitHub Apps consistently post under `<name>[bot]` (or `<name>-bot`).
+  if (login.endsWith('[bot]')) return true;
+  if (/(^|-)bot(-|$)/.test(login)) return true;
   return KNOWN_BOT_LOGIN_PATTERNS.some((pattern) => login.includes(pattern));
 }
 
 function isHumanAuthor(author: PullRequestActor | undefined) {
   if (!author || !author.login) return false;
   return !isBotAuthor(author);
+}
+
+// A comment is "from a real human" only when the author is human AND the body doesn't carry
+// CodeRabbit's signatures (which would mean a custom-named CodeRabbit App posted it).
+function isHumanComment(comment: { author?: PullRequestActor; body?: string } | undefined): boolean {
+  if (!comment) return false;
+  if (!isHumanAuthor(comment.author)) return false;
+  if (commentBodyMentionsCodeRabbit(comment.body)) return false;
+  return true;
 }
 
 type ReactionContent = 'EYES' | 'THUMBS_UP';
@@ -1495,7 +1549,7 @@ function collectCompletedHumanItemIds(ref: { repo: string; number: number }) {
     const nodes = thread.comments?.nodes ?? [];
     if (nodes.length === 0) continue;
     const first = nodes[0];
-    if (!isHumanAuthor(first?.author)) continue;
+    if (!isHumanComment(first)) continue;
     const latest = nodes[nodes.length - 1];
     if (!latest || !isCompletionReplyComment(latest)) continue;
     if (!first?.id) continue;
@@ -1576,7 +1630,7 @@ function swapEyesForThumbsUp(
 const COMPLETION_REPLY_PATTERN = /^(Change made|Skipped):/i;
 
 function isCompletionReplyComment(comment: { body?: string; author?: PullRequestActor }) {
-  if (isCodeRabbitAuthor(comment.author)) return false;
+  if (isCodeRabbitComment(comment)) return false; // CodeRabbit (any custom-name app) is never our reply
   const body = comment.body ?? '';
   for (const rawLine of body.split(/\r?\n/)) {
     const trimmed = rawLine.trim();
@@ -1607,7 +1661,7 @@ function humanThreadOutstanding(thread: PullRequestReviewThread) {
   const nodes = thread.comments?.nodes ?? [];
   if (nodes.length === 0) return false;
   const first = nodes[0];
-  if (!isHumanAuthor(first?.author)) return false;
+  if (!isHumanComment(first)) return false;
   const latest = latestCommentInThread(thread);
   if (!latest) return true;
   return !isCompletionReplyComment(latest);
@@ -1737,7 +1791,7 @@ function classifyHumanIssueComments(comments: PullRequestIssueComment[]): IssueC
   const pending: PullRequestIssueComment[] = [];
   const addressed: PullRequestIssueComment[] = [];
   for (const comment of comments) {
-    if (isHumanAuthor(comment.author) && !isCompletionReplyComment(comment)) {
+    if (isHumanComment(comment) && !isCompletionReplyComment(comment)) {
       pending.push(comment);
       continue;
     }
@@ -3760,8 +3814,8 @@ function prepareBranchCheckout(repoPath: string, branch: string) {
     if (tracked.status !== 0) throw new Error(tracked.stderr || switched.stderr || `git switch ${branch} failed.`);
   }
 
-  const pull = runGit(repoPath, ['pull', '--ff-only', 'origin', branch]);
-  if (pull.status !== 0) throw new Error(pull.stderr || `git pull --ff-only origin ${branch} failed with exit ${pull.status ?? 'unknown'}.`);
+  const merge = runGit(repoPath, ['merge', '--ff-only', `origin/${branch}`]);
+  if (merge.status !== 0) throw new Error(merge.stderr || `git merge --ff-only origin/${branch} failed with exit ${merge.status ?? 'unknown'}.`);
 }
 
 function readJsonFile<T>(filePath: string): T | null {
@@ -4861,6 +4915,7 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
       issue: options.issue,
       campaignStatus: null,
       labelUpdate: null,
+      assigneeUpdate: null,
       developmentBranch,
       contextSummary: { promptCharacters: prompt.length, comments: issue.comments?.length ?? 0 },
       adapterCwd,
@@ -4869,6 +4924,7 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
   }
   const campaignStatus = setCampaignStatus(options.issue, 'battlefield-active', { confirm: options.confirmStatus });
   const labelUpdate = setIssueWorkflowLabel(options.issue, 'battlefield-active', options.confirmStatus === true);
+  const assigneeUpdate = assignSelfToIssue(options.issue, options.confirmStatus === true);
 
   const contextSummary = { promptCharacters: prompt.length, comments: issue.comments?.length ?? 0 };
   if (options.dryRun !== false) {
@@ -4884,6 +4940,7 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
       issue: options.issue,
       campaignStatus,
       labelUpdate,
+      assigneeUpdate,
       developmentBranch,
       contextSummary,
       adapterCwd,
@@ -4902,6 +4959,7 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
       issue: options.issue,
       campaignStatus,
       labelUpdate,
+      assigneeUpdate,
       developmentBranch,
       contextSummary,
       adapterCwd,
@@ -4931,6 +4989,7 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     issue: options.issue,
     campaignStatus,
     labelUpdate,
+    assigneeUpdate,
     developmentBranch,
     contextSummary,
     adapterCwd,

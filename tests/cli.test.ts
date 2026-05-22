@@ -297,6 +297,7 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Adapter run: completed (foreground process; no background session remains)');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
       expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#7 +battlefield-active; removed ready-to-engage');
+      expect(lines).toContain('Issue assignee: updated TeamFloPay/sdk#7 +@me');
       expect(lines).toContain('Development branch: ready warroom/7-build-the-selector from main');
       expect(lines.some((line) => line.includes('Development branch link: created gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(true);
       expect(lines).toContain('Development checkout: checked out');
