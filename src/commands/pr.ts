@@ -27,9 +27,7 @@ import { buildSpecialistContext } from '../lib/specialist-context.js';
 import {
   assignSelfToIssue,
   parseIssueRef,
-  setIssueWorkflowLabel,
   type IssueAssigneeUpdateResult,
-  type IssueLabelUpdateResult,
   type IssueRef,
 } from './issues.js';
 
@@ -248,7 +246,6 @@ export type PrPlanResult = {
   action: 'issue-start' | 'review' | 'merge';
   issue?: string | null;
   campaignStatus: CampaignStatusSetResult | null;
-  labelUpdate?: IssueLabelUpdateResult | null;
   assigneeUpdate?: IssueAssigneeUpdateResult | null;
   developmentBranch?: DevelopmentBranchResult;
   mergeReadiness?: MergeReadiness;
@@ -293,7 +290,6 @@ export type PrCreateResult = {
   url: string | null;
   blocked: string[];
   campaignStatus: CampaignStatusSetResult | null;
-  labelUpdate: IssueLabelUpdateResult | null;
   prText: PrTextResult;
   issueComment: SummaryPostResult | null;
   artifact?: RunArtifact;
@@ -3209,9 +3205,6 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
   const campaignStatus = issueRef
     ? setCampaignStatus(issueRef, 'skirmish', { confirm: Boolean(options.confirm && options.confirmStatus && prResolved) })
     : null;
-  const labelUpdate = issueRef
-    ? setIssueWorkflowLabel(issueRef, 'skirmish', Boolean(options.confirm && options.confirmStatus && prResolved))
-    : null;
   const existingPr = Boolean(existingPrUrl && options.confirm);
   const baseResult: Omit<PrCreateResult, 'artifact' | 'issueComment'> = {
     action: 'create',
@@ -3231,7 +3224,6 @@ export function runPrCreate(workspaceRoot: string, options: PrOptions): PrCreate
     url,
     blocked,
     campaignStatus,
-    labelUpdate,
     prText,
   };
   const issueComment = buildPrCreateIssueCommentResult(
@@ -5090,7 +5082,6 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
       action: 'issue-start',
       issue: options.issue,
       campaignStatus: null,
-      labelUpdate: null,
       assigneeUpdate: null,
       developmentBranch,
       contextSummary: { promptCharacters: prompt.length, comments: issue.comments?.length ?? 0 },
@@ -5099,7 +5090,6 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     };
   }
   const campaignStatus = setCampaignStatus(options.issue, 'battlefield-active', { confirm: options.confirmStatus });
-  const labelUpdate = setIssueWorkflowLabel(options.issue, 'battlefield-active', options.confirmStatus === true);
   const assigneeUpdate = assignSelfToIssue(options.issue, options.confirmStatus === true);
 
   const contextSummary = { promptCharacters: prompt.length, comments: issue.comments?.length ?? 0 };
@@ -5115,31 +5105,10 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
       action: 'issue-start',
       issue: options.issue,
       campaignStatus,
-      labelUpdate,
       assigneeUpdate,
       developmentBranch,
       contextSummary,
       adapterCwd,
-    };
-  }
-  if (labelUpdate.error) {
-    return {
-      prompt,
-      artifact,
-      launched: false,
-      adapterStarted: false,
-      adapterExitStatus: null,
-      adapterSignal: null,
-      adapterCommand,
-      action: 'issue-start',
-      issue: options.issue,
-      campaignStatus,
-      labelUpdate,
-      assigneeUpdate,
-      developmentBranch,
-      contextSummary,
-      adapterCwd,
-      launchError: labelUpdate.error,
     };
   }
   const launch = runAdapter(workspaceRoot, prompt, {
@@ -5164,7 +5133,6 @@ export function runIssueStart(workspaceRoot: string, options: PrOptions): PrPlan
     action: 'issue-start',
     issue: options.issue,
     campaignStatus,
-    labelUpdate,
     assigneeUpdate,
     developmentBranch,
     contextSummary,
@@ -5776,7 +5744,6 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
   const campaignStatus = issueRef
     ? setCampaignStatus(issueRef, 'skirmish', { confirm: options.confirmStatus })
     : null;
-  const labelUpdate = issueRef ? setIssueWorkflowLabel(issueRef, 'skirmish', options.confirmStatus === true) : null;
   const contextSummary = {
     promptCharacters: prompt.length,
     comments: initialCodeRabbitThreads.length + initialHumanThreads.length + initialHumanComments.length,
@@ -5792,7 +5759,6 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
       action: 'review',
       issue: issueRef,
       campaignStatus,
-      labelUpdate,
       contextSummary,
       adapterCwd,
       prReviewLoop: { status: 'planned', completed: false, iterations: [], blocked: [], error: null },
@@ -5811,7 +5777,6 @@ export async function runPrReview(workspaceRoot: string, options: PrOptions): Pr
     action: 'review',
     issue: issueRef,
     campaignStatus,
-    labelUpdate,
     contextSummary,
     adapterCwd,
     prReviewLoop: loop.loop,
@@ -6083,9 +6048,6 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
   const campaignStatus = issueRef
     ? setCampaignStatus(issueRef, 'victory', { confirm: applyVictoryCloseout })
     : null;
-  const labelUpdate = issueRef
-    ? setIssueWorkflowLabel(issueRef, 'victory', applyVictoryCloseout)
-    : null;
   const usageSummary = merged && options.confirm === true && issueRef ? summarizeIssueUsage(workspaceRoot, issueRef) : null;
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'pr-merge', {
@@ -6117,7 +6079,6 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
     action: 'merge',
     issue: issueRef,
     campaignStatus,
-    labelUpdate,
     mergeReadiness: readiness,
     mergeE2E,
     mergeBump,

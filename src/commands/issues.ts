@@ -3,7 +3,7 @@ import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { createRunArtifact, type RunArtifact } from '../lib/artifacts.js';
 import { loadAlliesManifest, resolveAllyIssueRepo, type AllyEntry } from '../lib/allies.js';
-import { CAMPAIGN_LABELS, listCampaignIssuesByStatus, setCampaignStatus, type CampaignStatusName, type CampaignStatusSetResult } from '../lib/campaign.js';
+import { listCampaignIssuesByStatus, setCampaignStatus, type CampaignStatusName, type CampaignStatusSetResult } from '../lib/campaign.js';
 import { getInteractiveAdapterInvocation, runInteractiveAdapter } from '../lib/env.js';
 import { ownerRepoFromText } from '../lib/issue-links.js';
 import { attachRunUsageToIssue, createUsageCommandRunId } from '../lib/llm-usage.js';
@@ -25,10 +25,9 @@ export type IssueSummary = IssueRef & {
 };
 
 export type IssueListResult = {
-  label?: string;
   status?: string;
   repo?: string;
-  source: 'campaign' | 'labels';
+  source: 'campaign';
   issues: IssueSummary[];
 };
 
@@ -38,7 +37,6 @@ export type IssueHandoffResult = {
   launched: boolean;
   adapterCommand: string;
   campaignStatus: CampaignStatusSetResult | null;
-  labelUpdate: IssueLabelUpdateResult | null;
   triageNotes: TriageNotesResult | null;
   contextSummary: {
     promptCharacters: number;
@@ -50,15 +48,6 @@ export type IssueHandoffResult = {
   };
   launchError?: string | null;
   closeoutError?: string | null;
-};
-
-export type IssueLabelUpdateResult = {
-  issue: string;
-  status: CampaignStatusName;
-  addLabel: string;
-  removeLabels: string[];
-  applied: boolean;
-  error: string | null;
 };
 
 export type IssueAssigneeUpdateResult = {
@@ -81,7 +70,6 @@ export type TriageNotesResult = {
 
 export type IssueTriageOptions = {
   issue?: string;
-  label?: string;
   markReady?: boolean;
   confirmStatus?: boolean;
   dryRun?: boolean;
@@ -144,7 +132,6 @@ export type IssueFeedbackResult = {
 };
 
 export type IssueNextOptions = {
-  label?: string;
   currentPath?: string;
   allRepos?: boolean;
 };
@@ -181,7 +168,6 @@ export type IssueCreateResult = {
   url: string | null;
   createCommand: string | null;
   campaignStatus: CampaignStatusSetResult | null;
-  labelUpdate: IssueLabelUpdateResult | null;
   issueTypeUpdate: IssueTypeUpdateResult | null;
   closeoutError: string | null;
   contextSummary: {
@@ -237,29 +223,6 @@ function repoForCurrentPath(workspaceRoot: string, currentPath: string | undefin
     .map((entry) => getRepoHealth(workspaceRoot, entry))
     .filter((repo) => repo.checkedOut && containsPath(repo.resolvedPath, resolved))
     .sort((left, right) => right.resolvedPath.length - left.resolvedPath.length)[0] ?? null;
-}
-
-export function listIssuesByLabel(workspaceRoot: string, label: string, repoFilter: string | null = null): IssueListResult {
-  const manifest = loadRepoManifest(workspaceRoot);
-  const issues: IssueSummary[] = [];
-
-  for (const repo of manifest.repos.filter((entry) => !repoFilter || entry.github === repoFilter)) {
-    const rows = ghJson<Array<{ number: number; title: string; url: string; labels: Array<{ name?: string }> }>>(
-      ['issue', 'list', '--repo', repo.github, '--state', 'open', '--label', label, '--json', 'number,title,url,labels'],
-      []
-    );
-    for (const row of rows) {
-      issues.push({
-        repo: repo.github,
-        number: row.number,
-        title: row.title,
-        url: row.url,
-        labels: labelsFromGh(row.labels),
-      });
-    }
-  }
-
-  return { label, repo: repoFilter ?? undefined, source: 'labels', issues };
 }
 
 function issueContext(ref: IssueRef) {
@@ -497,12 +460,11 @@ function normalizeIssueCreateDraft(workspaceRoot: string, raw: unknown): { draft
   if (!title) return { draft: null, error: 'Issue draft is missing title.', warnings: [] };
   if (!body) return { draft: null, error: 'Issue draft is missing body.', warnings: [] };
 
-  const workflowLabels = new Set<string>(CAMPAIGN_LABELS.map((label) => label.name.toLowerCase()));
   const requestedLabels = stringArray(record.labels)
     .map((label) => label.trim())
-    .filter((label) => label && !workflowLabels.has(label.toLowerCase()));
+    .filter((label) => label);
   const ally = allyForIssueRepo(workspaceRoot, repo);
-  const generatedLabels = ['needs-triage', ...(ally ? ['ally', ally.id] : [])];
+  const generatedLabels = ally ? ['ally', ally.id] : [];
   const labelValidation = validateIssueCreateLabels(repo, generatedLabels, requestedLabels);
   if (labelValidation.error) return { draft: null, error: labelValidation.error, warnings: labelValidation.warnings };
   const issueTypeValidation = validateIssueCreateType(repo, issueType || null);
@@ -657,7 +619,7 @@ function buildIssueCreatePrompt(workspaceRoot: string, draftPath: string, option
     '  "milestone": null',
     '}',
     '',
-    'War Room will automatically add the `needs-triage` workflow label, ally labels for ally issue repos, Campaign Map Project 1, and Campaign status `needs-triage`.',
+    'War Room will automatically add ally labels for ally issue repos, add the issue to Campaign Map Project 1, and set Campaign status `needs-triage`.',
     seed ? ['', 'Seed context from CLI flags:', seed].join('\n') : '',
   ]
     .filter((line, index, lines) => line !== '' || index !== lines.length - 1)
@@ -814,7 +776,6 @@ function createIssueFromDraft(workspaceRoot: string, result: IssueCreateResult):
   const url = created.stdout.trim().split(/\r?\n/).find((line) => line.includes('/issues/')) ?? created.stdout.trim();
   const issue = issueRefFromUrl(url);
   let campaignStatus: CampaignStatusSetResult | null = null;
-  let labelUpdate: IssueLabelUpdateResult | null = null;
   let issueTypeUpdate: IssueTypeUpdateResult | null = null;
   const closeoutErrors: string[] = [];
 
@@ -828,9 +789,6 @@ function createIssueFromDraft(workspaceRoot: string, result: IssueCreateResult):
       closeoutErrors.push(error instanceof Error ? error.message : String(error));
     }
 
-    labelUpdate = setIssueWorkflowLabel(issue, 'needs-triage', true);
-    if (labelUpdate.error) closeoutErrors.push(labelUpdate.error);
-
     issueTypeUpdate = applyIssueType(issue, draft.issueType);
   } else {
     closeoutErrors.push(`Could not parse created issue URL: ${url || '(empty gh output)'}.`);
@@ -843,7 +801,6 @@ function createIssueFromDraft(workspaceRoot: string, result: IssueCreateResult):
     url: url || null,
     createCommand,
     campaignStatus,
-    labelUpdate,
     issueTypeUpdate,
     closeoutError: closeoutErrors.length ? closeoutErrors.join(' ') : null,
   };
@@ -990,14 +947,12 @@ function issueMatchesRepoFilter(workspaceRoot: string, issue: IssueSummary, repo
   return implementationRepoForIssue(workspaceRoot, issue) === repoFilter;
 }
 
-export function runIssueNext(workspaceRoot: string, options: IssueNextOptions | string = {}) {
-  const label = typeof options === 'string' ? options : options.label ?? 'ready-to-engage';
-  const currentRepo = typeof options === 'string' || options.allRepos ? null : repoForCurrentPath(workspaceRoot, options.currentPath);
+export function runIssueNext(workspaceRoot: string, options: IssueNextOptions = {}): IssueListResult {
+  const currentRepo = options.allRepos ? null : repoForCurrentPath(workspaceRoot, options.currentPath);
   const repoFilter = currentRepo?.github ?? null;
   const campaignIssues = listIssuesByCampaignStatus('ready-to-engage');
   const issues = campaignIssues.filter((issue) => issueMatchesRepoFilter(workspaceRoot, issue, repoFilter));
-  if (campaignIssues.length > 0) return { status: 'ready-to-engage', repo: repoFilter ?? undefined, source: 'campaign' as const, issues };
-  return listIssuesByLabel(workspaceRoot, label, repoFilter);
+  return { status: 'ready-to-engage', repo: repoFilter ?? undefined, source: 'campaign', issues };
 }
 
 function listIssuesByCampaignStatus(status: 'needs-triage' | 'ready-to-engage') {
@@ -1010,39 +965,6 @@ function listIssuesByCampaignStatus(status: 'needs-triage' | 'ready-to-engage') 
     status: issue.status,
     projectItemId: issue.projectItemId,
   }));
-}
-
-export function setIssueWorkflowLabel(issue: string, status: CampaignStatusName, confirm: boolean): IssueLabelUpdateResult {
-  const ref = parseIssueRef(issue);
-  const current = labelsFromGh(issueContext(ref).labels ?? []);
-  const workflowLabels = new Set<string>(CAMPAIGN_LABELS.map((label) => label.name));
-  const removeLabels = current.filter((label) => workflowLabels.has(label) && label !== status);
-  const addLabel = status;
-
-  if (confirm) {
-    const args = ['issue', 'edit', String(ref.number), '--repo', ref.repo, '--add-label', addLabel];
-    for (const label of removeLabels) args.push('--remove-label', label);
-    const result = spawnSync('gh', args, { encoding: 'utf8' });
-    if (result.status !== 0) {
-      return {
-        issue,
-        status,
-        addLabel,
-        removeLabels,
-        applied: false,
-        error: `${result.stderr || result.stdout}`.trim() || `gh issue edit failed with exit ${result.status ?? 'unknown'}.`,
-      };
-    }
-  }
-
-  return {
-    issue,
-    status,
-    addLabel,
-    removeLabels,
-    applied: confirm,
-    error: null,
-  };
 }
 
 export function assignSelfToIssue(issue: string, confirm: boolean): IssueAssigneeUpdateResult {
@@ -1095,7 +1017,6 @@ function emptyIssueCreateResult(
     url: null,
     createCommand: draft ? issueCreateCommand(draft) : null,
     campaignStatus: null,
-    labelUpdate: null,
     issueTypeUpdate: null,
     closeoutError: null,
     contextSummary: {
@@ -1175,11 +1096,9 @@ export function runIssueCreate(workspaceRoot: string, options: IssueCreateOption
 }
 
 export function runIssueTriage(workspaceRoot: string, options: IssueTriageOptions = {}): IssueListResult | IssueHandoffResult {
-  const label = options.label ?? 'needs-triage';
   if (!options.issue) {
     const issues = listIssuesByCampaignStatus('needs-triage');
-    if (issues.length > 0) return { status: 'needs-triage', source: 'campaign' as const, issues };
-    return listIssuesByLabel(workspaceRoot, label);
+    return { status: 'needs-triage', source: 'campaign', issues };
   }
 
   const ref = parseIssueRef(options.issue);
@@ -1187,7 +1106,7 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
   const artifact = options.writeArtifact
     ? createRunArtifact(workspaceRoot, 'issue-triage', {
         'prompt.md': prompt,
-        'input.json': JSON.stringify({ issue: options.issue, label }, null, 2),
+        'input.json': JSON.stringify({ issue: options.issue }, null, 2),
       })
     : null;
   const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, ref.repo);
@@ -1200,8 +1119,7 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
     const campaignStatus = shouldMarkReady
       ? setCampaignStatus(options.issue, 'ready-to-engage', { confirm: false })
       : null;
-    const labelUpdate = shouldMarkReady ? setIssueWorkflowLabel(options.issue, 'ready-to-engage', false) : null;
-    return { prompt, artifact, launched: false, adapterCommand, campaignStatus, labelUpdate, triageNotes: null, contextSummary };
+    return { prompt, artifact, launched: false, adapterCommand, campaignStatus, triageNotes: null, contextSummary };
   }
 
   const beforeComments = shouldMarkReady ? issueComments(ref) : { comments: [], error: null };
@@ -1217,7 +1135,6 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
     },
   });
   let campaignStatus: CampaignStatusSetResult | null = null;
-  let labelUpdate: IssueLabelUpdateResult | null = null;
   let triageNotes: TriageNotesResult | null = null;
   let closeoutError: string | null = null;
 
@@ -1229,11 +1146,6 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
       } catch (error) {
         closeoutError = error instanceof Error ? error.message : String(error);
       }
-
-      if (!closeoutError) {
-        labelUpdate = setIssueWorkflowLabel(options.issue, 'ready-to-engage', options.confirmStatus === true);
-        if (labelUpdate.error) closeoutError = labelUpdate.error;
-      }
     }
   }
 
@@ -1243,7 +1155,6 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
     launched: launch.launched,
     adapterCommand: launch.invocation.display,
     campaignStatus,
-    labelUpdate,
     triageNotes,
     contextSummary,
     launchError: launch.error,

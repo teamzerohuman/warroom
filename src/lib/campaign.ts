@@ -1,6 +1,5 @@
 import { spawnSync } from 'node:child_process';
 import { parseRepoRef } from './refs.js';
-import { type RepoManifest } from './repos.js';
 
 export const CAMPAIGN_OWNER = 'TeamFloPay';
 export const CAMPAIGN_PROJECT_NUMBER = 1;
@@ -14,29 +13,7 @@ export const CAMPAIGN_STATUSES = [
   { name: 'victory', color: 'PURPLE', description: 'Work is merged, cleaned up, and reported.' },
 ] as const;
 
-export const CAMPAIGN_LABELS = [
-  { name: 'needs-triage', color: 'D4C5F9', description: 'Blurry territory that needs planning before execution.' },
-  { name: 'ready-to-engage', color: '0E8A16', description: 'Planned work ready for implementation.' },
-  { name: 'battlefield-active', color: '1D76DB', description: 'Work is actively being implemented.' },
-  { name: 'skirmish', color: 'FBCA04', description: 'PR review, CodeRabbit feedback, or follow-up changes are being handled.' },
-  { name: 'blockaded', color: 'B60205', description: 'Work is blocked by an external dependency, decision, access issue, or prerequisite.' },
-  { name: 'victory', color: '5319E7', description: 'Work is merged, cleaned up, and reported.' },
-] as const;
-
 export type CampaignStatusName = (typeof CAMPAIGN_STATUSES)[number]['name'];
-
-export type CampaignLabelReport = {
-  checked: boolean;
-  expected: typeof CAMPAIGN_LABELS;
-  missing: Array<{ repo: string; label: string }>;
-  errors: Array<{ repo: string; detail: string }>;
-  createPlan: string[];
-};
-
-export type CampaignLabelApplyResult = CampaignLabelReport & {
-  applied: boolean;
-  created: Array<{ repo: string; label: string }>;
-};
 
 export type CampaignStatusReport = {
   checked: boolean;
@@ -55,6 +32,7 @@ export type CampaignStatusSetResult = {
   projectItemId: string | null;
   optionId: string;
   applied: boolean;
+  added: boolean;
   reason: string | null;
 };
 
@@ -72,81 +50,6 @@ function ghJson<T>(args: string[], fallback: T): T {
   const result = spawnSync('gh', args, { encoding: 'utf8' });
   if (result.status !== 0 || !result.stdout.trim()) return fallback;
   return JSON.parse(result.stdout) as T;
-}
-
-export function checkCampaignLabels(manifest: RepoManifest): CampaignLabelReport {
-  const missing: CampaignLabelReport['missing'] = [];
-  const errors: CampaignLabelReport['errors'] = [];
-  const createPlan: string[] = [];
-
-  for (const repo of manifest.repos) {
-    const result = spawnSync('gh', ['label', 'list', '--repo', repo.github, '--json', 'name', '--limit', '100'], {
-      encoding: 'utf8',
-    });
-    if (result.status !== 0) {
-      errors.push({ repo: repo.github, detail: `${result.stderr || result.stdout}`.trim() });
-      continue;
-    }
-
-    let labels: Array<{ name?: string }>;
-    try {
-      labels = JSON.parse(result.stdout || '[]') as Array<{ name?: string }>;
-    } catch {
-      errors.push({ repo: repo.github, detail: 'Could not parse gh label list output.' });
-      continue;
-    }
-    const existing = new Set(labels.map((label) => label.name).filter(Boolean));
-    for (const label of CAMPAIGN_LABELS) {
-      if (!existing.has(label.name)) {
-        missing.push({ repo: repo.github, label: label.name });
-        createPlan.push(
-          `gh label create ${label.name} --repo ${repo.github} --color ${label.color} --description "${label.description}"`
-        );
-      }
-    }
-  }
-
-  return {
-    checked: errors.length === 0,
-    expected: CAMPAIGN_LABELS,
-    missing,
-    errors,
-    createPlan,
-  };
-}
-
-export function applyCampaignLabels(manifest: RepoManifest, confirm: boolean): CampaignLabelApplyResult {
-  const report = checkCampaignLabels(manifest);
-  const created: Array<{ repo: string; label: string }> = [];
-
-  if (!confirm || report.errors.length > 0) {
-    return { ...report, applied: false, created };
-  }
-
-  for (const missing of report.missing) {
-    const label = CAMPAIGN_LABELS.find((entry) => entry.name === missing.label);
-    if (!label) continue;
-    const result = spawnSync(
-      'gh',
-      [
-        'label',
-        'create',
-        label.name,
-        '--repo',
-        missing.repo,
-        '--color',
-        label.color,
-        '--description',
-        label.description,
-      ],
-      { encoding: 'utf8' }
-    );
-    if (result.status === 0) {
-      created.push(missing);
-    }
-  }
-
-  return { ...checkCampaignLabels(manifest), applied: true, created };
 }
 
 function projectView() {
@@ -243,11 +146,22 @@ export function listCampaignIssuesByStatus(status: CampaignStatusName): Campaign
     }));
 }
 
-function ensureProjectItem(issue: string, confirm: boolean) {
+function ensureProjectItem(issue: string): { item: { id: string; content: { repository: string; number: number; url: string } }; added: boolean } {
   const existing = projectItemForIssue(issue);
-  if (existing) return existing;
-
-  if (!confirm) return null;
+  if (existing) {
+    const ref = parseIssueRef(issue);
+    return {
+      item: {
+        id: existing.id,
+        content: {
+          repository: existing.content?.repository ?? ref.repo,
+          number: existing.content?.number ?? ref.number,
+          url: existing.content?.url ?? `https://github.com/${ref.repo}/issues/${ref.number}`,
+        },
+      },
+      added: false,
+    };
+  }
 
   const ref = parseIssueRef(issue);
   const url = `https://github.com/${ref.repo}/issues/${ref.number}`;
@@ -256,7 +170,10 @@ function ensureProjectItem(issue: string, confirm: boolean) {
     {}
   );
   if (!added.id) throw new Error(`Could not add ${issue} to Campaign Map.`);
-  return { id: added.id, content: { repository: ref.repo, number: ref.number, url } };
+  return {
+    item: { id: added.id, content: { repository: ref.repo, number: ref.number, url } },
+    added: true,
+  };
 }
 
 export function setCampaignStatus(issue: string, status: CampaignStatusName, options: { confirm?: boolean; reason?: string | null } = {}): CampaignStatusSetResult {
@@ -274,10 +191,10 @@ export function setCampaignStatus(issue: string, status: CampaignStatusName, opt
 
   const option = report.options.find((entry) => entry.name === status);
   if (!option) throw new Error(`Campaign Map status option missing: ${status}`);
-  const item = ensureProjectItem(issue, options.confirm ?? false);
+
+  const { item, added } = ensureProjectItem(issue);
 
   if (options.confirm) {
-    if (!item) throw new Error(`Could not find or add ${issue} on Campaign Map.`);
     const result = spawnSync(
       'gh',
       [
@@ -300,9 +217,10 @@ export function setCampaignStatus(issue: string, status: CampaignStatusName, opt
   return {
     issue,
     status,
-    projectItemId: item?.id ?? null,
+    projectItemId: item.id,
     optionId: option.id,
     applied: options.confirm ?? false,
+    added,
     reason: options.reason ?? null,
   };
 }

@@ -63,7 +63,7 @@ These notes are public and client-facing. Write for merchants, buyers, external 
 - Lead with customer-visible value and behavior changes.
 - Translate implementation details into merchant, buyer, developer, or operator impact.
 - Call out breaking changes, removed public APIs, migration work, or required operational action directly.
-- Do not include War Room details, workflow labels, local file paths, CI output, validation commands, raw stack traces, Sentry IDs, secrets, customer PII, private endpoints, or private incident details.
+- Do not include War Room details, internal Campaign Map status names, local file paths, CI output, validation commands, raw stack traces, Sentry IDs, secrets, customer PII, private endpoints, or private incident details.
 - Do not expose internal implementation details: no database table or column names, no ORM/entity or migration names, no internal service or queue names, no internal class, file, or module paths, no feature-flag keys, no environment variable names.
 - Only reference things external consumers can already see: public API endpoints (with method + path), documented request/response DTO fields, public SDK exports, public CLI commands, and documented configuration keys.
 - Do not paste commit lists. Consolidate changes into a few meaningful bullets.

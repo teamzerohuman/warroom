@@ -4,7 +4,6 @@ import { spawnSync } from 'node:child_process';
 import YAML from 'yaml';
 import { z } from 'zod';
 import { absolutePath, getGitStatus, isGitCheckout } from './repos.js';
-import { CAMPAIGN_LABELS } from './campaign.js';
 
 const AllyIssueRepoSchema = z.object({
   github: z.string(),
@@ -97,7 +96,6 @@ export function resolveAllyIssueRepo(workspaceRoot: string, githubRepo: string):
 
 function expectedLabels(ally: AllyEntry) {
   return [
-    ...CAMPAIGN_LABELS,
     { name: 'ally', color: '0E8A16', description: 'Enterprise ally/client issue.' },
     { name: ally.id, color: '5319E7', description: `${ally.name} ally workspace issue.` },
   ];

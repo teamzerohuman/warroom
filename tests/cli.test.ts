@@ -296,7 +296,6 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.startsWith('Adapter: codex exec --model gpt-5.5 '))).toBe(true);
       expect(lines).toContain('Adapter run: completed (foreground process; no background session remains)');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> battlefield-active');
-      expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#7 +battlefield-active; removed ready-to-engage');
       expect(lines).toContain('Issue assignee: updated TeamFloPay/sdk#7 +@me');
       expect(lines).toContain('Development branch: ready warroom/7-build-the-selector from main');
       expect(lines.some((line) => line.includes('Development branch link: created gh issue develop 7 --repo TeamFloPay/sdk --base main --name warroom/7-build-the-selector --checkout'))).toBe(true);
@@ -476,7 +475,6 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain(`Adapter cwd: ${backend}`);
       expect(lines).toContain('Adapter run: completed (foreground process; no background session remains)');
       expect(lines).toContain('Campaign status: updated TeamFloPay/ally-clicktech#6 -> battlefield-active');
-      expect(lines).toContain('Issue labels: updated TeamFloPay/ally-clicktech#6 +battlefield-active; removed ready-to-engage');
       expect(lines).toContain('Development branch: ready warroom/6-omni-duplicate-paid-out-of-band-subscription-pay from main');
       expect(lines.some((line) => line.startsWith('Development branch link: created gh api graphql createLinkedBranch TeamFloPay/ally-clicktech#6 -> TeamFloPay/backend:warroom/6-omni-duplicate-paid-out-of-band-subscription-pay'))).toBe(true);
       expect(lines).toContain('Development checkout: checked out');
@@ -596,14 +594,13 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Repo: TeamFloPay/sdk');
       expect(lines).toContain('Title: Report checkout settlement confusion');
       expect(lines).toContain('Issue type: Bug');
-      expect(lines).toContain('Labels: needs-triage');
+      expect(lines).toContain('Labels: none');
       expect(lines).toContain('Draft warning: Ignored label "checkout" because it does not exist in TeamFloPay/sdk.');
       expect(lines).toContain('Create this GitHub issue now? [Y/n]');
       expect(lines).toContain('Issue create: created');
       expect(lines).toContain('URL: https://github.com/TeamFloPay/sdk/issues/123');
       expect(lines).toContain('Issue type: updated TeamFloPay/sdk#123 -> Bug');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#123 -> needs-triage');
-      expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#123 +needs-triage');
       expect(lines).toContain('Outcome: issue created with follow-up warnings. draft warning: Ignored label "checkout" because it does not exist in TeamFloPay/sdk.');
       expect(lines).toContain('Run `warroom issue triage --issue TeamFloPay/sdk#123` now? [Y/n]');
       expect(lines).toContain('Triaging TeamFloPay/sdk#123');
@@ -687,7 +684,6 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('Clarify how operators should move needs-triage issues toward a ready plan.'))).toBe(true);
       expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/sdk/issues/4#issuecomment-triage');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#4 -> ready-to-engage');
-      expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#4 +ready-to-engage; removed needs-triage');
       expect(lines.at(-1)).toBe('Run `warroom issue next --issue TeamFloPay/sdk#4` now? [Y/n]');
     } finally {
       process.env.PATH = originalPath;
@@ -876,7 +872,6 @@ describe('phase-1 CLI', () => {
 
       expect(lines).toContain('Triage notes: missing');
       expect(lines.some((line) => line.includes('Campaign status: updated TeamFloPay/sdk#4 -> ready-to-engage'))).toBe(false);
-      expect(lines.some((line) => line.includes('Issue labels: updated TeamFloPay/sdk#4 +ready-to-engage'))).toBe(false);
       expectFinalOutcome(
         lines,
         'Outcome: interactive issue triage session completed, but Campaign status was not updated. No new issue comment containing "## War Room triage notes" was found.'
@@ -925,7 +920,6 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes(`Local checkout: ${allyRepo}`))).toBe(true);
       expect(lines).toContain('Triage notes: ready https://github.com/TeamFloPay/ally-clicktech/issues/5#issuecomment-triage');
       expect(lines).toContain('Campaign status: updated TeamFloPay/ally-clicktech#5 -> ready-to-engage');
-      expect(lines).toContain('Issue labels: updated TeamFloPay/ally-clicktech#5 +ready-to-engage; removed needs-triage');
       expectBoxedOutcome(
         lines,
         'Outcome: interactive issue triage session completed. Campaign status updated to ready-to-engage.'
@@ -1369,7 +1363,6 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('PR review loop: no outstanding CodeRabbit feedback remains on the initial PR commit.');
       expect(lines).toContain('PR review: complete');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#7 -> skirmish');
-      expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#7 +skirmish; removed battlefield-active');
       expectBoxedOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
       expect(lines.at(-1)).toBe('Run `warroom pr merge --pr TeamFloPay/sdk#12` now? [Y/n]');
       expect(Number(readFileSync(`${stateFile}.polls`, 'utf8'))).toBeGreaterThanOrEqual(4);
@@ -1479,7 +1472,6 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('PR review loop 2: no outstanding CodeRabbit feedback remains.');
       expect(lines).toContain('PR review: launched');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#8 -> skirmish');
-      expect(lines).toContain('Issue labels: updated TeamFloPay/sdk#8 +skirmish; removed battlefield-active');
       expect(lines.some((line) => line.startsWith('Adapter: codex exec --model gpt-5.5 '))).toBe(true);
       expect(lines.some((line) => line.includes('Please analyze the latest [@coderabbit](plugin://coderabbit@openai-curated)'))).toBe(true);
       expect(lines.some((line) => line.includes('addPullRequestReviewThreadReply'))).toBe(true);
@@ -1770,7 +1762,6 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Starting PR review for TeamFloPay/backend#657');
       expect(lines).toContain('PR review: launched');
       expect(lines).toContain('Campaign status: updated TeamFloPay/backend#632 -> skirmish');
-      expect(lines).toContain('Issue labels: updated TeamFloPay/backend#632 +skirmish; removed battlefield-active');
       expect(lines).toContain('PR review loop 1: no outstanding CodeRabbit feedback remains.');
       expect(lines.some((line) => line.includes('PR https://github.com/TeamFloPay/backend/pull/657'))).toBe(true);
       expectBoxedOutcome(lines, 'Outcome: PR review loop complete; no outstanding CodeRabbit feedback remains.');
@@ -2699,9 +2690,6 @@ exit 0
       expect(lines).toContain('Merge e2e: skipped (repos.yaml has merge.playwright: false for TeamFloPay/infra.)');
       expect(lines).toContain('Merged: yes');
       expect(lines).toContain('Campaign status: updated TeamFloPay/backend#562 -> victory');
-      expect(lines).toContain(
-        'Issue labels: updated TeamFloPay/backend#562 +victory; removed battlefield-active, ready-to-engage, skirmish'
-      );
       expect(lines).toContain('War Room LLM usage for TeamFloPay/backend#562:');
       expect(lines).toContain('- Entries: 1');
       expect(lines).toContain('- Total tokens: 120 estimated');
@@ -4994,8 +4982,7 @@ if (args[0] === 'issue' && args[1] === 'create') {
     repo !== 'TeamFloPay/sdk' ||
     title !== 'Report checkout settlement confusion' ||
     !body.includes('Customer support needs a clear issue') ||
-    labels.includes('checkout') ||
-    !labels.includes('needs-triage')
+    labels.includes('checkout')
   ) {
     process.stderr.write('unexpected issue create payload');
     process.exit(1);

@@ -2,12 +2,13 @@
 import { Command } from 'commander';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { spawnSync } from 'node:child_process';
 import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { createInterface } from 'node:readline';
 import { runAbort, type AbortResult } from './commands/abort.js';
 import { runAlliesStatus, type AlliesStatus } from './commands/allies.js';
 import { runBootstrap, type BootstrapResult } from './commands/bootstrap.js';
-import { runCampaignLabels, runCampaignStatus, runCampaignStatusCheck } from './commands/campaign.js';
+import { runCampaignStatus, runCampaignStatusCheck } from './commands/campaign.js';
 import { runCommitCreate, type CommitCreateResult } from './commands/commit-create.js';
 import {
   linkSdkToDemo,
@@ -19,6 +20,7 @@ import {
 import { runDoctor } from './commands/doctor.js';
 import {
   confirmIssueCreate,
+  parseIssueRef,
   runIssueCreate,
   runIssueFeedback,
   runIssueNext,
@@ -29,6 +31,8 @@ import {
   type IssueListResult,
   type IssueSummary,
 } from './commands/issues.js';
+import { resolveAllyIssueRepo } from './lib/allies.js';
+import { ownerRepoFromText } from './lib/issue-links.js';
 import { runMapsAssign, type MapsAssignResult } from './commands/maps-assign.js';
 import { runMapsStudy } from './commands/maps-study.js';
 import {
@@ -76,7 +80,7 @@ import { readWorkspaceEnvVar } from './lib/env.js';
 import { formatLlmUsageSummary, refreshIssueUsageLedgerCosts, summarizeIssueUsage, type LlmUsageSummary } from './lib/llm-usage.js';
 import { pickCommandPath } from './lib/interactive-menu.js';
 import { selectChoice } from './lib/prompt.js';
-import { runGit } from './lib/repos.js';
+import { loadRepoManifest, runGit } from './lib/repos.js';
 import { findWarRoomWorkspace } from './lib/workspace.js';
 
 type Output = (text: string) => void;
@@ -144,7 +148,7 @@ function printAlliesStatus(output: Output, result: AlliesStatus) {
     if (!ally.envExampleExists) output(`missing env example: ${ally.envExamplePath}`);
     for (const doc of ally.docsStatus.filter((entry) => !entry.exists)) output(`missing doc: ${doc.path}`);
     if (ally.labels.error) output(`label check failed: ${ally.labels.error}`);
-    for (const label of ally.labels.missing) output(`missing label: ${ally.issue_repo.github}:${label}`);
+    for (const label of ally.labels.missing) output(`missing ally label: ${ally.issue_repo.github}:${label}`);
   }
 }
 
@@ -156,13 +160,107 @@ function printMapsAssign(output: Output, result: MapsAssignResult) {
 }
 
 function printIssueList(output: Output, result: IssueListResult, options: { numbered?: boolean } = {}) {
-  const selector = result.source === 'campaign' ? `Campaign status ${result.status}` : `label ${result.label}`;
+  const selector = `Campaign status ${result.status}`;
   const repo = result.repo ? ` for ${result.repo}` : '';
   output(`Issues with ${selector}${repo}: ${result.issues.length}`);
   result.issues.forEach((issue, index) => {
     const prefix = options.numbered ? `${index + 1}. ` : '';
     output(`${prefix}${issue.repo}#${issue.number} ${issue.title} ${issue.url}`);
   });
+}
+
+async function ensureAllyImplementationRepo(
+  workspaceRoot: string,
+  output: Output,
+  input: Input,
+  interactive: boolean,
+  issueRef: string
+): Promise<boolean> {
+  let ref;
+  try {
+    ref = parseIssueRef(issueRef);
+  } catch {
+    return true;
+  }
+
+  const allyResolution = resolveAllyIssueRepo(workspaceRoot, ref.repo);
+  if (!allyResolution) return true;
+
+  const result = spawnSync(
+    'gh',
+    ['issue', 'view', String(ref.number), '--repo', ref.repo, '--json', 'body,comments'],
+    { encoding: 'utf8' }
+  );
+  let issue: { body?: string; comments?: Array<{ body?: string }> } = {};
+  if (result.status === 0 && result.stdout.trim()) {
+    try {
+      issue = JSON.parse(result.stdout);
+    } catch {
+      issue = {};
+    }
+  }
+
+  const candidates = [
+    ...(issue.comments ?? []).slice().reverse().map((comment) => ownerRepoFromText(comment.body)),
+    ownerRepoFromText(issue.body),
+  ].filter((repo): repo is string => Boolean(repo));
+
+  const manifest = loadRepoManifest(workspaceRoot);
+  const isMapped = (repo: string) => manifest.repos.some((entry) => entry.github === repo);
+  if (candidates.some(isMapped)) return true;
+
+  if (!interactive) {
+    output(
+      `Ally issue ${ref.repo}#${ref.number} has no implementation repo declared. Re-run interactively, or add a comment like \`Owner repo: TeamFloPay/<mapped-repo>\` on the issue.`
+    );
+    return false;
+  }
+
+  const activeRepos = manifest.repos.filter((repo) => repo.status === 'active');
+  if (activeRepos.length === 0) {
+    output('repos.yaml has no active mapped repos to choose from.');
+    return false;
+  }
+
+  output(
+    `Ally issue ${ref.repo}#${ref.number} does not declare an implementation repo. Pick the repo where work will happen:`
+  );
+  const cancelSentinel = '__cancel__';
+  const choice = await selectChoice<string>({
+    output,
+    input,
+    question: 'Implementation repo:',
+    default: activeRepos[0]!.github,
+    choices: [
+      ...activeRepos.map((repo) => ({
+        label: `${repo.github} — ${repo.description}`,
+        value: repo.github,
+        aliases: [repo.id, repo.github.split('/')[1] ?? repo.id],
+      })),
+      { label: 'Cancel', value: cancelSentinel, aliases: ['cancel', 'q', 'quit', '0'] },
+    ],
+    retryHelp: 'Choose a mapped repo by label, id, or cancel.',
+  });
+
+  if (choice === cancelSentinel) {
+    output('No implementation repo selected.');
+    return false;
+  }
+
+  const body = `Owner repo: ${choice}`;
+  const post = spawnSync(
+    'gh',
+    ['issue', 'comment', String(ref.number), '--repo', ref.repo, '--body', body],
+    { encoding: 'utf8' }
+  );
+  if (post.status !== 0) {
+    output(
+      `Failed to post Owner repo comment on ${ref.repo}#${ref.number}: ${(post.stderr || post.stdout).trim()}`
+    );
+    return false;
+  }
+  output(`Posted "Owner repo: ${choice}" comment on ${ref.repo}#${ref.number}.`);
+  return true;
 }
 
 async function promptIssueSelection(output: Output, input: Input, issues: IssueSummary[], action = 'start') {
@@ -408,13 +506,6 @@ function printIssueHandoff(output: Output, result: IssueHandoffResult, options: 
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
   }
-  if (result.labelUpdate) {
-    const removed = result.labelUpdate.removeLabels.length ? `; removed ${result.labelUpdate.removeLabels.join(', ')}` : '';
-    output(
-      `Issue labels: ${result.labelUpdate.applied ? 'updated' : 'planned'} ${result.labelUpdate.issue} +${result.labelUpdate.addLabel}${removed}`
-    );
-    if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
-  }
   if (result.triageNotes) {
     const notes = result.triageNotes;
     output(
@@ -505,13 +596,6 @@ function printIssueCreate(output: Output, result: IssueCreateResult) {
   }
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
-  }
-  if (result.labelUpdate) {
-    const removed = result.labelUpdate.removeLabels.length ? `; removed ${result.labelUpdate.removeLabels.join(', ')}` : '';
-    output(
-      `Issue labels: ${result.labelUpdate.applied ? 'updated' : 'planned'} ${result.labelUpdate.issue} +${result.labelUpdate.addLabel}${removed}`
-    );
-    if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
   }
   if (result.closeoutError) output(`issue closeout error: ${result.closeoutError}`);
   printOutcome(output, issueCreateOutcome(result));
@@ -840,13 +924,6 @@ function printPrPlan(output: Output, result: PrPlanResult) {
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
   }
-  if (result.labelUpdate) {
-    const removed = result.labelUpdate.removeLabels.length ? `; removed ${result.labelUpdate.removeLabels.join(', ')}` : '';
-    output(
-      `Issue labels: ${result.labelUpdate.applied ? 'updated' : 'planned'} ${result.labelUpdate.issue} +${result.labelUpdate.addLabel}${removed}`
-    );
-    if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
-  }
   if (result.assigneeUpdate) {
     output(
       `Issue assignee: ${result.assigneeUpdate.applied ? 'updated' : 'planned'} ${result.assigneeUpdate.issue} +${result.assigneeUpdate.assignee}`
@@ -890,13 +967,6 @@ function printPrCreate(output: Output, result: PrCreateResult) {
   for (const blocker of result.blocked) output(`blocked: ${blocker}`);
   if (result.campaignStatus) {
     output(`Campaign status: ${result.campaignStatus.applied ? 'updated' : 'planned'} ${result.campaignStatus.issue} -> ${result.campaignStatus.status}`);
-  }
-  if (result.labelUpdate) {
-    const removed = result.labelUpdate.removeLabels.length ? `; removed ${result.labelUpdate.removeLabels.join(', ')}` : '';
-    output(
-      `Issue labels: ${result.labelUpdate.applied ? 'updated' : 'planned'} ${result.labelUpdate.issue} +${result.labelUpdate.addLabel}${removed}`
-    );
-    if (result.labelUpdate.error) output(`label update error: ${result.labelUpdate.error}`);
   }
   output(result.body);
   if ((result.created || result.existingPr) && result.url) {
@@ -974,15 +1044,6 @@ async function promptPrMergeFollowUps(
         output(
           `Campaign status: ${summaryResult.campaignStatus.applied ? 'updated' : 'planned'} ${summaryResult.campaignStatus.issue} -> ${summaryResult.campaignStatus.status}`
         );
-      }
-      if (summaryResult.labelUpdate) {
-        const removed = summaryResult.labelUpdate.removeLabels.length
-          ? `; removed ${summaryResult.labelUpdate.removeLabels.join(', ')}`
-          : '';
-        output(
-          `Issue labels: ${summaryResult.labelUpdate.applied ? 'updated' : 'planned'} ${summaryResult.labelUpdate.issue} +${summaryResult.labelUpdate.addLabel}${removed}`
-        );
-        if (summaryResult.labelUpdate.error) output(`label update error: ${summaryResult.labelUpdate.error}`);
       }
     }
   }
@@ -1514,16 +1575,6 @@ function printAbort(output: Output, result: AbortResult) {
   }
 }
 
-function printCampaignLabels(output: Output, result: ReturnType<typeof runCampaignLabels>) {
-  output(`Campaign labels: ${result.errors.length > 0 ? 'check failed' : result.missing.length === 0 ? 'ok' : `${result.missing.length} missing`}`);
-  if ('applied' in result && 'created' in result && Array.isArray(result.created)) {
-    output(`Applied: ${result.applied ? 'yes' : 'no'} (${result.created.length} created)`);
-  }
-  for (const missing of result.missing) output(`missing ${missing.label} in ${missing.repo}`);
-  for (const command of result.createPlan) output(`create plan: ${command}`);
-  for (const error of result.errors) output(`error ${error.repo}: ${error.detail}`);
-}
-
 function printCampaignStatusCheck(output: Output, result: ReturnType<typeof runCampaignStatusCheck>) {
   output(`Campaign statuses: ${result.errors.length > 0 ? 'check failed' : result.missing.length === 0 && result.unexpected.length === 0 ? 'ok' : 'needs attention'}`);
   output(`Project: ${result.projectId ?? 'unknown'}`);
@@ -1536,7 +1587,7 @@ function printCampaignStatusCheck(output: Output, result: ReturnType<typeof runC
 
 function printCampaignStatus(output: Output, result: ReturnType<typeof runCampaignStatus>) {
   output(`Campaign status: ${result.applied ? 'updated' : 'planned'} ${result.issue} -> ${result.status}`);
-  output(`Project item: ${result.projectItemId ?? 'not added in preview'}`);
+  output(`Project item: ${result.projectItemId}${result.added ? ' (added to board)' : ''}`);
   output(`Option: ${result.optionId}`);
   if (result.reason) output(`Reason: ${result.reason}`);
 }
@@ -1658,11 +1709,6 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       output(
         `Campaign statuses: ${result.campaignStatuses.errors.length > 0 ? 'check failed' : result.campaignStatuses.missing.length === 0 && result.campaignStatuses.unexpected.length === 0 ? 'ok' : 'needs attention'}`
       );
-      const missingLabels = result.campaignLabels.missing.length;
-      output(
-        `Campaign labels: ${result.campaignLabels.errors.length > 0 ? 'check failed' : missingLabels === 0 ? 'ok' : `${missingLabels} missing`}`
-      );
-      if (missingLabels > 0) output('Run warroom doctor --json to inspect campaignLabels.createPlan before creating labels.');
       for (const repo of result.repos) {
         const checkout = repo.checkedOut ? `${repo.source} checkout` : 'missing';
         const dirty = repo.clean === false ? ', dirty' : repo.clean === true ? ', clean' : '';
@@ -1789,21 +1835,6 @@ export function buildProgram(options: BuildProgramOptions = {}) {
 
   const campaign = program.command('campaign').description('Campaign Map setup and status commands.');
   campaign
-    .command('labels')
-    .description('Check or apply Campaign Map workflow labels across mapped repos.')
-    .option('--apply', 'Create missing labels. Requires --confirm.')
-    .option('--confirm', 'Confirm label creation when used with --apply.')
-    .option('--json', 'Print machine-readable output.')
-    .action((opts: { apply?: boolean; confirm?: boolean; json?: boolean }) => {
-      const result = runCampaignLabels(workspaceRoot, opts);
-      if (opts.json) {
-        printJson(output, result);
-        return;
-      }
-      printCampaignLabels(output, result);
-    });
-
-  campaign
     .command('status-check')
     .description('Validate Campaign Map Status options.')
     .option('--json', 'Print machine-readable output.')
@@ -1916,7 +1947,6 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .command('triage')
     .description('List triage issues or create a scoped LLM triage handoff for one issue.')
     .option('--issue <owner/repo#number>', 'Issue to triage.')
-    .option('--label <label>', 'Label used for triage listing.', 'needs-triage')
     .option('--mark-ready', 'Preview or move the issue to ready-to-engage after triage.')
     .option('--confirm-status', 'Apply the Campaign Map status movement requested by --mark-ready.')
     .option('--dry-run', 'Print the structured handoff without launching the configured LLM adapter.')
@@ -1924,13 +1954,12 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--no-select', 'List issues without prompting for a selection.')
     .option('--json', 'Print machine-readable output.')
-    .action(async (opts: { issue?: string; label?: string; markReady?: boolean; confirmStatus?: boolean; dryRun?: boolean; launch?: boolean; writeArtifact?: boolean; select?: boolean; json?: boolean }) => {
+    .action(async (opts: { issue?: string; markReady?: boolean; confirmStatus?: boolean; dryRun?: boolean; launch?: boolean; writeArtifact?: boolean; select?: boolean; json?: boolean }) => {
       const triageDryRun = () => opts.dryRun === true;
       const runTriage = (issueRef?: string, selectedInteractively = false) => {
         const dryRun = triageDryRun();
         return runIssueTriage(workspaceRoot, {
           issue: issueRef,
-          label: opts.label,
           markReady: dryRun ? opts.markReady : opts.markReady || selectedInteractively || Boolean(issueRef),
           confirmStatus: dryRun ? false : opts.confirmStatus || selectedInteractively || Boolean(issueRef),
           dryRun,
@@ -2076,7 +2105,6 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .command('next')
     .description('List issues ready for implementation and select one to start development.')
     .option('--issue <owner/repo#number>', 'Start this issue directly instead of prompting for a selection.')
-    .option('--label <label>', 'Ready label to query.', 'ready-to-engage')
     .option('--base <branch>', 'Target branch for the eventual PR.', 'main')
     .option('--dry-run', 'Print the selected issue handoff without launching the adapter or moving Campaign Map status.')
     .option('--launch', 'Launch the configured LLM adapter for the selected issue. This is the default after selection.')
@@ -2090,7 +2118,6 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .action(
       async (opts: {
         issue?: string;
-        label?: string;
         base?: string;
         dryRun?: boolean;
         launch?: boolean;
@@ -2106,6 +2133,27 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         if (opts.issue) {
           const dryRun = opts.dryRun === true;
           if (!opts.json) output(`Starting ${opts.issue}`);
+          if (!dryRun) {
+            const ensured = await ensureAllyImplementationRepo(
+              workspaceRoot,
+              output,
+              input,
+              interactive && opts.json !== true,
+              opts.issue
+            );
+            if (!ensured) {
+              if (opts.json) {
+                printJson(output, { ok: false, issue: opts.issue, error: 'Implementation repo not selected for ally issue.' });
+              } else {
+                printOutcome(
+                  output,
+                  'Outcome: not started. Ally issue has no implementation repo. Re-run interactively or add an `Owner repo: TeamFloPay/<mapped-repo>` comment, then retry.'
+                );
+              }
+              process.exitCode = 1;
+              return;
+            }
+          }
           const plan = runIssueStart(workspaceRoot, {
             issue: opts.issue,
             base: opts.base,
@@ -2124,7 +2172,6 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         }
 
         const result = runIssueNext(workspaceRoot, {
-          label: opts.label,
           currentPath: invocationCwd,
           allRepos: opts.all,
         });
@@ -2155,6 +2202,17 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         const issueRef = `${selected.repo}#${selected.number}`;
         output(`Starting ${issueRef}`);
         const dryRun = opts.dryRun === true;
+        if (!dryRun) {
+          const ensured = await ensureAllyImplementationRepo(workspaceRoot, output, input, interactive, issueRef);
+          if (!ensured) {
+            printOutcome(
+              output,
+              'Outcome: not started. Ally issue has no implementation repo. Pick a repo when prompted or add an `Owner repo: TeamFloPay/<mapped-repo>` comment, then retry.'
+            );
+            process.exitCode = 1;
+            return;
+          }
+        }
         const plan = runIssueStart(workspaceRoot, {
           issue: issueRef,
           base: opts.base,

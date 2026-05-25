@@ -43,7 +43,7 @@ If instructions conflict:
 
 ## GitHub Project
 
-TeamFloPay Project 1 is the Campaign Map. Its Status options are `needs-triage`, `ready-to-engage`, `battlefield-active`, `skirmish`, `blockaded`, and `victory`.
+TeamFloPay Project 1 is the Campaign Map. Its Status options are `needs-triage`, `ready-to-engage`, `battlefield-active`, `skirmish`, `blockaded`, and `victory`. The Status field is the single source of truth for an issue's phase — no duplicate workflow labels are written on the repo. Status changes always add the issue to the Campaign Map board if it is not already there.
 
 When updating issues or project state:
 

@@ -4,7 +4,7 @@ import { getRepoHealth, loadRepoManifest } from '../lib/repos.js';
 import { getEnvStatus } from '../lib/env.js';
 import { loadResourcesManifest, validateResourceReferences } from '../lib/resources.js';
 import { checkGithubAuth, checkTool } from '../lib/tools.js';
-import { checkCampaignLabels, checkCampaignStatusOptions } from '../lib/campaign.js';
+import { checkCampaignStatusOptions } from '../lib/campaign.js';
 import { runAlliesStatus } from './allies.js';
 
 function adapterToolChecks(adapter: string | null) {
@@ -43,7 +43,6 @@ export function runDoctor(workspaceRoot: string) {
     checkTool('npm', 'npm', ['--version']),
     ...adapterToolChecks(env.adapter),
   ];
-  const campaignLabels = checkCampaignLabels(manifest);
   const campaignStatuses = checkCampaignStatusOptions();
   const allies = runAlliesStatus(workspaceRoot);
 
@@ -64,7 +63,6 @@ export function runDoctor(workspaceRoot: string) {
       referencesOk: resourceReferences.ok,
       missingReferences: resourceReferences.missing,
     },
-    campaignLabels,
     campaignStatuses,
     allies,
     repos,
