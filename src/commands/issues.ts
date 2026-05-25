@@ -88,6 +88,61 @@ export type IssueTriageOptions = {
   writeArtifact?: boolean;
 };
 
+export type FeedbackPostResult = {
+  target: 'issue' | 'pr';
+  ref: string;
+  applied: boolean;
+  url: string | null;
+  reason: string | null;
+  error: string | null;
+};
+
+export type FeedbackNotesResult = {
+  marker: string;
+  beforeIssueComments: number | null;
+  afterIssueComments: number | null;
+  foundIssueComment: boolean;
+  issueCommentUrl: string | null;
+  beforePrComments: number | null;
+  afterPrComments: number | null;
+  foundPrComment: boolean;
+  prCommentUrl: string | null;
+  expectedPrComment: boolean;
+  reason: string | null;
+  error: string | null;
+};
+
+export type IssueFeedbackOptions = {
+  issue: string;
+  prRef?: string;
+  body?: string;
+  bodyFile?: string;
+  postPrComment?: boolean;
+  dryRun?: boolean;
+  writeArtifact?: boolean;
+};
+
+export type IssueFeedbackResult = {
+  mode: 'adapter' | 'direct';
+  marker: string;
+  issue: string;
+  prRef: string | null;
+  prompt: string | null;
+  formattedBody: string | null;
+  artifact: RunArtifact | null;
+  launched: boolean;
+  adapterCommand: string | null;
+  adapterCwd: string | null;
+  launchError: string | null;
+  feedbackNotes: FeedbackNotesResult | null;
+  issueComment: FeedbackPostResult | null;
+  prComment: FeedbackPostResult | null;
+  contextSummary: {
+    promptCharacters: number | null;
+    feedbackCharacters: number | null;
+  };
+};
+
 export type IssueNextOptions = {
   label?: string;
   currentPath?: string;
@@ -147,6 +202,7 @@ export type IssueCreateOptions = {
 
 const TRIAGE_NOTES_MARKER = '## War Room triage notes';
 const TRIAGE_READY_LINE = 'Ready for ready-to-engage: yes';
+const FEEDBACK_NOTES_MARKER = '## War Room feedback';
 
 function ghJson<T>(args: string[], fallback: T): T {
   const result = spawnSync('gh', args, { encoding: 'utf8' });
@@ -1192,5 +1248,438 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
     contextSummary,
     launchError: launch.error,
     closeoutError,
+  };
+}
+
+function currentGhUserLogin(): string | null {
+  const result = spawnSync('gh', ['api', 'user', '--jq', '.login'], { encoding: 'utf8' });
+  if (result.status !== 0) return null;
+  return result.stdout.trim() || null;
+}
+
+function formatFeedbackComment(args: {
+  feedbackBody: string;
+  author: string | null;
+  prRef: string | null;
+  postedAt: Date;
+}): string {
+  const lines: string[] = [FEEDBACK_NOTES_MARKER, ''];
+  if (args.author) lines.push(`**Author:** @${args.author}`);
+  lines.push(`**Posted:** ${args.postedAt.toISOString()}`);
+  if (args.prRef) lines.push(`**Related PR:** ${args.prRef}`);
+  lines.push('', '---', '', args.feedbackBody.trim());
+  return lines.join('\n');
+}
+
+function postIssueFeedbackComment(ref: IssueRef, body: string): FeedbackPostResult {
+  const result = spawnSync('gh', ['issue', 'comment', String(ref.number), '--repo', ref.repo, '--body', body], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    return {
+      target: 'issue',
+      ref: `${ref.repo}#${ref.number}`,
+      applied: false,
+      url: null,
+      reason: null,
+      error: result.stderr.trim() || `gh issue comment failed with exit ${result.status ?? 'unknown'}.`,
+    };
+  }
+  return {
+    target: 'issue',
+    ref: `${ref.repo}#${ref.number}`,
+    applied: true,
+    url: result.stdout.trim() || null,
+    reason: null,
+    error: null,
+  };
+}
+
+function postPrFeedbackComment(ref: IssueRef, body: string): FeedbackPostResult {
+  const result = spawnSync('gh', ['pr', 'comment', String(ref.number), '--repo', ref.repo, '--body', body], { encoding: 'utf8' });
+  if (result.status !== 0) {
+    return {
+      target: 'pr',
+      ref: `${ref.repo}#${ref.number}`,
+      applied: false,
+      url: null,
+      reason: null,
+      error: result.stderr.trim() || `gh pr comment failed with exit ${result.status ?? 'unknown'}.`,
+    };
+  }
+  return {
+    target: 'pr',
+    ref: `${ref.repo}#${ref.number}`,
+    applied: true,
+    url: result.stdout.trim() || null,
+    reason: null,
+    error: null,
+  };
+}
+
+function prComments(ref: IssueRef): { comments: IssueComment[]; error: string | null } {
+  const result = spawnSync('gh', ['pr', 'view', String(ref.number), '--repo', ref.repo, '--json', 'comments'], {
+    encoding: 'utf8',
+  });
+  if (result.status !== 0) {
+    return { comments: [], error: `${result.stderr || result.stdout}`.trim() || `gh pr view failed with exit ${result.status ?? 'unknown'}.` };
+  }
+  try {
+    const parsed = JSON.parse(result.stdout || '{}') as { comments?: IssueComment[] };
+    return { comments: parsed.comments ?? [], error: null };
+  } catch {
+    return { comments: [], error: 'Could not parse gh pr comments output.' };
+  }
+}
+
+function verifyFeedbackNotes(
+  issueRef: IssueRef,
+  prRef: IssueRef | null,
+  expectPrComment: boolean,
+  before: {
+    issue: { comments: IssueComment[]; error: string | null };
+    pr: { comments: IssueComment[]; error: string | null } | null;
+  }
+): FeedbackNotesResult {
+  if (before.issue.error) {
+    return {
+      marker: FEEDBACK_NOTES_MARKER,
+      beforeIssueComments: null,
+      afterIssueComments: null,
+      foundIssueComment: false,
+      issueCommentUrl: null,
+      beforePrComments: before.pr?.comments.length ?? null,
+      afterPrComments: null,
+      foundPrComment: false,
+      prCommentUrl: null,
+      expectedPrComment: expectPrComment,
+      reason: 'Could not inspect issue comments before launch.',
+      error: before.issue.error,
+    };
+  }
+
+  const afterIssue = issueComments(issueRef);
+  if (afterIssue.error) {
+    return {
+      marker: FEEDBACK_NOTES_MARKER,
+      beforeIssueComments: before.issue.comments.length,
+      afterIssueComments: null,
+      foundIssueComment: false,
+      issueCommentUrl: null,
+      beforePrComments: before.pr?.comments.length ?? null,
+      afterPrComments: null,
+      foundPrComment: false,
+      prCommentUrl: null,
+      expectedPrComment: expectPrComment,
+      reason: 'Could not inspect issue comments after launch.',
+      error: afterIssue.error,
+    };
+  }
+
+  const beforeIssueKeys = new Set(before.issue.comments.map(commentKey));
+  const newIssueComments = afterIssue.comments.filter((comment) => !beforeIssueKeys.has(commentKey(comment)));
+  const issueNote = newIssueComments.find((comment) => comment.body?.includes(FEEDBACK_NOTES_MARKER));
+
+  let foundPrComment = false;
+  let prCommentUrl: string | null = null;
+  let afterPrCommentCount: number | null = null;
+  let prReason: string | null = null;
+  let prError: string | null = null;
+
+  if (expectPrComment && prRef) {
+    const afterPr = prComments(prRef);
+    afterPrCommentCount = afterPr.comments.length;
+    if (afterPr.error) {
+      prError = afterPr.error;
+      prReason = 'Could not inspect PR comments after launch.';
+    } else {
+      const beforePrKeys = new Set((before.pr?.comments ?? []).map(commentKey));
+      const newPrComments = afterPr.comments.filter((comment) => !beforePrKeys.has(commentKey(comment)));
+      const prNote = newPrComments.find((comment) => comment.body?.includes(FEEDBACK_NOTES_MARKER));
+      if (prNote) {
+        foundPrComment = true;
+        prCommentUrl = prNote.url ?? null;
+      } else {
+        prReason = `No new PR comment containing "${FEEDBACK_NOTES_MARKER}" was found.`;
+      }
+    }
+  }
+
+  const reason = !issueNote
+    ? `No new issue comment containing "${FEEDBACK_NOTES_MARKER}" was found.`
+    : prReason;
+
+  return {
+    marker: FEEDBACK_NOTES_MARKER,
+    beforeIssueComments: before.issue.comments.length,
+    afterIssueComments: afterIssue.comments.length,
+    foundIssueComment: Boolean(issueNote),
+    issueCommentUrl: issueNote?.url ?? null,
+    beforePrComments: before.pr?.comments.length ?? null,
+    afterPrComments: afterPrCommentCount,
+    foundPrComment,
+    prCommentUrl,
+    expectedPrComment: expectPrComment,
+    reason,
+    error: prError,
+  };
+}
+
+function buildFeedbackPrompt(
+  workspaceRoot: string,
+  issueRef: IssueRef,
+  prRef: IssueRef | null,
+  postedAt: Date
+): string {
+  const issue = issueContext(issueRef);
+  const labels = labelsFromGh(issue.labels ?? []);
+  const pr = prRef
+    ? ghJson<{ title?: string; url?: string; body?: string; headRefName?: string }>(
+        ['pr', 'view', String(prRef.number), '--repo', prRef.repo, '--json', 'title,url,body,headRefName'],
+        {}
+      )
+    : null;
+  const isoDate = postedAt.toISOString();
+  const ghLogin = currentGhUserLogin();
+  const lines: (string | null)[] = [
+    `War Room issue feedback handoff for ${issueRef.repo}#${issueRef.number}`,
+    '',
+    `Parent issue: ${issueRef.repo}#${issueRef.number}`,
+    `Title: ${issue.title ?? 'unknown'}`,
+    `URL: ${issue.url ?? `https://github.com/${issueRef.repo}/issues/${issueRef.number}`}`,
+    `Labels: ${labels.length ? labels.join(', ') : 'none'}`,
+    prRef ? `In-flight PR: ${prRef.repo}#${prRef.number}` : null,
+    pr?.url ? `PR URL: ${pr.url}` : null,
+    pr?.headRefName ? `PR branch: ${pr.headRefName}` : null,
+    '',
+    buildSpecialistContext(workspaceRoot, issueRef.repo),
+    '',
+    'Feedback intake mode contract:',
+    '- This is a light, scoped feedback intake — not a full re-triage. The parent issue has already been triaged.',
+    '- Read-only inspection only. Do not edit repository files, create branches, commit, open PRs, or run formatters in this session.',
+    '- Do not include the feedback content in implementation prompts. Posting the structured comment is the deliverable.',
+    '- Treat client data, secrets, payment details, private URLs, and raw PII as confidential. Do not copy them into the GitHub comment.',
+    '',
+    'Light grill-me workflow:',
+    '- Open the session with: "What feedback would you like to add to this issue?"',
+    '- Wait for the user reply, then ask up to 2 clarifying questions one at a time — only when there is genuine ambiguity. Skip questions whose answers are already clear from the user reply.',
+    '  - Clarifier 1 (only if missing): What problem does this feedback solve, and why does it want to land alongside the parent work rather than as a separate follow-up?',
+    prRef
+      ? `  - Clarifier 2 (only if missing): Should this fold into the in-flight PR ${prRef.repo}#${prRef.number} before merge, or land as a follow-up after it ships? Recommend in-PR by default when --pr was passed; only diverge when the user signals otherwise.`
+      : `  - Clarifier 2 (only if missing): Which repo/branch should pick this up — does this need its own follow-up PR, or is it scoped to the parent issue's existing work?`,
+    '- Stop questioning as soon as you have what + why + scope. Do not ask filler questions.',
+    '- Read-only investigation (gh / repo files) is allowed and preferred over asking a question whose answer is in the repo.',
+    '',
+    'Posting the structured feedback comment:',
+    `- After the interview, post a single comment to ${issueRef.repo}#${issueRef.number} using \`gh issue comment ${issueRef.number} --repo ${issueRef.repo} --body <body>\` (or the equivalent GitHub MCP call).`,
+    `- The comment body MUST start with exactly: ${FEEDBACK_NOTES_MARKER}`,
+    '- The next non-empty lines, in order, must be:',
+    ghLogin ? `  - **Author:** @${ghLogin}` : `  - **Author:** @<your GitHub login>`,
+    `  - **Posted:** ${isoDate}`,
+    prRef ? `  - **Related PR:** ${prRef.repo}#${prRef.number}` : null,
+    '- Then a horizontal rule (`---`) on its own line, then the structured feedback content with these sections:',
+    '  - **What:** one-paragraph description of the refinement.',
+    '  - **Why:** the motivation — what breaks or what we gain if this lands alongside the parent issue.',
+    '  - **Scope:** explicit out-of-scope list so the implementer keeps the change narrow.',
+    '  - **Where it lands:** which repo / PR / branch picks this up (cite the in-flight PR when set).',
+    '- Keep the comment compact. This is a refinement comment, not a re-triage. Aim for under ~30 lines.',
+    prRef
+      ? `- After posting the issue comment, post the same body as a PR conversation comment using \`gh pr comment ${prRef.number} --repo ${prRef.repo} --body <body>\` so the in-flight PR review picks it up. (Skip this step only if the user explicitly says not to cross-post.)`
+      : null,
+    '',
+    'Wrap-up:',
+    '- After posting, print the comment URL(s) and tell the user the suggested next step:',
+    prRef
+      ? `  - "Drop a review comment / nudge on ${prRef.repo}#${prRef.number} reviewers so they fold this into the PR before merge."`
+      : `  - "Run \`warroom issue next --issue ${issueRef.repo}#${issueRef.number}\` (or open a focused follow-up PR) to implement this feedback."`,
+    '',
+    'Issue body (for context only — do not re-summarize):',
+    truncateText(issue.body),
+  ];
+  return lines.filter((line): line is string => line !== null).join('\n');
+}
+
+export function runIssueFeedback(workspaceRoot: string, options: IssueFeedbackOptions): IssueFeedbackResult {
+  const ref = parseIssueRef(options.issue);
+  const prRef = options.prRef ? parseIssueRef(options.prRef) : null;
+  const shouldPostPrComment = Boolean(prRef && options.postPrComment !== false);
+
+  // Direct mode: caller provided --body or --file. Skip the LLM and post the structured comment ourselves.
+  let directBody: string | null = null;
+  if (options.body) directBody = options.body.trim();
+  else if (options.bodyFile) {
+    const filePath = path.isAbsolute(options.bodyFile)
+      ? options.bodyFile
+      : path.resolve(process.cwd(), options.bodyFile);
+    if (!existsSync(filePath)) {
+      throw new Error(`Feedback body file not found: ${filePath}`);
+    }
+    directBody = readFileSync(filePath, 'utf8').trim();
+  }
+  if (directBody !== null && !directBody) {
+    throw new Error('Feedback body resolved to an empty string. Provide non-empty --body or --file.');
+  }
+
+  if (directBody) {
+    return runDirectFeedback(workspaceRoot, options, ref, prRef, shouldPostPrComment, directBody);
+  }
+
+  return runAdapterFeedback(workspaceRoot, options, ref, prRef, shouldPostPrComment);
+}
+
+function runDirectFeedback(
+  workspaceRoot: string,
+  options: IssueFeedbackOptions,
+  ref: IssueRef,
+  prRef: IssueRef | null,
+  shouldPostPrComment: boolean,
+  feedbackBody: string
+): IssueFeedbackResult {
+  const author = currentGhUserLogin();
+  const postedAt = new Date();
+  const formattedBody = formatFeedbackComment({
+    feedbackBody,
+    author,
+    prRef: prRef ? `${prRef.repo}#${prRef.number}` : null,
+    postedAt,
+  });
+
+  const planOnly = options.dryRun !== false;
+  let issueComment: FeedbackPostResult;
+  let prComment: FeedbackPostResult | null = null;
+
+  if (planOnly) {
+    issueComment = {
+      target: 'issue',
+      ref: `${ref.repo}#${ref.number}`,
+      applied: false,
+      url: null,
+      reason: 'Dry run; rerun without --dry-run (and with --body/--file) to post directly.',
+      error: null,
+    };
+    if (shouldPostPrComment && prRef) {
+      prComment = {
+        target: 'pr',
+        ref: `${prRef.repo}#${prRef.number}`,
+        applied: false,
+        url: null,
+        reason: 'Dry run; rerun without --dry-run to post directly.',
+        error: null,
+      };
+    }
+  } else {
+    issueComment = postIssueFeedbackComment(ref, formattedBody);
+    if (shouldPostPrComment && prRef) {
+      prComment = postPrFeedbackComment(prRef, formattedBody);
+    }
+  }
+
+  let artifact: RunArtifact | null = null;
+  if (options.writeArtifact) {
+    artifact = createRunArtifact(workspaceRoot, 'issue-feedback', {
+      'input.json': JSON.stringify(options, null, 2),
+      'feedback.md': formattedBody,
+    });
+  }
+
+  return {
+    mode: 'direct',
+    marker: FEEDBACK_NOTES_MARKER,
+    issue: options.issue,
+    prRef: prRef ? `${prRef.repo}#${prRef.number}` : null,
+    prompt: null,
+    formattedBody,
+    artifact,
+    launched: false,
+    adapterCommand: null,
+    adapterCwd: null,
+    launchError: null,
+    feedbackNotes: null,
+    issueComment,
+    prComment,
+    contextSummary: {
+      promptCharacters: null,
+      feedbackCharacters: feedbackBody.length,
+    },
+  };
+}
+
+function runAdapterFeedback(
+  workspaceRoot: string,
+  options: IssueFeedbackOptions,
+  ref: IssueRef,
+  prRef: IssueRef | null,
+  shouldPostPrComment: boolean
+): IssueFeedbackResult {
+  const postedAt = new Date();
+  const prompt = buildFeedbackPrompt(workspaceRoot, ref, prRef, postedAt);
+  const adapterCwd = repoWorkspaceForGitHub(workspaceRoot, prRef?.repo ?? ref.repo);
+  const adapterCommand = getInteractiveAdapterInvocation(workspaceRoot, adapterCwd).display;
+  const contextSummary = {
+    promptCharacters: prompt.length,
+    feedbackCharacters: null,
+  };
+
+  let artifact: RunArtifact | null = null;
+  if (options.writeArtifact) {
+    artifact = createRunArtifact(workspaceRoot, 'issue-feedback', {
+      'prompt.md': prompt,
+      'input.json': JSON.stringify(options, null, 2),
+    });
+  }
+
+  if (options.dryRun !== false) {
+    return {
+      mode: 'adapter',
+      marker: FEEDBACK_NOTES_MARKER,
+      issue: options.issue,
+      prRef: prRef ? `${prRef.repo}#${prRef.number}` : null,
+      prompt,
+      formattedBody: null,
+      artifact,
+      launched: false,
+      adapterCommand,
+      adapterCwd,
+      launchError: null,
+      feedbackNotes: null,
+      issueComment: null,
+      prComment: null,
+      contextSummary,
+    };
+  }
+
+  const beforeIssue = issueComments(ref);
+  const beforePr = shouldPostPrComment && prRef ? prComments(prRef) : null;
+  const launch = runInteractiveAdapter(workspaceRoot, prompt, {
+    cwd: adapterCwd,
+    usage: {
+      issue: options.issue,
+      command: 'issue-feedback',
+      stage: 'interactive-feedback',
+      repo: ref.repo,
+      runDir: artifact?.runDir ?? null,
+      commandRunId: createUsageCommandRunId('issue-feedback'),
+    },
+  });
+
+  let feedbackNotes: FeedbackNotesResult | null = null;
+  if (launch.launched) {
+    feedbackNotes = verifyFeedbackNotes(ref, prRef, shouldPostPrComment, { issue: beforeIssue, pr: beforePr });
+  }
+
+  return {
+    mode: 'adapter',
+    marker: FEEDBACK_NOTES_MARKER,
+    issue: options.issue,
+    prRef: prRef ? `${prRef.repo}#${prRef.number}` : null,
+    prompt,
+    formattedBody: null,
+    artifact,
+    launched: launch.launched,
+    adapterCommand: launch.invocation.display,
+    adapterCwd,
+    launchError: launch.error,
+    feedbackNotes,
+    issueComment: null,
+    prComment: null,
+    contextSummary,
   };
 }

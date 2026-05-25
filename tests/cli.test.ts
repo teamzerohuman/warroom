@@ -765,6 +765,87 @@ describe('phase-1 CLI', () => {
     }
   });
 
+  it('previews the LLM feedback intake prompt without launching on --dry-run', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+    writeCodexFixture(bin);
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), interactive: false });
+
+      await program.parseAsync([
+        'node',
+        'warroom',
+        'issue',
+        'feedback',
+        'TeamFloPay/sdk#4',
+        '--pr',
+        'TeamFloPay/sdk#7',
+        '--dry-run',
+      ]);
+
+      expect(lines.some((line) => line.startsWith('Issue feedback for TeamFloPay/sdk#4: preflight only'))).toBe(true);
+      expect(lines).toContain('Mode: interactive LLM intake');
+      expect(lines).toContain('Marker: ## War Room feedback');
+      expect(lines).toContain('Related PR: TeamFloPay/sdk#7');
+      expect(lines.some((line) => line.includes('Adapter: codex --model gpt-5.5 ') && line.endsWith(' <prompt> (not launched)'))).toBe(true);
+      expect(lines).toContain('Outcome: dry run only; no LLM feedback session was launched. Drop --dry-run to start the interactive intake.');
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
+  it('previews a direct (bypass) feedback comment when --file is passed with --dry-run', async () => {
+    const root = makeDevFixture();
+    const bin = path.join(root, 'bin');
+    mkdirSync(bin, { recursive: true });
+    writeGhFixture(bin);
+
+    const feedbackFile = path.join(root, 'feedback.md');
+    writeFileSync(
+      feedbackFile,
+      '**What:** Add a back-compat mapper.\n\n**Why:** Avoid breaking client sites that have not yet upgraded the SDK.\n\n**Scope:** Mapper only — no new endpoints.\n\n**Where it lands:** Fold into the in-flight PR.'
+    );
+
+    const originalPath = process.env.PATH;
+    process.env.PATH = `${bin}${path.delimiter}${originalPath ?? ''}`;
+
+    try {
+      const lines: string[] = [];
+      const program = buildProgram({ cwd: root, output: (line) => lines.push(line), interactive: false });
+
+      await program.parseAsync([
+        'node',
+        'warroom',
+        'issue',
+        'feedback',
+        'TeamFloPay/sdk#4',
+        '--pr',
+        'TeamFloPay/sdk#7',
+        '--file',
+        feedbackFile,
+        '--dry-run',
+      ]);
+
+      expect(lines.some((line) => line.startsWith('Issue feedback for TeamFloPay/sdk#4: preflight only'))).toBe(true);
+      expect(lines).toContain('Mode: direct (--body/--file)');
+      expect(lines.some((line) => line.startsWith('Issue comment: planned TeamFloPay/sdk#4'))).toBe(true);
+      expect(lines.some((line) => line.startsWith('PR comment: planned TeamFloPay/sdk#7'))).toBe(true);
+      expect(lines.some((line) => line.startsWith('## War Room feedback'))).toBe(true);
+      expect(lines.some((line) => line.includes('**Related PR:** TeamFloPay/sdk#7'))).toBe(true);
+      expect(lines.some((line) => line.includes('Add a back-compat mapper'))).toBe(true);
+      expect(lines.some((line) => line === 'Outcome: preflight only; no comment posted. Rerun without --dry-run (and with --body/--file) to post directly.')).toBe(true);
+    } finally {
+      process.env.PATH = originalPath;
+    }
+  });
+
   it('does not move a triaged issue when no ready triage notes were posted', async () => {
     const root = makeDevFixture();
     const bin = path.join(root, 'bin');

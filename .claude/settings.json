@@ -1,10 +1,11 @@
 {
-  "enabledPlugins": {
-    "mcp-server-dev@claude-plugins-official": true
-  },
   "permissions": {
     "allow": [
-      "Bash(grep -r \"Run \\\\`warroom pr create\\\\`\" /Users/andrewslack/Sites/Flo/warroom/src --include=\"*.ts\" -l)"
+      "Bash(grep :*)",
+      "Bash(node /Users/andrewslack/Sites/Flo/warroom/dist/src/cli.js dev test --help)"
     ]
+  },
+  "enabledPlugins": {
+    "mcp-server-dev@claude-plugins-official": true
   }
 }

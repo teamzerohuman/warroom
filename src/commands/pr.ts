@@ -2096,6 +2096,23 @@ function codeRabbitReviewedHead(snapshot: PrReviewSnapshot, headSha: string) {
   return codeRabbitReviews(snapshot).some((review) => review.commit?.oid === headSha);
 }
 
+function codeRabbitLastActivityAt(snapshot: PrReviewSnapshot): number | null {
+  const times: number[] = [];
+  const push = (value: string | null | undefined) => {
+    if (!value) return;
+    const t = Date.parse(value);
+    if (Number.isFinite(t)) times.push(t);
+  };
+  for (const check of codeRabbitChecks(snapshot)) {
+    push(check.completedAt);
+    push(check.startedAt);
+  }
+  for (const review of codeRabbitReviews(snapshot)) {
+    push(review.submittedAt);
+  }
+  return times.length === 0 ? null : Math.max(...times);
+}
+
 function codeRabbitFeedbackFingerprint(
   snapshot: PrReviewSnapshot,
   threads: ReturnType<typeof listOutstandingCodeRabbitThreads>,
@@ -2183,7 +2200,12 @@ async function waitForCodeRabbitFeedback(
         stableFingerprint = fingerprint;
         stableSince = Date.now();
       }
-      const settledMs = stableSince === null ? 0 : Date.now() - stableSince;
+      let settledMs = stableSince === null ? 0 : Date.now() - stableSince;
+      const lastActivity = codeRabbitLastActivityAt(snapshot);
+      if (lastActivity !== null) {
+        const externalSettled = Date.now() - lastActivity;
+        if (externalSettled > settledMs) settledMs = externalSettled;
+      }
       if (settledMs >= settleMs) {
         return {
           snapshot,
@@ -2461,6 +2483,32 @@ export function inferIssueRefForCurrentBranch(workspaceRoot: string, currentPath
   const repo = repoHealthForCurrentPath(workspaceRoot, currentPath);
   if (!repo?.branch) return null;
   return configuredBranchIssueRef(repo.resolvedPath, repo.branch);
+}
+
+export type CurrentBranchContext = {
+  repo: string;
+  branch: string;
+  branchIsBase: boolean;
+  issue: string | null;
+  pr: string | null;
+  prUrl: string | null;
+};
+
+export function inferCurrentBranchContext(workspaceRoot: string, currentPath: string): CurrentBranchContext | null {
+  const repo = repoHealthForCurrentPath(workspaceRoot, currentPath);
+  if (!repo?.branch) return null;
+  const defaultBranch = loadRepoManifest(workspaceRoot).defaults.default_branch;
+  const branchIsBase = repo.branch === defaultBranch;
+  const issue = currentBranchIssueRef(repo.github, repo.branch, repo.resolvedPath);
+  const openPr = findOpenPrForBranch(repo.github, repo.branch);
+  return {
+    repo: repo.github,
+    branch: repo.branch,
+    branchIsBase,
+    issue,
+    pr: openPr?.ref ?? null,
+    prUrl: openPr?.url ?? null,
+  };
 }
 
 function gitOutput(repoPath: string, args: string[]) {
@@ -3570,7 +3618,7 @@ async function runDemoE2E(
   return result;
 }
 
-async function runMergeE2E(
+export async function runMergeE2E(
   workspaceRoot: string,
   requirement: { required: boolean; skipReason: string | null },
   output: Pick<PrOptions, 'e2eOutput' | 'e2eStatus'> = {}
@@ -4234,6 +4282,44 @@ function envIntOrDefault(name: string, fallback: number) {
   if (!raw) return fallback;
   const parsed = Number.parseInt(raw, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+async function runGhPrMergeWithRetry(
+  ref: { repo: string; number: number },
+  adminArgs: string[],
+  options: PrOptions
+): Promise<void> {
+  const maxAttempts = envIntOrDefault('WARROOM_MERGE_RETRY_ATTEMPTS', 3);
+  const args = ['pr', 'merge', String(ref.number), '--repo', ref.repo, '--squash', '--delete-branch', ...adminArgs];
+  let lastError: string | null = null;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const result = spawnSync('gh', args, { encoding: 'utf8' });
+    if (result.stdout) process.stdout.write(result.stdout);
+    if (result.stderr) process.stderr.write(result.stderr);
+    if (result.status === 0) return;
+
+    const stderr = (result.stderr ?? '').toString();
+    const status = result.status;
+    const baseModified = /Base branch was modified/i.test(stderr);
+
+    if (baseModified && attempt < maxAttempts) {
+      options.mergeStatus?.(
+        `Merge: base branch moved during merge (attempt ${attempt}/${maxAttempts}); refreshing mergeability and retrying...`
+      );
+      await waitForPrMergeable(ref, options, `Merge retry ${attempt + 1}`);
+      continue;
+    }
+
+    lastError = stderr.trim() || `gh pr merge failed with exit ${status ?? 'unknown'}.`;
+    throw new Error(
+      baseModified
+        ? `gh pr merge failed after ${attempt} attempts because the base branch kept advancing: ${lastError}`
+        : `gh pr merge failed: ${lastError}`
+    );
+  }
+
+  throw new Error(lastError ?? 'gh pr merge failed for an unknown reason.');
 }
 
 async function waitForPrMergeable(
@@ -5945,12 +6031,7 @@ export async function runPrMerge(workspaceRoot: string, options: PrOptions): Pro
         }
         const adminArgs =
           options.allowFailingChecks || options.allowUnresolvedReviewThreads ? ['--admin'] : [];
-        const result = spawnSync(
-          'gh',
-          ['pr', 'merge', String(ref.number), '--repo', ref.repo, '--squash', '--delete-branch', ...adminArgs],
-          { stdio: 'inherit' }
-        );
-        if (result.status !== 0) throw new Error(`gh pr merge failed with exit ${result.status ?? 'unknown'}.`);
+        await runGhPrMergeWithRetry(ref, adminArgs, resolvedOptions);
         merged = true;
         if (mergePostMerge.required) {
           mergePostMerge = await runMergePostMerge(mergePostMerge, resolvedOptions);

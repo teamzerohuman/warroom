@@ -20,9 +20,11 @@ import { runDoctor } from './commands/doctor.js';
 import {
   confirmIssueCreate,
   runIssueCreate,
+  runIssueFeedback,
   runIssueNext,
   runIssueTriage,
   type IssueCreateResult,
+  type IssueFeedbackResult,
   type IssueHandoffResult,
   type IssueListResult,
   type IssueSummary,
@@ -31,9 +33,11 @@ import { runMapsAssign, type MapsAssignResult } from './commands/maps-assign.js'
 import { runMapsStudy } from './commands/maps-study.js';
 import {
   findOpenPrForBranch,
+  inferCurrentBranchContext,
   inferIssueRefForCurrentBranch,
   inferPrRefForCurrentBranch,
   runIssueStart,
+  runMergeE2E,
   runPrCreate,
   runPrMerge,
   runPrReview,
@@ -42,6 +46,7 @@ import {
   type LocalCleanupResult,
   type MergeBumpResult,
   type MergeChangelogResult,
+  type MergeE2EResult,
   type MergePostMergeResult,
   type PrCreateResult,
   type PrPlanResult,
@@ -262,6 +267,7 @@ async function promptText(output: Output, input: Input, question: string): Promi
   }
   return '';
 }
+
 
 async function promptMergeConfirmation(output: Output, input: Input, question: string): Promise<'confirm' | 'skip' | 'cancel'> {
   return selectChoice<'confirm' | 'skip' | 'cancel'>({
@@ -509,6 +515,100 @@ function printIssueCreate(output: Output, result: IssueCreateResult) {
   }
   if (result.closeoutError) output(`issue closeout error: ${result.closeoutError}`);
   printOutcome(output, issueCreateOutcome(result));
+}
+
+function formatFeedbackPost(post: { applied: boolean; ref: string; url: string | null; reason: string | null; error: string | null } | null) {
+  if (!post) return 'not posted';
+  if (post.applied) return `posted ${post.ref}${post.url ? ` ${post.url}` : ''}`;
+  if (post.error) return `failed ${post.ref}: ${post.error}`;
+  return `planned ${post.ref}${post.reason ? ` (${post.reason})` : ''}`;
+}
+
+function printIssueFeedback(output: Output, result: IssueFeedbackResult) {
+  output(`Issue feedback for ${result.issue}: ${issueFeedbackState(result)}`);
+  output(`Mode: ${result.mode === 'adapter' ? 'interactive LLM intake' : 'direct (--body/--file)'}`);
+  output(`Marker: ${result.marker}`);
+  if (result.prRef) output(`Related PR: ${result.prRef}`);
+  if (result.adapterCommand) {
+    output(`Adapter: ${result.adapterCommand}${result.launched ? ' (launched)' : ' (not launched)'}`);
+  }
+  if (result.adapterCwd) output(`Adapter cwd: ${result.adapterCwd}`);
+  if (result.launchError) output(`Adapter error: ${result.launchError}`);
+  if (result.artifact) output(`Artifact: ${result.artifact.runDir}`);
+  if (result.contextSummary.promptCharacters !== null) {
+    output(`Prompt size: ${result.contextSummary.promptCharacters} chars`);
+  }
+  if (result.contextSummary.feedbackCharacters !== null) {
+    output(`Feedback size: ${result.contextSummary.feedbackCharacters} chars`);
+  }
+  if (result.feedbackNotes) {
+    const notes = result.feedbackNotes;
+    output(
+      `Issue feedback comment: ${notes.foundIssueComment ? 'posted' : 'missing'}${notes.issueCommentUrl ? ` ${notes.issueCommentUrl}` : ''}`
+    );
+    if (notes.expectedPrComment) {
+      output(
+        `PR feedback comment: ${notes.foundPrComment ? 'posted' : 'missing'}${notes.prCommentUrl ? ` ${notes.prCommentUrl}` : ''}`
+      );
+    }
+    if (notes.reason) output(`feedback notes reason: ${notes.reason}`);
+    if (notes.error) output(`feedback notes error: ${notes.error}`);
+  }
+  if (result.issueComment) output(`Issue comment: ${formatFeedbackPost(result.issueComment)}`);
+  if (result.prComment) output(`PR comment: ${formatFeedbackPost(result.prComment)}`);
+  if (result.formattedBody) {
+    output('');
+    output('--- comment body ---');
+    output(result.formattedBody);
+    output('--- end comment body ---');
+  }
+  printOutcome(output, issueFeedbackOutcome(result));
+}
+
+function issueFeedbackState(result: IssueFeedbackResult) {
+  if (result.mode === 'direct') {
+    if (!result.issueComment) return 'preflight only';
+    if (result.issueComment.applied) return 'posted';
+    if (result.issueComment.error) return 'failed';
+    return 'preflight only';
+  }
+  if (!result.launched) {
+    return result.prompt ? 'preflight only' : 'blocked';
+  }
+  if (result.feedbackNotes?.foundIssueComment) {
+    return result.feedbackNotes.expectedPrComment && !result.feedbackNotes.foundPrComment
+      ? 'posted (PR cross-post missing)'
+      : 'posted';
+  }
+  return 'adapter completed; feedback comment missing';
+}
+
+function issueFeedbackOutcome(result: IssueFeedbackResult) {
+  if (result.mode === 'direct') {
+    if (result.issueComment?.applied) {
+      const crossPost = result.prComment?.applied ? ` and cross-posted to PR ${result.prRef}` : '';
+      return `Outcome: feedback posted to ${result.issue}${crossPost}.`;
+    }
+    if (result.issueComment?.error) {
+      return `Outcome: feedback not posted. ${result.issueComment.error}`;
+    }
+    return 'Outcome: preflight only; no comment posted. Rerun without --dry-run (and with --body/--file) to post directly.';
+  }
+  if (result.launchError) {
+    return `Outcome: feedback intake blocked. ${result.launchError}`;
+  }
+  if (!result.launched) {
+    return 'Outcome: dry run only; no LLM feedback session was launched. Drop --dry-run to start the interactive intake.';
+  }
+  if (result.feedbackNotes?.foundIssueComment) {
+    const crossNote = result.feedbackNotes.expectedPrComment
+      ? result.feedbackNotes.foundPrComment
+        ? ` Cross-posted to PR ${result.prRef}.`
+        : ` PR cross-post missing — paste the same comment on PR ${result.prRef} manually.`
+      : '';
+    return `Outcome: interactive feedback intake completed; feedback comment posted to ${result.issue}.${crossNote}`;
+  }
+  return `Outcome: interactive feedback intake completed, but no "${result.marker}" comment was detected on ${result.issue}.${result.feedbackNotes?.reason ? ` ${result.feedbackNotes.reason}` : ''}`;
 }
 
 function issueStartOutcome(result: PrPlanResult) {
@@ -1498,6 +1598,19 @@ function printDevAction(output: Output, action: DevActionResult) {
   printDevStatus(output, action.status);
 }
 
+function printDevTest(output: Output, result: MergeE2EResult) {
+  output(`Dev test: ${result.status}${result.skipReason ? ` (${result.skipReason})` : ''}`);
+  output(`Backend: ${result.backendPath ?? 'missing'} (${result.backendCommand}, ready ${result.backendReadyUrl})`);
+  output(
+    `Backend process: ${result.usedExistingBackend ? 'reused existing' : result.startedBackend ? 'started by War Room (stopped on exit)' : 'planned'}`
+  );
+  output(`Demo: ${result.demoPath ?? 'missing'} (${result.demoCommand}, base ${result.demoBaseUrl})`);
+  if (result.durationMs !== null) output(`Dev test duration: ${result.durationMs}ms`);
+  if (result.testExitStatus !== null) output(`Dev test exit: ${result.testExitStatus}`);
+  for (const blocker of result.blocked) output(`dev test blocked: ${blocker}`);
+  if (result.error) output(`dev test error: ${result.error}`);
+}
+
 export function buildProgram(options: BuildProgramOptions = {}) {
   const invocationCwd = options.cwd ?? process.cwd();
   const workspaceRoot = findWarRoomWorkspace(invocationCwd);
@@ -1867,6 +1980,99 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       }
     });
   issue
+    .command('feedback [issue]')
+    .description('Capture structured refinement feedback on an existing issue. Launches an interactive LLM session that does a light grill-me intake and posts a `## War Room feedback` comment (and optionally cross-posts to a related PR). When run from inside a mapped repo on a feature branch, the issue and open PR are auto-detected.')
+    .option('--pr <owner/repo#number>', 'Cross-post the feedback to an in-flight PR conversation so reviewers fold it in before merge. Auto-detected from the current branch when omitted.')
+    .option('--no-pr-comment', 'Do not cross-post the feedback to the PR even when --pr is set or auto-detected.')
+    .option('--body <text>', 'Skip the LLM intake and post pre-written feedback content directly (bypass mode).')
+    .option('--file <path>', 'Skip the LLM intake and post pre-written feedback from a file (bypass mode).')
+    .option('--dry-run', 'Print the prompt (or the structured comment for direct mode) without launching the adapter or posting.')
+    .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
+    .option('--json', 'Print machine-readable output.')
+    .action(
+      async (
+        issueArg: string | undefined,
+        opts: {
+          pr?: string;
+          prComment?: boolean;
+          body?: string;
+          file?: string;
+          dryRun?: boolean;
+          writeArtifact?: boolean;
+          json?: boolean;
+        }
+      ) => {
+        try {
+          let resolvedIssue = issueArg;
+          let resolvedPr = opts.pr;
+          if (!resolvedIssue || !resolvedPr) {
+            const ctx = inferCurrentBranchContext(workspaceRoot, invocationCwd);
+            if (!resolvedIssue) {
+              if (!ctx) {
+                output('Could not auto-detect an issue: run inside a mapped child repo checkout, or pass an explicit `<issue>` argument.');
+                process.exitCode = 1;
+                return;
+              }
+              if (ctx.branchIsBase) {
+                output(`Could not auto-detect an issue: ${ctx.repo} is on the base branch (${ctx.branch}). Switch to a feature branch or pass an explicit \`<issue>\` argument.`);
+                process.exitCode = 1;
+                return;
+              }
+              if (!ctx.issue) {
+                output(`Could not auto-detect an issue for ${ctx.repo} branch ${ctx.branch}. Branches created by \`warroom issue next\` set this automatically; otherwise pass an explicit \`<issue>\` argument.`);
+                process.exitCode = 1;
+                return;
+              }
+              resolvedIssue = ctx.issue;
+              if (!opts.json) output(`Auto-detected issue: ${resolvedIssue} (from ${ctx.repo} branch ${ctx.branch})`);
+            }
+            if (!resolvedPr && ctx?.pr) {
+              resolvedPr = ctx.pr;
+              if (!opts.json) output(`Auto-detected PR: ${resolvedPr}${ctx.prUrl ? ` ${ctx.prUrl}` : ''}`);
+            }
+          }
+          const result = runIssueFeedback(workspaceRoot, {
+            issue: resolvedIssue,
+            prRef: resolvedPr,
+            body: opts.body,
+            bodyFile: opts.file,
+            postPrComment: opts.prComment,
+            dryRun: opts.dryRun === true,
+            writeArtifact: opts.writeArtifact,
+          });
+          if (opts.json) {
+            printJson(output, result);
+          } else {
+            printIssueFeedback(output, result);
+          }
+          if (result.launchError) process.exitCode = 1;
+          if (result.mode === 'direct' && result.issueComment && !result.issueComment.applied && result.issueComment.error) {
+            process.exitCode = 1;
+          }
+          if (
+            result.mode === 'adapter' &&
+            result.launched &&
+            result.feedbackNotes &&
+            !result.feedbackNotes.foundIssueComment
+          ) {
+            process.exitCode = 1;
+          }
+          const feedbackPosted =
+            (result.mode === 'adapter' && result.feedbackNotes?.foundIssueComment) ||
+            (result.mode === 'direct' && result.issueComment?.applied === true);
+          if (feedbackPosted && resolvedPr && interactive && !opts.json) {
+            await promptPrReviewForRef(workspaceRoot, output, input, resolvedPr, resolvedIssue, {
+              writeArtifact: opts.writeArtifact,
+              liveMergeOutput: liveMergeOutput(),
+            });
+          }
+        } catch (error) {
+          output(`Feedback failed: ${error instanceof Error ? error.message : String(error)}`);
+          process.exitCode = 1;
+        }
+      }
+    );
+  issue
     .command('next')
     .description('List issues ready for implementation and select one to start development.')
     .option('--issue <owner/repo#number>', 'Start this issue directly instead of prompting for a selection.')
@@ -2103,6 +2309,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
             confirmStatus: shouldConfirmPrReviewStatus(dryRun, opts),
             writeArtifact: opts.writeArtifact,
             reviewStatus: launch ? output : undefined,
+            waitForInitialCodeRabbit: launch,
           });
           printPrPlan(output, review);
           if (review.launchError) process.exitCode = 1;
@@ -2132,6 +2339,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           confirmStatus: shouldConfirmPrReviewStatus(false, opts),
           writeArtifact: opts.writeArtifact,
           reviewStatus: output,
+          waitForInitialCodeRabbit: true,
         });
         printPrPlan(output, review);
         if (review.launchError) process.exitCode = 1;
@@ -2152,6 +2360,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         confirmStatus: shouldConfirmPrReviewStatus(dryRun, opts),
         writeArtifact: opts.writeArtifact,
         reviewStatus: opts.json ? undefined : output,
+        waitForInitialCodeRabbit: !dryRun,
       });
       if (opts.json) {
         printJson(output, result);
@@ -2445,6 +2654,25 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         return;
       }
       printDevAction(output, result);
+    });
+
+  dev
+    .command('test')
+    .description('Run the demo Playwright e2e suite against the local backend, starting it if it is not already healthy. Reuses the same flow as `warroom pr merge`.')
+    .option('--json', 'Print machine-readable output.')
+    .action(async (opts: { json?: boolean }) => {
+      const live = liveMergeOutput();
+      const result = await runMergeE2E(
+        workspaceRoot,
+        { required: true, skipReason: null },
+        { e2eStatus: live.e2eStatus, e2eOutput: live.e2eOutput }
+      );
+      if (opts.json) {
+        printJson(output, result);
+      } else {
+        printDevTest(output, result);
+      }
+      if (result.status !== 'passed') process.exitCode = 1;
     });
 
   const changelog = program.command('changelog').description('Changelog distribution commands.');
