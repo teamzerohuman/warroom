@@ -74,6 +74,8 @@ export type IssueTriageOptions = {
   confirmStatus?: boolean;
   dryRun?: boolean;
   writeArtifact?: boolean;
+  currentPath?: string;
+  allRepos?: boolean;
 };
 
 export type FeedbackPostResult = {
@@ -950,13 +952,13 @@ function issueMatchesRepoFilter(workspaceRoot: string, issue: IssueSummary, repo
 export function runIssueNext(workspaceRoot: string, options: IssueNextOptions = {}): IssueListResult {
   const currentRepo = options.allRepos ? null : repoForCurrentPath(workspaceRoot, options.currentPath);
   const repoFilter = currentRepo?.github ?? null;
-  const campaignIssues = listIssuesByCampaignStatus('ready-to-engage');
+  const campaignIssues = listIssuesByCampaignStatus('ready-to-engage', repoFilter);
   const issues = campaignIssues.filter((issue) => issueMatchesRepoFilter(workspaceRoot, issue, repoFilter));
   return { status: 'ready-to-engage', repo: repoFilter ?? undefined, source: 'campaign', issues };
 }
 
-function listIssuesByCampaignStatus(status: 'needs-triage' | 'ready-to-engage') {
-  return listCampaignIssuesByStatus(status).map((issue) => ({
+function listIssuesByCampaignStatus(status: 'needs-triage' | 'ready-to-engage', repo: string | null = null) {
+  return listCampaignIssuesByStatus(status, repo).map((issue) => ({
     repo: issue.repo,
     number: issue.number,
     title: issue.title,
@@ -1097,8 +1099,11 @@ export function runIssueCreate(workspaceRoot: string, options: IssueCreateOption
 
 export function runIssueTriage(workspaceRoot: string, options: IssueTriageOptions = {}): IssueListResult | IssueHandoffResult {
   if (!options.issue) {
-    const issues = listIssuesByCampaignStatus('needs-triage');
-    return { status: 'needs-triage', source: 'campaign', issues };
+    const currentRepo = options.allRepos ? null : repoForCurrentPath(workspaceRoot, options.currentPath);
+    const repoFilter = currentRepo?.github ?? null;
+    const campaignIssues = listIssuesByCampaignStatus('needs-triage', repoFilter);
+    const issues = campaignIssues.filter((issue) => issueMatchesRepoFilter(workspaceRoot, issue, repoFilter));
+    return { status: 'needs-triage', repo: repoFilter ?? undefined, source: 'campaign', issues };
   }
 
   const ref = parseIssueRef(options.issue);
@@ -1143,6 +1148,15 @@ export function runIssueTriage(workspaceRoot: string, options: IssueTriageOption
     if (triageNotes.ready) {
       try {
         campaignStatus = setCampaignStatus(options.issue, 'ready-to-engage', { confirm: options.confirmStatus });
+      } catch (error) {
+        closeoutError = error instanceof Error ? error.message : String(error);
+      }
+    } else if (triageNotes.found) {
+      const reason = triageNotes.commentUrl
+        ? `Triage notes marked the issue as not ready for ready-to-engage. See ${triageNotes.commentUrl}.`
+        : 'Triage notes marked the issue as not ready for ready-to-engage.';
+      try {
+        campaignStatus = setCampaignStatus(options.issue, 'blockaded', { confirm: options.confirmStatus, reason });
       } catch (error) {
         closeoutError = error instanceof Error ? error.message : String(error);
       }

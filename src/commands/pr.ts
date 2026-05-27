@@ -332,8 +332,14 @@ export type PrReviewQueueResult = {
   action: 'review';
   source: 'campaign';
   statuses: CampaignStatusName[];
+  repo?: string;
   issues: PrReviewQueueIssue[];
   prs: PrReviewQueueItem[];
+};
+
+export type PrReviewQueueOptions = {
+  currentPath?: string;
+  allRepos?: boolean;
 };
 
 const REVIEW_QUEUE_STATUSES: CampaignStatusName[] = ['battlefield-active', 'skirmish'];
@@ -1326,14 +1332,19 @@ function updatedTime(value: string | null) {
   return Number.isFinite(time) ? time : 0;
 }
 
-export function runPrReviewQueue(): PrReviewQueueResult {
+export function runPrReviewQueue(workspaceRoot?: string, options: PrReviewQueueOptions = {}): PrReviewQueueResult {
+  const currentRepo = workspaceRoot && !options.allRepos && options.currentPath
+    ? repoHealthForCurrentPath(workspaceRoot, options.currentPath)
+    : null;
+  const repoFilter = currentRepo?.github ?? null;
   const issues = REVIEW_QUEUE_STATUSES.flatMap((status) =>
-    listCampaignIssuesByStatus(status).map(queueIssueFromCampaignIssue)
+    listCampaignIssuesByStatus(status, repoFilter).map(queueIssueFromCampaignIssue)
   );
   const prsByRef = new Map<string, PrReviewQueueItem>();
 
   for (const issue of issues) {
     for (const pr of listLinkedOpenPrsForIssue(issue)) {
+      if (repoFilter && pr.repo !== repoFilter) continue;
       const key = `${pr.repo}#${pr.number}`;
       const existing = prsByRef.get(key);
       if (!existing) {
@@ -1359,6 +1370,7 @@ export function runPrReviewQueue(): PrReviewQueueResult {
     action: 'review',
     source: 'campaign',
     statuses: REVIEW_QUEUE_STATUSES,
+    repo: repoFilter ?? undefined,
     issues,
     prs,
   };

@@ -75,7 +75,7 @@ import {
   type SlackPostResult,
 } from './commands/changelog-share.js';
 import { runSync, type SyncResult } from './commands/sync.js';
-import { CAMPAIGN_STATUSES, type CampaignStatusName } from './lib/campaign.js';
+import { CAMPAIGN_STATUSES, resetCampaignCache, type CampaignStatusName } from './lib/campaign.js';
 import { readWorkspaceEnvVar } from './lib/env.js';
 import { formatLlmUsageSummary, refreshIssueUsageLedgerCosts, summarizeIssueUsage, type LlmUsageSummary } from './lib/llm-usage.js';
 import { pickCommandPath } from './lib/interactive-menu.js';
@@ -266,28 +266,24 @@ async function ensureAllyImplementationRepo(
 async function promptIssueSelection(output: Output, input: Input, issues: IssueSummary[], action = 'start') {
   if (issues.length === 0) return null;
 
-  output(`Select an issue number to ${action}, or enter 0 to cancel.`);
-  output('Selection:');
+  const cancelSentinel = '__cancel__';
+  const choice = await selectChoice<IssueSummary | typeof cancelSentinel>({
+    output,
+    input,
+    question: `Select an issue to ${action}:`,
+    default: issues[0]!,
+    choices: [
+      ...issues.map((issue, index) => ({
+        label: `${index + 1}. ${issue.repo}#${issue.number} ${issue.title}`,
+        value: issue as IssueSummary | typeof cancelSentinel,
+        aliases: [String(index + 1), `${issue.repo}#${issue.number}`, `#${issue.number}`],
+      })),
+      { label: 'Cancel', value: cancelSentinel, aliases: ['0', 'q', 'quit', 'cancel'] },
+    ],
+    retryHelp: `Enter a number from 1 to ${issues.length}, or 0 to cancel.`,
+  });
 
-  const readline = createInterface({ input, crlfDelay: Infinity });
-  try {
-    for await (const line of readline) {
-      const answer = line.trim().toLowerCase();
-      if (answer === '0' || answer === 'q' || answer === 'quit' || answer === 'cancel') return null;
-
-      const selected = Number(answer);
-      if (Number.isInteger(selected) && selected >= 1 && selected <= issues.length) {
-        return issues[selected - 1] ?? null;
-      }
-
-      output(`Enter a number from 1 to ${issues.length}, or 0 to cancel.`);
-      output('Selection:');
-    }
-  } finally {
-    readline.close();
-  }
-
-  return null;
+  return choice === cancelSentinel ? null : choice;
 }
 
 function prReviewRef(pr: PrReviewQueueResult['prs'][number]) {
@@ -313,28 +309,25 @@ async function promptPrReviewSelection(output: Output, input: Input, prs: PrRevi
     return pr;
   }
 
-  output('Select a PR number to review, or enter 0 to cancel.');
-  output('Selection:');
+  type PrChoice = PrReviewQueueResult['prs'][number];
+  const cancelSentinel = '__cancel__';
+  const choice = await selectChoice<PrChoice | typeof cancelSentinel>({
+    output,
+    input,
+    question: 'Select a PR to review:',
+    default: prs[0]!,
+    choices: [
+      ...prs.map((pr, index) => ({
+        label: `${index + 1}. ${prReviewRef(pr)} ${pr.title ?? ''}`.trim(),
+        value: pr as PrChoice | typeof cancelSentinel,
+        aliases: [String(index + 1), prReviewRef(pr), `#${pr.number}`],
+      })),
+      { label: 'Cancel', value: cancelSentinel, aliases: ['0', 'q', 'quit', 'cancel'] },
+    ],
+    retryHelp: `Enter a number from 1 to ${prs.length}, or 0 to cancel.`,
+  });
 
-  const readline = createInterface({ input, crlfDelay: Infinity });
-  try {
-    for await (const line of readline) {
-      const answer = line.trim().toLowerCase();
-      if (answer === '0' || answer === 'q' || answer === 'quit' || answer === 'cancel') return null;
-
-      const selected = Number(answer);
-      if (Number.isInteger(selected) && selected >= 1 && selected <= prs.length) {
-        return prs[selected - 1] ?? null;
-      }
-
-      output(`Enter a number from 1 to ${prs.length}, or 0 to cancel.`);
-      output('Selection:');
-    }
-  } finally {
-    readline.close();
-  }
-
-  return null;
+  return choice === cancelSentinel ? null : choice;
 }
 
 async function promptConfirmation(output: Output, input: Input, question: string) {
@@ -348,6 +341,25 @@ async function promptConfirmation(output: Output, input: Input, question: string
       { label: 'No', value: false, aliases: ['n'] },
     ],
     retryHelp: 'Enter yes or no.',
+  });
+}
+
+async function promptPrMergeOrReviewAgain(
+  output: Output,
+  input: Input,
+  question: string
+): Promise<'merge' | 'review-again' | 'cancel'> {
+  return selectChoice<'merge' | 'review-again' | 'cancel'>({
+    output,
+    input,
+    question,
+    default: 'merge',
+    choices: [
+      { label: 'Yes', value: 'merge', aliases: ['y'] },
+      { label: 'No', value: 'cancel', aliases: ['n'] },
+      { label: 'Review Again', value: 'review-again', aliases: ['r', 'review', 'again'] },
+    ],
+    retryHelp: 'Enter yes to merge, no to cancel, or review-again to rerun PR review.',
   });
 }
 
@@ -532,10 +544,15 @@ function issueTriageOutcome(result: IssueHandoffResult) {
 
   if (result.launched) {
     if (result.closeoutError) {
-      return `Outcome: interactive issue triage session completed, but ready-to-engage closeout was blocked. ${result.closeoutError}`;
+      const targetStatus = result.campaignStatus?.status ?? 'ready-to-engage';
+      return `Outcome: interactive issue triage session completed, but ${targetStatus} closeout was blocked. ${result.closeoutError}`;
     }
-    if (result.triageNotes && !result.triageNotes.ready) {
-      return `Outcome: interactive issue triage session completed, but Campaign status was not updated. ${result.triageNotes.reason ?? 'Triage notes did not mark the issue ready.'}`;
+    if (result.triageNotes && !result.triageNotes.ready && !result.triageNotes.found) {
+      return `Outcome: interactive issue triage session completed, but Campaign status was not updated. ${result.triageNotes.reason ?? 'Triage notes were not posted.'}`;
+    }
+    if (result.triageNotes && !result.triageNotes.ready && result.campaignStatus?.status === 'blockaded') {
+      const reason = result.triageNotes.reason ?? 'Triage notes marked the issue as not ready for ready-to-engage.';
+      return `Outcome: interactive issue triage session completed.${status} ${reason}`;
     }
     return `Outcome: interactive issue triage session completed.${status}`;
   }
@@ -1185,7 +1202,8 @@ async function runInteractivePrMergeFlow(
 }
 
 function printPrReviewQueue(output: Output, result: PrReviewQueueResult, options: { numbered?: boolean; suppressOutcome?: boolean } = {}) {
-  output(`Open PRs for Campaign statuses ${result.statuses.join(', ')}: ${result.prs.length}`);
+  const repo = result.repo ? ` for ${result.repo}` : '';
+  output(`Open PRs for Campaign statuses ${result.statuses.join(', ')}${repo}: ${result.prs.length}`);
   result.prs.forEach((pr, index) => {
     const issues = pr.issues
       .map((issue) => `${issue.repo}#${issue.number}${issue.status ? ` ${issue.status}` : ''}`)
@@ -1522,22 +1540,45 @@ async function promptPrMergeAfterPrReview(
   result: PrPlanResult,
   options: { pr: string; writeArtifact?: boolean; liveOutput?: PrMergeLiveOutput }
 ) {
-  if (result.action !== 'review' || result.launchError || !result.prReviewLoop?.completed) return;
+  let current = result;
+  while (current.action === 'review' && !current.launchError && current.prReviewLoop?.completed) {
+    const choice = await promptPrMergeOrReviewAgain(
+      output,
+      input,
+      `Run \`warroom pr merge --pr ${options.pr}\` now? [Y/n/Review Again]`
+    );
+    if (choice === 'cancel') return;
+    if (choice === 'merge') {
+      output(`Starting PR merge for ${options.pr}`);
+      try {
+        await runInteractivePrMergeFlow(workspaceRoot, output, input, {
+          pr: options.pr,
+          issue: current.issue ?? undefined,
+          writeArtifact: options.writeArtifact,
+          liveOutput: options.liveOutput ?? { e2eStatus: output, mergeStatus: output },
+        });
+      } catch (error) {
+        output(`PR merge failed: ${error instanceof Error ? error.message : String(error)}`);
+        process.exitCode = 1;
+      }
+      return;
+    }
 
-  const mergePr = await promptConfirmation(output, input, `Run \`warroom pr merge --pr ${options.pr}\` now? [Y/n]`);
-  if (!mergePr) return;
-
-  output(`Starting PR merge for ${options.pr}`);
-  try {
-    await runInteractivePrMergeFlow(workspaceRoot, output, input, {
+    output(`Starting PR review for ${options.pr}`);
+    current = await runPrReview(workspaceRoot, {
       pr: options.pr,
-      issue: result.issue ?? undefined,
+      issue: current.issue ?? undefined,
+      dryRun: false,
+      confirmStatus: true,
       writeArtifact: options.writeArtifact,
-      liveOutput: options.liveOutput ?? { e2eStatus: output, mergeStatus: output },
+      reviewStatus: output,
+      waitForInitialCodeRabbit: true,
     });
-  } catch (error) {
-    output(`PR merge failed: ${error instanceof Error ? error.message : String(error)}`);
-    process.exitCode = 1;
+    printPrPlan(output, current);
+    if (current.launchError) {
+      process.exitCode = 1;
+      return;
+    }
   }
 }
 
@@ -1663,6 +1704,7 @@ function printDevTest(output: Output, result: MergeE2EResult) {
 }
 
 export function buildProgram(options: BuildProgramOptions = {}) {
+  resetCampaignCache();
   const invocationCwd = options.cwd ?? process.cwd();
   const workspaceRoot = findWarRoomWorkspace(invocationCwd);
   const output = options.output ?? console.log;
@@ -1953,8 +1995,9 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--launch', 'Compatibility option; issue triage launches by default unless --dry-run is passed.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--no-select', 'List issues without prompting for a selection.')
+    .option('--all', 'List triage issues across all mapped repos, even from inside a child repo checkout.')
     .option('--json', 'Print machine-readable output.')
-    .action(async (opts: { issue?: string; markReady?: boolean; confirmStatus?: boolean; dryRun?: boolean; launch?: boolean; writeArtifact?: boolean; select?: boolean; json?: boolean }) => {
+    .action(async (opts: { issue?: string; markReady?: boolean; confirmStatus?: boolean; dryRun?: boolean; launch?: boolean; writeArtifact?: boolean; select?: boolean; all?: boolean; json?: boolean }) => {
       const triageDryRun = () => opts.dryRun === true;
       const runTriage = (issueRef?: string, selectedInteractively = false) => {
         const dryRun = triageDryRun();
@@ -1964,6 +2007,8 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           confirmStatus: dryRun ? false : opts.confirmStatus || selectedInteractively || Boolean(issueRef),
           dryRun,
           writeArtifact: opts.writeArtifact,
+          currentPath: invocationCwd,
+          allRepos: opts.all,
         });
       };
 
@@ -2332,10 +2377,11 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--confirm-status', 'Move the linked issue to skirmish on the Campaign Map. This is the default when launching review.')
     .option('--no-status', 'Do not move the linked issue to skirmish.')
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
+    .option('--all', 'List review-queue PRs across all mapped repos, even from inside a child repo checkout.')
     .option('--json', 'Print machine-readable output.')
-    .action(async (opts: { pr?: string; issue?: string; dryRun?: boolean; launch?: boolean; checkInMinutes?: number; confirmStatus?: boolean; status?: boolean; writeArtifact?: boolean; json?: boolean }) => {
+    .action(async (opts: { pr?: string; issue?: string; dryRun?: boolean; launch?: boolean; checkInMinutes?: number; confirmStatus?: boolean; status?: boolean; writeArtifact?: boolean; all?: boolean; json?: boolean }) => {
       if (!opts.pr) {
-        const result = runPrReviewQueue();
+        const result = runPrReviewQueue(workspaceRoot, { currentPath: invocationCwd, allRepos: opts.all });
         if (opts.json) {
           printJson(output, result);
           return;

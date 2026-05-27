@@ -3,6 +3,9 @@ import { parseRepoRef } from './refs.js';
 
 export const CAMPAIGN_OWNER = 'TeamFloPay';
 export const CAMPAIGN_PROJECT_NUMBER = 1;
+const PROJECT_ITEM_LIST_RECENT_LIMIT = '200';
+const PROJECT_ITEM_LIST_FALLBACK_LIMIT = '2000';
+const RATE_LIMIT_RETRY_DELAY_MS = 30_000;
 
 export const CAMPAIGN_STATUSES = [
   { name: 'needs-triage', color: 'GRAY', description: 'Blurry territory that needs planning before execution.' },
@@ -46,20 +49,83 @@ export type CampaignProjectIssue = {
   projectItemId: string;
 };
 
+type ProjectItem = {
+  id: string;
+  title?: string;
+  status?: string;
+  labels?: string[];
+  content?: {
+    repository?: string;
+    number?: number;
+    title?: string;
+    url?: string;
+  };
+};
+
+type CampaignCache = {
+  pathKey?: string;
+  projectView?: { id?: string; title?: string };
+  statusField?: {
+    id: string;
+    name: string;
+    type: string;
+    options?: Array<{ id: string; name: string }>;
+  } | null;
+  items?: { items: ProjectItem[]; scope: 'recent' | 'fallback' };
+};
+
+let cache: CampaignCache = {};
+
+function ensureCacheForCurrentPath() {
+  const currentPath = process.env.PATH ?? '';
+  if (cache.pathKey !== currentPath) {
+    cache = { pathKey: currentPath };
+  }
+}
+
+export function resetCampaignCache() {
+  cache = { pathKey: process.env.PATH ?? '' };
+}
+
+function isRateLimitError(stderr: string) {
+  const lower = stderr.toLowerCase();
+  return lower.includes('api rate limit') || lower.includes('secondary rate limit') || lower.includes('rate limit exceeded');
+}
+
+function sleepSyncMs(ms: number) {
+  const sab = new Int32Array(new SharedArrayBuffer(4));
+  Atomics.wait(sab, 0, 0, ms);
+}
+
+function ghRun(args: string[]): { status: number | null; stdout: string; stderr: string } {
+  let result = spawnSync('gh', args, { encoding: 'utf8' });
+  if (result.status !== 0 && isRateLimitError(result.stderr ?? '')) {
+    process.stderr.write(`gh rate limit hit; waiting ${Math.round(RATE_LIMIT_RETRY_DELAY_MS / 1000)}s before retry...\n`);
+    sleepSyncMs(RATE_LIMIT_RETRY_DELAY_MS);
+    result = spawnSync('gh', args, { encoding: 'utf8' });
+  }
+  return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+}
+
 function ghJson<T>(args: string[], fallback: T): T {
-  const result = spawnSync('gh', args, { encoding: 'utf8' });
+  const result = ghRun(args);
   if (result.status !== 0 || !result.stdout.trim()) return fallback;
   return JSON.parse(result.stdout) as T;
 }
 
 function projectView() {
-  return ghJson<{
+  ensureCacheForCurrentPath();
+  if (cache.projectView !== undefined) return cache.projectView;
+  cache.projectView = ghJson<{
     id?: string;
     title?: string;
   }>(['project', 'view', String(CAMPAIGN_PROJECT_NUMBER), '--owner', CAMPAIGN_OWNER, '--format', 'json'], {});
+  return cache.projectView;
 }
 
 function projectStatusField() {
+  ensureCacheForCurrentPath();
+  if (cache.statusField !== undefined) return cache.statusField;
   const fields = ghJson<{
     fields?: Array<{
       id: string;
@@ -69,7 +135,25 @@ function projectStatusField() {
     }>;
   }>(['project', 'field-list', String(CAMPAIGN_PROJECT_NUMBER), '--owner', CAMPAIGN_OWNER, '--format', 'json'], {});
 
-  return fields.fields?.find((field) => field.name === 'Status' && field.type === 'ProjectV2SingleSelectField') ?? null;
+  cache.statusField = fields.fields?.find((field) => field.name === 'Status' && field.type === 'ProjectV2SingleSelectField') ?? null;
+  return cache.statusField;
+}
+
+function fetchProjectItems(scope: 'recent' | 'fallback'): ProjectItem[] {
+  const limit = scope === 'recent' ? PROJECT_ITEM_LIST_RECENT_LIMIT : PROJECT_ITEM_LIST_FALLBACK_LIMIT;
+  const args = ['project', 'item-list', String(CAMPAIGN_PROJECT_NUMBER), '--owner', CAMPAIGN_OWNER, '--format', 'json', '--limit', limit];
+  const response = ghJson<{ items?: ProjectItem[] }>(args, {});
+  return response.items ?? [];
+}
+
+function projectItems(scope: 'recent' | 'fallback' = 'recent'): ProjectItem[] {
+  ensureCacheForCurrentPath();
+  if (cache.items && (cache.items.scope === scope || cache.items.scope === 'fallback')) {
+    return cache.items.items;
+  }
+  const items = fetchProjectItems(scope);
+  cache.items = { items, scope };
+  return items;
 }
 
 export function checkCampaignStatusOptions(): CampaignStatusReport {
@@ -103,47 +187,34 @@ export function parseIssueRef(value: string) {
 
 function projectItemForIssue(issue: string) {
   const ref = parseIssueRef(issue);
-  const items = ghJson<{
-    items?: Array<{
-      id: string;
-      content?: {
-        repository?: string;
-        number?: number;
-        url?: string;
-      };
-    }>;
-  }>(['project', 'item-list', String(CAMPAIGN_PROJECT_NUMBER), '--owner', CAMPAIGN_OWNER, '--format', 'json', '--limit', '100'], {});
+  const match = (items: ProjectItem[]) =>
+    items.find((item) => item.content?.repository === ref.repo && item.content?.number === ref.number) ?? null;
 
-  return items.items?.find((item) => item.content?.repository === ref.repo && item.content?.number === ref.number) ?? null;
+  const recent = match(projectItems('recent'));
+  if (recent) return recent;
+  if (cache.items?.scope === 'fallback') return null;
+  return match(projectItems('fallback'));
 }
 
-export function listCampaignIssuesByStatus(status: CampaignStatusName): CampaignProjectIssue[] {
-  const items = ghJson<{
-    items?: Array<{
-      id: string;
-      title?: string;
-      status?: string;
-      labels?: string[];
-      content?: {
-        repository?: string;
-        number?: number;
-        title?: string;
-        url?: string;
-      };
-    }>;
-  }>(['project', 'item-list', String(CAMPAIGN_PROJECT_NUMBER), '--owner', CAMPAIGN_OWNER, '--format', 'json', '--limit', '100'], {});
+export function listCampaignIssuesByStatus(status: CampaignStatusName, repo: string | null = null): CampaignProjectIssue[] {
+  const matchesRepo = (item: ProjectItem) => !repo || item.content?.repository === repo;
+  const filtered = (items: ProjectItem[]) =>
+    items.filter((item) => item.status === status && item.content?.repository && item.content?.number && matchesRepo(item));
 
-  return (items.items ?? [])
-    .filter((item) => item.status === status && item.content?.repository && item.content?.number)
-    .map((item) => ({
-      repo: item.content?.repository ?? '',
-      number: item.content?.number ?? 0,
-      title: item.content?.title ?? item.title ?? '',
-      url: item.content?.url ?? `https://github.com/${item.content?.repository}/issues/${item.content?.number}`,
-      status: item.status ?? null,
-      labels: item.labels ?? [],
-      projectItemId: item.id,
-    }));
+  let items = filtered(projectItems('recent'));
+  if (items.length === 0 && repo && cache.items?.scope !== 'fallback') {
+    items = filtered(projectItems('fallback'));
+  }
+
+  return items.map((item) => ({
+    repo: item.content?.repository ?? '',
+    number: item.content?.number ?? 0,
+    title: item.content?.title ?? item.title ?? '',
+    url: item.content?.url ?? `https://github.com/${item.content?.repository}/issues/${item.content?.number}`,
+    status: item.status ?? null,
+    labels: item.labels ?? [],
+    projectItemId: item.id,
+  }));
 }
 
 function ensureProjectItem(issue: string): { item: { id: string; content: { repository: string; number: number; url: string } }; added: boolean } {
@@ -170,6 +241,7 @@ function ensureProjectItem(issue: string): { item: { id: string; content: { repo
     {}
   );
   if (!added.id) throw new Error(`Could not add ${issue} to Campaign Map.`);
+  cache.items = undefined;
   return {
     item: { id: added.id, content: { repository: ref.repo, number: ref.number, url } },
     added: true,
@@ -195,23 +267,23 @@ export function setCampaignStatus(issue: string, status: CampaignStatusName, opt
   const { item, added } = ensureProjectItem(issue);
 
   if (options.confirm) {
-    const result = spawnSync(
-      'gh',
-      [
-        'project',
-        'item-edit',
-        '--id',
-        item.id,
-        '--project-id',
-        report.projectId,
-        '--field-id',
-        report.statusFieldId,
-        '--single-select-option-id',
-        option.id,
-      ],
-      { encoding: 'utf8' }
-    );
+    const result = ghRun([
+      'project',
+      'item-edit',
+      '--id',
+      item.id,
+      '--project-id',
+      report.projectId,
+      '--field-id',
+      report.statusFieldId,
+      '--single-select-option-id',
+      option.id,
+    ]);
     if (result.status !== 0) throw new Error(`${result.stderr || result.stdout}`.trim());
+    if (cache.items) {
+      const cached = cache.items.items.find((entry) => entry.id === item.id);
+      if (cached) cached.status = status;
+    }
   }
 
   return {

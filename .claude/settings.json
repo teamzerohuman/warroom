@@ -2,7 +2,9 @@
   "permissions": {
     "allow": [
       "Bash(grep :*)",
-      "Bash(node /Users/andrewslack/Sites/Flo/warroom/dist/src/cli.js dev test --help)"
+      "Bash(node /Users/andrewslack/Sites/Flo/warroom/dist/src/cli.js dev test --help)",
+      "Bash(gh help *)",
+      "Bash(grep -n \"for.*\\\\${.*repo\\\\|Issues with Campaign status\" src/cli.ts)"
     ]
   },
   "enabledPlugins": {
