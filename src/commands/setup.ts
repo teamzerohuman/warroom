@@ -1,4 +1,4 @@
-import { copyFileSync, existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import YAML from 'yaml';
 import { loadRepoManifest } from '../lib/repos.js';
@@ -168,11 +168,27 @@ export function buildRepoManifest(defaults: RepoDefaultsInput, repos: RepoInput[
 }
 
 // Writes the manifest as YAML and validates it parses. Throws on invalid input.
+// On validation failure, restores any previous repos.yaml (or removes it if
+// none existed) so a broken manifest is never persisted on disk.
 export function writeRepoManifestFromInputs(workspaceRoot: string, defaults: RepoDefaultsInput, repos: RepoInput[]) {
   const manifest = buildRepoManifest(defaults, repos);
   const manifestPath = path.join(workspaceRoot, 'repos.yaml');
+  const previous = existsSync(manifestPath) ? readFileSync(manifestPath, 'utf8') : null;
   writeFileSync(manifestPath, YAML.stringify(manifest));
-  loadRepoManifest(workspaceRoot); // validate; throws if the generated file is invalid
+  try {
+    loadRepoManifest(workspaceRoot);
+  } catch (error) {
+    if (previous === null) {
+      try {
+        unlinkSync(manifestPath);
+      } catch {
+        // ignore rollback cleanup error
+      }
+    } else {
+      writeFileSync(manifestPath, previous);
+    }
+    throw error;
+  }
   return manifest;
 }
 

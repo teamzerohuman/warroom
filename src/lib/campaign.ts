@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { parseRepoRef } from './refs.js';
-import { getProjectConfig } from './repos.js';
+import { getProjectConfig, parseCampaignProjectEnv } from './repos.js';
 import { findWarRoomWorkspace } from './workspace.js';
 
 // The campaign GitHub Project owner/number come from repos.yaml `defaults`
@@ -9,7 +9,7 @@ import { findWarRoomWorkspace } from './workspace.js';
 export function campaignTarget(): { owner: string; project: number } {
   const env = process.env;
   const envOwner = env.WARROOM_CAMPAIGN_OWNER;
-  const envProject = env.WARROOM_CAMPAIGN_PROJECT ? Number(env.WARROOM_CAMPAIGN_PROJECT) : undefined;
+  const envProject = parseCampaignProjectEnv(env.WARROOM_CAMPAIGN_PROJECT);
   if (envOwner && envProject !== undefined) return { owner: envOwner, project: envProject };
   try {
     const config = getProjectConfig(findWarRoomWorkspace());
