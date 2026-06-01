@@ -24,6 +24,7 @@ maps/issue-territory.md
 !.warroom/runs/.gitkeep
 .warroom/dev/*
 !.warroom/dev/.gitkeep
+.warroom/changelog-share-state.json
 
 # Ally secrets, local client repo checkouts, and machine-specific workspace state.
 allies/*/.env.local
