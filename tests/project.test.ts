@@ -101,6 +101,17 @@ function makeFakeGh(seed: { projects?: FakeProject[]; createNumber?: number } = 
       for (const project of projects.values()) project.fields = project.fields.filter((field) => field.id !== id);
       return ok({ id });
     }
+    if (args[0] === 'api' && args[1] === 'graphql') {
+      // Models updateProjectV2Field: rewrite the named field's options in place.
+      const query = (opt(args, '-f') ?? '').replace(/^query=/, '');
+      const fieldId = (query.match(/fieldId: "([^"]+)"/) ?? [])[1];
+      const names = [...query.matchAll(/\{name: "([^"]+)"/g)].map((m) => m[1]);
+      for (const project of projects.values()) {
+        const field = project.fields.find((f) => f.id === fieldId);
+        if (field) field.options = names.map((name, index) => ({ id: `g${index}`, name }));
+      }
+      return ok({ data: { updateProjectV2Field: { projectV2Field: { id: fieldId } } } });
+    }
     if (args[0] === 'project' && args[1] === 'field-create') {
       const project = projects.get(Number(args[2]));
       const names = (opt(args, '--single-select-options') ?? '').split(',').filter(Boolean);
@@ -131,19 +142,20 @@ describe('project board lib', () => {
     });
   });
 
-  it('replaces a default Status field with the six campaign states', () => {
+  it('reconfigures the built-in Status field in place with the six campaign states', () => {
     const gh = makeFakeGh({
       projects: [{ number: 5, id: 'PVT_5', url: 'u', title: 'Campaign Map', fields: [defaultStatusField()] }],
     });
     const result = configureCampaignStatusField('acme', 5, gh.runner);
     expect(result.replaced).toBe(true);
     expect(result.created).toBe(false);
-    // A delete then a create were issued.
-    expect(gh.calls.some((c) => c[1] === 'field-delete')).toBe(true);
-    const create = gh.calls.find((c) => c[1] === 'field-create');
-    expect(create).toBeDefined();
-    expect(create).toContain(CAMPAIGN_STATUSES.join(','));
-    // The board now carries exactly the six states.
+    // The built-in field is rewritten in place — never deleted/recreated.
+    expect(gh.calls.some((c) => c[1] === 'field-delete' || c[1] === 'field-create')).toBe(false);
+    const graphql = gh.calls.find((c) => c[0] === 'api' && c[1] === 'graphql');
+    expect(graphql).toBeDefined();
+    expect(graphql?.join(' ')).toContain('updateProjectV2Field');
+    // The same field id is kept and now carries exactly the six states.
+    expect(result.fieldId).toBe('F_default');
     const options = gh.projects.get(5)?.fields.find((f) => f.name === 'Status')?.options?.map((o) => o.name);
     expect(options).toEqual(CAMPAIGN_STATUSES);
   });
@@ -155,6 +167,7 @@ describe('project board lib', () => {
     const result = configureCampaignStatusField('acme', 5, gh.runner);
     expect(result).toMatchObject({ created: false, replaced: false });
     expect(gh.calls.some((c) => c[1] === 'field-delete' || c[1] === 'field-create')).toBe(false);
+    expect(gh.calls.some((c) => c[0] === 'api' && c[1] === 'graphql')).toBe(false);
   });
 
   it('creates a Status field when none exists', () => {
@@ -162,6 +175,7 @@ describe('project board lib', () => {
     const result = configureCampaignStatusField('acme', 5, gh.runner);
     expect(result).toMatchObject({ created: true, replaced: false });
     expect(gh.calls.some((c) => c[1] === 'field-delete')).toBe(false);
+    expect(gh.calls.some((c) => c[0] === 'api' && c[1] === 'graphql')).toBe(false);
     expect(gh.calls.some((c) => c[1] === 'field-create')).toBe(true);
   });
 
@@ -323,6 +337,18 @@ if (args[0] === 'project' && args[1] === 'field-create') {
   const field = { id: fid, name: opt('--name'), type: 'ProjectV2SingleSelectField', options: names.map(function (n, i) { return { id: 'o' + i, name: n }; }) };
   if (p) p.fields.push(field);
   writeState(state); out({ id: field.id, name: field.name }); process.exit(0);
+}
+if (args[0] === 'api' && args[1] === 'graphql') {
+  const query = (opt('-f') || '').replace(/^query=/, '');
+  const fieldMatch = query.match(/fieldId: "([^"]+)"/);
+  const fieldId = fieldMatch ? fieldMatch[1] : '';
+  const names = []; const re = /\\{name: "([^"]+)"/g; let m;
+  while ((m = re.exec(query)) !== null) names.push(m[1]);
+  for (const key of Object.keys(state.projects)) {
+    const f = state.projects[key].fields.find(function (x) { return x.id === fieldId; });
+    if (f) f.options = names.map(function (n, i) { return { id: 'g' + i, name: n }; });
+  }
+  writeState(state); out({ data: { updateProjectV2Field: { projectV2Field: { id: fieldId } } } }); process.exit(0);
 }
 process.stderr.write('unexpected gh call: ' + args.join(' '));
 process.exit(1);

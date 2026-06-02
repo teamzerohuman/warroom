@@ -18,6 +18,16 @@ const SINGLE_SELECT_TYPE = 'ProjectV2SingleSelectField';
 // validates and what the workflow commands move issues between.
 export const CAMPAIGN_STATUS_NAMES = CAMPAIGN_STATUSES.map((status) => status.name);
 
+// GraphQL literal for the six campaign states, used to (re)configure a
+// single-select Status field's options in one `updateProjectV2Field` call.
+// `color` is a ProjectV2SingleSelectFieldOptionColor enum (unquoted); name and
+// description are strings (JSON-quoted so any punctuation stays safe).
+function campaignStatusOptionsLiteral(): string {
+  return CAMPAIGN_STATUSES.map(
+    (status) => `{name: ${JSON.stringify(status.name)}, color: ${status.color}, description: ${JSON.stringify(status.description)}}`
+  ).join(', ');
+}
+
 export type CampaignProject = {
   number: number;
   id: string;
@@ -121,9 +131,12 @@ function optionsMatchCampaign(field: ProjectField): boolean {
 
 // Ensures the project's single-select `Status` field carries exactly the six
 // Campaign Map states in order. A freshly created GitHub Project ships with a
-// default Status field (Todo/In Progress/Done); when its options do not match we
-// delete it and recreate it so `campaign status-check` passes. Idempotent: a
-// field that already matches is left untouched.
+// built-in Status field (Todo/In Progress/Done); when its options do not match
+// we rewrite them in place via `updateProjectV2Field` so `campaign status-check`
+// passes. (The built-in field cannot be deleted — GitHub only allows deleting
+// custom fields — so delete+recreate is not an option.) Idempotent: a field that
+// already matches is left untouched. When no Status field exists at all we create
+// one from scratch.
 export function configureCampaignStatusField(
   owner: string,
   projectNumber: number,
@@ -135,13 +148,9 @@ export function configureCampaignStatusField(
     return { fieldId: existing.id, created: false, replaced: false };
   }
 
-  let replaced = false;
   if (existing) {
-    const deleted = runner(['project', 'field-delete', '--id', existing.id, '--format', 'json']);
-    if (deleted.status !== 0) {
-      throw new Error(`gh project field-delete failed: ${(deleted.stderr || deleted.stdout || '').trim()}`);
-    }
-    replaced = true;
+    replaceStatusFieldOptions(existing.id, runner);
+    return { fieldId: existing.id, created: false, replaced: true };
   }
 
   const created = ghJson<{ id?: string }>(runner, [
@@ -163,5 +172,17 @@ export function configureCampaignStatusField(
     throw new Error(`gh project field-create did not return a field id (got ${JSON.stringify(created)}).`);
   }
 
-  return { fieldId: created.id, created: !replaced, replaced };
+  return { fieldId: created.id, created: true, replaced: false };
+}
+
+// Rewrites the options of an existing single-select field to the six Campaign Map
+// states using the GraphQL `updateProjectV2Field` mutation. Unlike field-delete,
+// this works on the built-in Status field. Omitting option ids replaces every
+// option, which is what we want on a freshly created board.
+function replaceStatusFieldOptions(fieldId: string, runner: GhRunner): void {
+  const mutation = `mutation { updateProjectV2Field(input: {fieldId: ${JSON.stringify(fieldId)}, singleSelectOptions: [${campaignStatusOptionsLiteral()}]}) { projectV2Field { ... on ProjectV2SingleSelectField { id } } } }`;
+  const result = runner(['api', 'graphql', '-f', `query=${mutation}`]);
+  if (result.status !== 0) {
+    throw new Error(`gh api graphql updateProjectV2Field failed: ${(result.stderr || result.stdout || '').trim()}`);
+  }
 }

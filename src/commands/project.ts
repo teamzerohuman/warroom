@@ -94,13 +94,17 @@ export function runProjectCreate(workspaceRoot: string, options: ProjectCreateOp
       statusField.created
         ? 'Created Status field with the six Campaign Map states.'
         : statusField.replaced
-          ? 'Replaced the default Status field with the six Campaign Map states.'
+          ? 'Reconfigured the default Status field with the six Campaign Map states.'
           : 'Status field already carried the six Campaign Map states.'
     );
 
     updateCampaignProjectInManifest(workspaceRoot, owner, project.number);
     result.manifestUpdated = true;
     result.messages.push(`Wired repos.yaml -> campaign_owner: ${owner}, campaign_project_number: ${project.number}.`);
+    result.messages.push(
+      `Next: open ${project.url}/views/1 and switch the default view to "Board" grouped by Status to get the Kanban columns ` +
+        "(GitHub's API can't set the board layout for you)."
+    );
 
     result.applied = true;
     return result;
@@ -159,7 +163,7 @@ export function runProjectLink(workspaceRoot: string, options: ProjectLinkOption
         statusField.created
           ? 'Created Status field with the six Campaign Map states.'
           : statusField.replaced
-            ? 'Replaced the existing Status field with the six Campaign Map states.'
+            ? 'Reconfigured the existing Status field with the six Campaign Map states.'
             : 'Status field already carried the six Campaign Map states.'
       );
     }
