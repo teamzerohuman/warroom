@@ -67,11 +67,17 @@ resources:
     description: Logical Sentry MCP resource for issue/event investigation; credentials stay outside git.
     docs_url: https://docs.sentry.io/
 
-  - id: logrocket-mcp
-    type: mcp
-    name: LogRocket MCP
-    description: Logical LogRocket MCP resource for scoped session, issue, and metric investigation; credentials and client scopes stay outside git.
-    docs_url: https://docs.logrocket.com/docs/mcp
+  - id: mcp-spec-docs
+    type: docs
+    name: Model Context Protocol Specification
+    description: Public Model Context Protocol specification and TypeScript SDK documentation.
+    docs_url: https://modelcontextprotocol.io/
+
+  - id: openapi-docs
+    type: docs
+    name: OpenAPI Specification
+    description: Public OpenAPI Specification documentation for tool/schema generation.
+    docs_url: https://spec.openapis.org/
 
   - id: metabase
     type: app

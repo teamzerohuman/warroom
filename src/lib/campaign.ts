@@ -82,7 +82,7 @@ type ProjectItem = {
 };
 
 type CampaignCache = {
-  pathKey?: string;
+  contextKey?: string;
   projectView?: { id?: string; title?: string };
   statusField?: {
     id: string;
@@ -95,15 +95,27 @@ type CampaignCache = {
 
 let cache: CampaignCache = {};
 
-function ensureCacheForCurrentPath() {
-  const currentPath = process.env.PATH ?? '';
-  if (cache.pathKey !== currentPath) {
-    cache = { pathKey: currentPath };
+// The cache lives for the process but must invalidate when either the gh
+// environment or the campaign target changes. PATH is part of the key because
+// the test suite swaps a fake `gh` binary onto PATH per test and relies on each
+// test getting a fresh cache; owner/project are part of the key so pointing at a
+// different project mid-process never returns another project's metadata. Note
+// that only *successful* gh lookups are ever cached (see projectView etc.), so a
+// transient failure is retried on the next call rather than poisoning the run.
+function cacheContextKey(): string {
+  const target = campaignTarget();
+  return `${process.env.PATH ?? ''} :: ${target.owner}#${target.project}`;
+}
+
+function ensureCacheForContext() {
+  const key = cacheContextKey();
+  if (cache.contextKey !== key) {
+    cache = { contextKey: key };
   }
 }
 
 export function resetCampaignCache() {
-  cache = { pathKey: process.env.PATH ?? '' };
+  cache = {};
 }
 
 function isRateLimitError(stderr: string) {
@@ -126,67 +138,90 @@ function ghRun(args: string[]): { status: number | null; stdout: string; stderr:
   return { status: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
 }
 
-function ghJson<T>(args: string[], fallback: T): T {
+// Returns the parsed JSON on success, or an error string on failure. A failure
+// surfaces the gh stderr (e.g. "missing required scopes [read:project]") so
+// callers can report the real reason instead of a vague "could not load".
+// Callers decide whether to cache — successful results only — so a transient gh
+// failure self-heals on the next call rather than poisoning the run.
+function ghJson<T>(args: string[]): { ok: true; data: T } | { ok: false; error: string } {
   const result = ghRun(args);
-  if (result.status !== 0 || !result.stdout.trim()) return fallback;
-  return JSON.parse(result.stdout) as T;
+  if (result.status !== 0 || !result.stdout.trim()) {
+    const raw = result.stderr || result.stdout || `gh exited with status ${result.status}`;
+    return { ok: false, error: raw.replace(/\s+/g, ' ').trim() };
+  }
+  return { ok: true, data: JSON.parse(result.stdout) as T };
 }
 
-function projectView() {
-  ensureCacheForCurrentPath();
-  if (cache.projectView !== undefined) return cache.projectView;
+function projectView(): { view: { id?: string; title?: string }; error: string | null } {
+  ensureCacheForContext();
+  if (cache.projectView !== undefined) return { view: cache.projectView, error: null };
   const target = campaignTarget();
-  cache.projectView = ghJson<{
-    id?: string;
-    title?: string;
-  }>(['project', 'view', String(target.project), '--owner', target.owner, '--format', 'json'], {});
-  return cache.projectView;
+  const result = ghJson<{ id?: string; title?: string }>([
+    'project',
+    'view',
+    String(target.project),
+    '--owner',
+    target.owner,
+    '--format',
+    'json',
+  ]);
+  if (!result.ok) return { view: {}, error: result.error };
+  cache.projectView = result.data;
+  return { view: result.data, error: null };
 }
 
-function projectStatusField() {
-  ensureCacheForCurrentPath();
-  if (cache.statusField !== undefined) return cache.statusField;
-  const fields = ghJson<{
+function projectStatusField(): { field: CampaignCache['statusField']; error: string | null } {
+  ensureCacheForContext();
+  if (cache.statusField !== undefined) return { field: cache.statusField, error: null };
+  const target = campaignTarget();
+  const result = ghJson<{
     fields?: Array<{
       id: string;
       name: string;
       type: string;
       options?: Array<{ id: string; name: string }>;
     }>;
-  }>(['project', 'field-list', String(campaignTarget().project), '--owner', campaignTarget().owner, '--format', 'json'], {});
+  }>(['project', 'field-list', String(target.project), '--owner', target.owner, '--format', 'json']);
+  if (!result.ok) return { field: null, error: result.error };
 
-  cache.statusField = fields.fields?.find((field) => field.name === 'Status' && field.type === 'ProjectV2SingleSelectField') ?? null;
-  return cache.statusField;
+  // A successful lookup with no Status field is a real negative, not a transient
+  // failure, so caching null here is correct.
+  const field = result.data.fields?.find((entry) => entry.name === 'Status' && entry.type === 'ProjectV2SingleSelectField') ?? null;
+  cache.statusField = field;
+  return { field, error: null };
 }
 
-function fetchProjectItems(scope: 'recent' | 'fallback'): ProjectItem[] {
+function fetchProjectItems(scope: 'recent' | 'fallback'): { items: ProjectItem[]; error: string | null } {
   const limit = scope === 'recent' ? PROJECT_ITEM_LIST_RECENT_LIMIT : PROJECT_ITEM_LIST_FALLBACK_LIMIT;
   const target = campaignTarget();
   const args = ['project', 'item-list', String(target.project), '--owner', target.owner, '--format', 'json', '--limit', limit];
-  const response = ghJson<{ items?: ProjectItem[] }>(args, {});
-  return response.items ?? [];
+  const result = ghJson<{ items?: ProjectItem[] }>(args);
+  if (!result.ok) return { items: [], error: result.error };
+  return { items: result.data.items ?? [], error: null };
 }
 
 function projectItems(scope: 'recent' | 'fallback' = 'recent'): ProjectItem[] {
-  ensureCacheForCurrentPath();
+  ensureCacheForContext();
   if (cache.items && (cache.items.scope === scope || cache.items.scope === 'fallback')) {
     return cache.items.items;
   }
-  const items = fetchProjectItems(scope);
-  cache.items = { items, scope };
-  return items;
+  const result = fetchProjectItems(scope);
+  // Don't cache a failed fetch — leave the cache empty so the next call retries.
+  if (result.error) return result.items;
+  cache.items = { items: result.items, scope };
+  return result.items;
 }
 
 export function checkCampaignStatusOptions(): CampaignStatusReport {
   const errors: string[] = [];
-  const project = projectView();
-  const field = projectStatusField();
+  const { view, error: viewError } = projectView();
+  const { field, error: fieldError } = projectStatusField();
 
-  if (!project.id) {
+  if (!view.id) {
     const target = campaignTarget();
-    errors.push(`Could not load ${target.owner} Project ${target.project}.`);
+    errors.push(`Could not load ${target.owner} Project ${target.project}.${viewError ? ` (${viewError})` : ''}`);
   }
-  if (!field) errors.push('Could not load Campaign Map Status field.');
+  if (!field) errors.push(`Could not load Campaign Map Status field.${fieldError ? ` (${fieldError})` : ''}`);
 
   const options = field?.options ?? [];
   const optionNames = new Set(options.map((option) => option.name));
@@ -198,7 +233,7 @@ export function checkCampaignStatusOptions(): CampaignStatusReport {
     missing: expectedNames.filter((name) => !optionNames.has(name)),
     unexpected: options.map((option) => option.name).filter((name) => !expectedNames.includes(name as CampaignStatusName)),
     options,
-    projectId: project.id ?? null,
+    projectId: view.id ?? null,
     statusFieldId: field?.id ?? null,
     errors,
   };
@@ -261,14 +296,23 @@ function ensureProjectItem(issue: string): { item: { id: string; content: { repo
   const ref = parseIssueRef(issue);
   const url = `https://github.com/${ref.repo}/issues/${ref.number}`;
   const target = campaignTarget();
-  const added = ghJson<{ id?: string }>(
-    ['project', 'item-add', String(target.project), '--owner', target.owner, '--url', url, '--format', 'json'],
-    {}
-  );
-  if (!added.id) throw new Error(`Could not add ${issue} to Campaign Map.`);
+  const result = ghJson<{ id?: string }>([
+    'project',
+    'item-add',
+    String(target.project),
+    '--owner',
+    target.owner,
+    '--url',
+    url,
+    '--format',
+    'json',
+  ]);
+  if (!result.ok || !result.data.id) {
+    throw new Error(`Could not add ${issue} to Campaign Map.${result.ok ? '' : ` ${result.error}`}`);
+  }
   cache.items = undefined;
   return {
-    item: { id: added.id, content: { repository: ref.repo, number: ref.number, url } },
+    item: { id: result.data.id, content: { repository: ref.repo, number: ref.number, url } },
     added: true,
   };
 }
