@@ -1527,7 +1527,7 @@ async function promptPrCreateAfterCommit(
   output: Output,
   input: Input,
   result: CommitCreateResult,
-  options: { autoCreatePr?: boolean } = {}
+  options: { autoCreatePr?: boolean; autoReviewPr?: boolean } = {}
 ) {
   if (!result.committed) return;
   if (options.autoCreatePr === false) return;
@@ -1535,7 +1535,7 @@ async function promptPrCreateAfterCommit(
   const existingPr = result.branch ? findOpenPrForBranch(result.githubRepo, result.branch) : null;
   if (existingPr) {
     output(`Existing PR detected: ${existingPr.url}`);
-    await promptPrReviewForRef(workspaceRoot, output, input, existingPr.ref, result.issue, {});
+    await promptPrReviewForRef(workspaceRoot, output, input, existingPr.ref, result.issue, { autoReviewPr: options.autoReviewPr });
     return;
   }
 
@@ -1552,7 +1552,7 @@ async function promptPrCreateAfterCommit(
       currentPath: result.path,
     });
     printPrCreate(output, created);
-    await promptPrReviewAfterPrCreate(workspaceRoot, output, input, created, {});
+    await promptPrReviewAfterPrCreate(workspaceRoot, output, input, created, { autoReviewPr: options.autoReviewPr });
   } catch (error) {
     output(`PR create failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
@@ -1651,7 +1651,7 @@ async function promptPrCreateAfterIssueStart(
   output: Output,
   input: Input,
   result: PrPlanResult,
-  options: { autoCreatePr?: boolean } = {}
+  options: { autoCreatePr?: boolean; autoReviewPr?: boolean } = {}
 ) {
   if (result.action !== 'issue-start' || !result.launched || result.launchError || !result.adapterCwd) return;
   if (options.autoCreatePr === false) return;
@@ -1682,7 +1682,7 @@ async function promptPrCreateAfterIssueStart(
         all: true,
       });
       printCommitCreate(output, committed);
-      await promptPrCreateAfterCommit(workspaceRoot, output, input, committed, { autoCreatePr: options.autoCreatePr });
+      await promptPrCreateAfterCommit(workspaceRoot, output, input, committed, { autoCreatePr: options.autoCreatePr, autoReviewPr: options.autoReviewPr });
     } catch (error) {
       output(`Commit create failed: ${error instanceof Error ? error.message : String(error)}`);
       process.exitCode = 1;
@@ -1714,7 +1714,7 @@ async function promptPrCreateAfterIssueStart(
       // Leave title/body unset so pr create asks the adapter to summarize the actual branch commits and diff.
     });
     printPrCreate(output, created);
-    await promptPrReviewAfterPrCreate(workspaceRoot, output, input, created, {});
+    await promptPrReviewAfterPrCreate(workspaceRoot, output, input, created, { autoReviewPr: options.autoReviewPr });
   } catch (error) {
     output(`PR create failed: ${error instanceof Error ? error.message : String(error)}`);
     process.exitCode = 1;
@@ -1752,7 +1752,8 @@ async function promptIssueNextAfterTriage(
   });
   printPrPlan(output, plan);
   if (plan.launchError) process.exitCode = 1;
-  await promptPrCreateAfterIssueStart(workspaceRoot, output, input, plan);
+  // Match `issue next`'s default: auto-create the PR and auto-run review after development instead of prompting.
+  await promptPrCreateAfterIssueStart(workspaceRoot, output, input, plan, { autoCreatePr: true, autoReviewPr: true });
 }
 
 function prRefFromCreateResult(result: PrCreateResult) {
@@ -1766,9 +1767,14 @@ async function promptPrReviewForRef(
   input: Input,
   prRef: string,
   issue: string | null | undefined,
-  options: { writeArtifact?: boolean; liveMergeOutput?: PrMergeLiveOutput }
+  options: { writeArtifact?: boolean; liveMergeOutput?: PrMergeLiveOutput; autoReviewPr?: boolean }
 ) {
-  const reviewPr = await promptConfirmation(output, input, 'Run `warroom pr review` next? [Y/n]');
+  // Mirrors autoCreatePr: true auto-runs the review, false skips it entirely, undefined prompts.
+  if (options.autoReviewPr === false) return;
+  const reviewPr =
+    options.autoReviewPr === true
+      ? true
+      : await promptConfirmation(output, input, 'Run `warroom pr review` next? [Y/n]');
   if (!reviewPr) return;
 
   output(`Starting PR review for ${prRef}`);
@@ -1795,7 +1801,7 @@ async function promptPrReviewAfterPrCreate(
   output: Output,
   input: Input,
   result: PrCreateResult,
-  options: { writeArtifact?: boolean; liveMergeOutput?: PrMergeLiveOutput }
+  options: { writeArtifact?: boolean; liveMergeOutput?: PrMergeLiveOutput; autoReviewPr?: boolean }
 ) {
   if (!result.created && !result.existingPr) return;
   const prRef = prRefFromCreateResult(result);
@@ -2519,6 +2525,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--write-artifact', 'Write prompt/input artifacts under .warroom/runs.')
     .option('--no-select', 'List issues without prompting for a selection.')
     .option('--no-pr-creation', 'Do not auto-create the PR after development. By default, the PR is created without prompting.')
+    .option('--no-pr-review', 'Do not auto-run pr review after the PR is created. By default, pr review runs without prompting.')
     .option('--all', 'List ready issues across all mapped repos, even from inside a child repo checkout.')
     .option('--json', 'Print machine-readable output.')
     .action(
@@ -2532,10 +2539,12 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         writeArtifact?: boolean;
         select?: boolean;
         prCreation?: boolean;
+        prReview?: boolean;
         all?: boolean;
         json?: boolean;
       }) => {
         const autoCreatePr = opts.prCreation !== false;
+        const autoReviewPr = opts.prReview !== false;
         if (opts.issue) {
           const dryRun = opts.dryRun === true;
           if (!opts.json) output(`Starting ${opts.issue}`);
@@ -2573,7 +2582,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
           }
           printPrPlan(output, plan);
           if (plan.launchError) process.exitCode = 1;
-          if (interactive) await promptPrCreateAfterIssueStart(workspaceRoot, output, input, plan, { autoCreatePr });
+          if (interactive) await promptPrCreateAfterIssueStart(workspaceRoot, output, input, plan, { autoCreatePr, autoReviewPr });
           return;
         }
 
@@ -2630,7 +2639,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
         });
         printPrPlan(output, plan);
         if (plan.launchError) process.exitCode = 1;
-        await promptPrCreateAfterIssueStart(workspaceRoot, output, input, plan, { autoCreatePr });
+        await promptPrCreateAfterIssueStart(workspaceRoot, output, input, plan, { autoCreatePr, autoReviewPr });
       }
     );
 
@@ -3033,8 +3042,10 @@ export function buildProgram(options: BuildProgramOptions = {}) {
     .option('--no-push', 'Create the commit without pushing to the remote branch.')
     .option('--no-issue-comment', 'Do not post the commit progress comment back to the linked issue after commit.')
     .option('--confirm', 'Actually create the commit and push it to the remote branch.')
+    .option('--no-pr-creation', 'Do not auto-create the PR after committing. By default, the PR is created without prompting.')
+    .option('--no-pr-review', 'Do not auto-run pr review after the PR is created. By default, pr review runs without prompting.')
     .option('--json', 'Print machine-readable output.')
-    .action(async (opts: { repo?: string; issue?: string; message?: string; validate?: string[]; writeArtifact?: boolean; all?: boolean; push?: boolean; issueComment?: boolean; confirm?: boolean; json?: boolean }) => {
+    .action(async (opts: { repo?: string; issue?: string; message?: string; validate?: string[]; writeArtifact?: boolean; all?: boolean; push?: boolean; issueComment?: boolean; confirm?: boolean; prCreation?: boolean; prReview?: boolean; json?: boolean }) => {
       const commandOptions = { ...opts, currentPath: invocationCwd };
       const result = runCommitCreate(workspaceRoot, opts.confirm ? commandOptions : { ...commandOptions, confirm: false });
       if (opts.json) {
@@ -3045,8 +3056,12 @@ export function buildProgram(options: BuildProgramOptions = {}) {
 
       if (!interactive) return;
 
+      // Like `issue next`, auto-create the PR and auto-run review after the commit instead of prompting.
+      const autoCreatePr = opts.prCreation !== false;
+      const autoReviewPr = opts.prReview !== false;
+
       if (opts.confirm || result.committed) {
-        await promptPrCreateAfterCommit(workspaceRoot, output, input, result);
+        await promptPrCreateAfterCommit(workspaceRoot, output, input, result, { autoCreatePr, autoReviewPr });
         return;
       }
 
@@ -3057,7 +3072,7 @@ export function buildProgram(options: BuildProgramOptions = {}) {
       output(willPush ? 'Creating commit and pushing...' : 'Creating commit...');
       const committed = runCommitCreate(workspaceRoot, { ...commandOptions, confirm: true, all: commitAll });
       printCommitCreate(output, committed);
-      await promptPrCreateAfterCommit(workspaceRoot, output, input, committed);
+      await promptPrCreateAfterCommit(workspaceRoot, output, input, committed, { autoCreatePr, autoReviewPr });
     });
 
   program

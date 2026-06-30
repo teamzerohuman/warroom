@@ -310,7 +310,9 @@ describe('phase-1 CLI', () => {
       expect(lines.some((line) => line.includes('War Room should have checked this checkout out to warroom/7-build-the-selector'))).toBe(true);
       expect(lines.some((line) => line.includes('Triage complete: build the feature directly.'))).toBe(true);
       expect(lines).toContain('Outcome: LLM adapter completed on warroom/7-build-the-selector; no background session remains. Campaign status updated to battlefield-active.');
-      expect(lines.at(-1)).toBe('Run `warroom pr review` next? [Y/n]');
+      // PR creation and review now run automatically instead of prompting.
+      expect(lines).not.toContain('Run `warroom pr review` next? [Y/n]');
+      expect(lines.some((line) => line.startsWith('Starting PR review for TeamFloPay/sdk#'))).toBe(true);
 
       const branch = spawnSync('git', ['branch', '--show-current'], {
         cwd: path.resolve(root, '..', 'sdk'),
@@ -383,7 +385,9 @@ describe('phase-1 CLI', () => {
       expect(output).toContain('- Captures the actual change in selector.ts for reviewers.');
       expect(lines).toContain('Issue progress: posted TeamFloPay/sdk#7 https://github.com/TeamFloPay/sdk/issues/7#issuecomment-2');
       expect(lines).toContain('PR URL: https://github.com/TeamFloPay/sdk/pull/12');
-      expect(lines.at(-1)).toBe('Run `warroom pr review` next? [Y/n]');
+      // PR review now runs automatically instead of prompting.
+      expect(lines).not.toContain('Run `warroom pr review` next? [Y/n]');
+      expect(lines).toContain('Starting PR review for TeamFloPay/sdk#12');
 
       const remoteBranch = spawnSync(
         'git',
@@ -734,7 +738,12 @@ describe('phase-1 CLI', () => {
       expect(lines).toContain('Starting TeamFloPay/sdk#4');
       expect(lines).toContain('Issue start: launched');
       expect(lines).toContain('Campaign status: updated TeamFloPay/sdk#4 -> battlefield-active');
-      expect(lines.at(-1)).toBe('Run `warroom pr create` next? [Y/n]');
+      // PR creation and review now run automatically instead of prompting.
+      expect(lines).not.toContain('Run `warroom pr create` next? [Y/n]');
+      expect(lines).toContain('Creating PR...');
+      expect(lines).toContain('PR create: created');
+      expect(lines).not.toContain('Run `warroom pr review` next? [Y/n]');
+      expect(lines).toContain('Starting PR review for TeamFloPay/sdk#12');
     } finally {
       process.env.PATH = originalPath;
     }
@@ -2674,7 +2683,10 @@ exit 0
     expect(lines).toContain('Creating commit and pushing...');
     expect(lines).toContain('Commit create for sdk: committed');
     expect(lines).toContain('Push: pushed git push -u origin HEAD');
-    expect(lines).toContain('Run `warroom pr create` next? [Y/n]');
+    // PR creation now runs automatically instead of prompting; from the base branch it refuses cleanly.
+    expect(lines).not.toContain('Run `warroom pr create` next? [Y/n]');
+    expect(lines).toContain('Creating PR...');
+    expect(lines).toContain('PR create failed: Refusing to create a PR from base branch main. No commits found on main ahead of main. Run `warroom commit create` before creating a PR.');
 
     const log = spawnSync('git', ['log', '-1', '--pretty=%s'], { cwd: sdk, encoding: 'utf8' });
     expect(log.stdout.trim()).toBe('chore(sdk): save fixture');
@@ -2721,11 +2733,13 @@ exit 0
       }
 
       expect(lines).toContain('Commit create for sdk: committed');
-      expect(lines).toContain('Run `warroom pr create` next? [Y/n]');
+      // PR creation and review now run automatically instead of prompting.
+      expect(lines).not.toContain('Run `warroom pr create` next? [Y/n]');
       expect(lines).toContain('Creating PR...');
       expect(lines).toContain('PR create: created');
       expect(lines).toContain('PR URL: https://github.com/TeamFloPay/sdk/pull/12');
-      expect(lines.at(-1)).toBe('Run `warroom pr review` next? [Y/n]');
+      expect(lines).not.toContain('Run `warroom pr review` next? [Y/n]');
+      expect(lines).toContain('Starting PR review for TeamFloPay/sdk#12');
     } finally {
       process.env.PATH = originalPath;
     }
